@@ -136,19 +136,18 @@ struct DispatchSpan {
     grid_size: [u32; 3],
     group_size: [u32; 3],
     buffers: Vec<TimelineBufferBinding>,
+    synthetic: bool,
 }
 
 pub fn report(trace: &TraceBundle) -> Result<TimelineReport> {
     let regions = trace.command_buffer_regions()?;
-    let profiler_timeline = profiler::stream_data_summary(&trace.path)
-        .ok()
-        .and_then(|summary| summary.timeline);
-    Ok(build(&regions, profiler_timeline.as_ref()))
+    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    Ok(build(&regions, profiler_summary.as_ref()))
 }
 
 pub fn build(
     regions: &[CommandBufferRegion],
-    profiler_timeline: Option<&profiler::ProfilerTimelineInfo>,
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
 ) -> TimelineReport {
     let mut command_buffers = Vec::new();
     let mut encoders = Vec::new();
@@ -156,8 +155,11 @@ pub fn build(
     let mut events = Vec::new();
     let mut start_time_ns = u64::MAX;
     let mut end_time_ns = 0u64;
+    let profiler_timeline = profiler_summary.and_then(|summary| summary.timeline.as_ref());
+    let profiler_dispatches = profiler_summary.map(|summary| &summary.dispatches[..]);
     let command_buffers_profiler_backed =
         profiler_timeline.is_some_and(|timeline| !timeline.command_buffer_timestamps.is_empty());
+    let mut profiler_dispatch_count = 0usize;
 
     events.push(metadata_event(1, 0, "process_name", "gputrace timeline"));
     events.push(metadata_event(1, 1, "thread_name", "Command Buffers"));
@@ -200,7 +202,14 @@ pub fn build(
             ]),
         });
 
-        let dispatch_spans = build_dispatch_spans(region, timestamp_ns, duration_ns);
+        let dispatch_spans = build_dispatch_spans(
+            region,
+            command_buffer_start_ticks(profiler_timeline, region_pos),
+            timestamp_ns,
+            duration_ns,
+            profiler_timeline,
+            profiler_dispatches,
+        );
         let mut encoder_dispatches: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (dispatch_pos, span) in dispatch_spans.iter().enumerate() {
             if let Some(address) = span.encoder_address {
@@ -224,7 +233,10 @@ pub fn build(
                     let start = first.start_time_ns;
                     let end = last.end_time_ns.max(start);
                     let duration = end.checked_sub(start).filter(|duration| *duration > 0);
-                    (start, end, duration, true)
+                    let synthetic = positions
+                        .iter()
+                        .any(|position| dispatch_spans[*position].synthetic());
+                    (start, end, duration, synthetic)
                 } else if let Some(cb_duration_ns) = duration_ns {
                     let slice = if region.encoders.is_empty() {
                         0
@@ -288,6 +300,9 @@ pub fn build(
         }
 
         for span in dispatch_spans {
+            if !span.synthetic() {
+                profiler_dispatch_count += 1;
+            }
             let encoder_index = span.encoder_address.and_then(|address| {
                 region
                     .encoders
@@ -383,7 +398,7 @@ pub fn build(
     dispatches.sort_by(|left, right| left.index.cmp(&right.index));
 
     TimelineReport {
-        synthetic: true,
+        synthetic: !command_buffers_profiler_backed && profiler_dispatch_count == 0,
         command_buffers_profiler_backed,
         start_time_ns,
         end_time_ns,
@@ -412,7 +427,12 @@ pub fn export_raw_json(report: &RawTimelineReport) -> Result<String> {
 
 pub fn format_report(report: &TimelineReport) -> String {
     let mut out = String::new();
-    if report.command_buffers_profiler_backed {
+    if report.command_buffers_profiler_backed && !report.synthetic {
+        out.push_str("Profiler-backed timeline report\n");
+        out.push_str(
+            "Command-buffer and dispatch spans come from profiler data when available; remaining gaps stay synthetic.\n\n",
+        );
+    } else if report.command_buffers_profiler_backed {
         out.push_str("Mixed timeline report\n");
         out.push_str(
             "Command-buffer spans come from profiler APSTimelineData; encoder and dispatch slices remain synthetic.\n\n",
@@ -621,11 +641,109 @@ fn profiler_command_buffer_span(
     (timestamp_ns, duration_ns, true)
 }
 
+fn command_buffer_start_ticks(
+    profiler_timeline: Option<&profiler::ProfilerTimelineInfo>,
+    region_pos: usize,
+) -> Option<u64> {
+    profiler_timeline.and_then(|timeline| {
+        timeline
+            .command_buffer_timestamps
+            .get(region_pos)
+            .map(|entry| entry.start_ticks)
+    })
+}
+
 fn build_dispatch_spans(
     region: &CommandBufferRegion,
+    command_buffer_start_ticks: Option<u64>,
     command_buffer_start_ns: u64,
     duration_ns: Option<u64>,
+    profiler_timeline: Option<&profiler::ProfilerTimelineInfo>,
+    profiler_dispatches: Option<&[profiler::ProfilerDispatch]>,
 ) -> Vec<DispatchSpan> {
+    let first_command_buffer_start_ticks = profiler_timeline.and_then(|timeline| {
+        timeline
+            .command_buffer_timestamps
+            .first()
+            .map(|entry| entry.start_ticks)
+    });
+
+    if let (
+        Some(command_buffer_start_ticks),
+        Some(first_start_ticks),
+        Some(timeline),
+        Some(dispatches),
+    ) = (
+        command_buffer_start_ticks,
+        first_command_buffer_start_ticks,
+        profiler_timeline,
+        profiler_dispatches,
+    ) {
+        let command_buffer_end_ticks = timeline
+            .command_buffer_timestamps
+            .iter()
+            .find(|entry| entry.start_ticks == command_buffer_start_ticks)
+            .map(|entry| entry.end_ticks)
+            .unwrap_or(command_buffer_start_ticks);
+        let mut spans = Vec::with_capacity(region.dispatches.len());
+        for dispatch in &region.dispatches {
+            if let Some(profiler_dispatch) = dispatches.get(dispatch.index)
+                && profiler_dispatch.end_ticks > profiler_dispatch.start_ticks
+                && profiler_dispatch.start_ticks >= command_buffer_start_ticks
+                && profiler_dispatch.end_ticks <= command_buffer_end_ticks
+            {
+                let start_time_ns = ticks_to_ns(
+                    profiler_dispatch
+                        .start_ticks
+                        .saturating_sub(first_start_ticks),
+                    timeline.timebase_numer,
+                    timeline.timebase_denom,
+                );
+                let end_time_ns = ticks_to_ns(
+                    profiler_dispatch
+                        .end_ticks
+                        .saturating_sub(first_start_ticks),
+                    timeline.timebase_numer,
+                    timeline.timebase_denom,
+                );
+                let (encoder_label, encoder_address) = dispatch
+                    .encoder_id
+                    .and_then(|address| {
+                        region
+                            .encoders
+                            .iter()
+                            .find(|encoder| encoder.address == address)
+                            .map(|encoder| (Some(encoder.label.clone()), Some(encoder.address)))
+                    })
+                    .unwrap_or((None, dispatch.encoder_id));
+
+                spans.push(DispatchSpan {
+                    index: dispatch.index,
+                    encoder_address,
+                    encoder_label,
+                    kernel_name: dispatch.kernel_name.clone(),
+                    start_time_ns,
+                    end_time_ns,
+                    duration_ns: end_time_ns
+                        .checked_sub(start_time_ns)
+                        .filter(|duration| *duration > 0),
+                    grid_size: dispatch.grid_size,
+                    group_size: dispatch.group_size,
+                    buffers: dispatch
+                        .buffers
+                        .iter()
+                        .map(bound_buffer_to_timeline)
+                        .collect(),
+                    synthetic: false,
+                });
+                continue;
+            }
+        }
+        if spans.len() == region.dispatches.len() {
+            return spans;
+        }
+    }
+
     let dispatch_count = region.dispatches.len();
     let per_dispatch_duration = duration_ns.and_then(|duration| {
         if dispatch_count == 0 {
@@ -669,6 +787,7 @@ fn build_dispatch_spans(
                 .iter()
                 .map(bound_buffer_to_timeline)
                 .collect(),
+            synthetic: true,
         });
         current_start_ns = span_end_ns;
     }
@@ -865,7 +984,7 @@ fn format_duration_ms(duration_ns: Option<u64>) -> String {
 
 impl DispatchSpan {
     fn synthetic(&self) -> bool {
-        true
+        self.synthetic
     }
 }
 
@@ -877,6 +996,23 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::trace::{CommandBuffer, ComputeEncoder, DispatchCall, MTLResourceUsage};
+
+    fn profiler_summary_with_timeline(
+        timeline: profiler::ProfilerTimelineInfo,
+        dispatches: Vec<profiler::ProfilerDispatch>,
+    ) -> profiler::ProfilerStreamDataSummary {
+        profiler::ProfilerStreamDataSummary {
+            function_names: vec![],
+            pipelines: vec![],
+            dispatches,
+            encoder_timings: vec![],
+            timeline: Some(timeline),
+            num_pipelines: 0,
+            num_gpu_commands: 0,
+            num_encoders: 0,
+            total_time_us: 0,
+        }
+    }
 
     #[test]
     fn builds_synthetic_timeline_report() {
@@ -1007,16 +1143,113 @@ mod tests {
             absolute_time: 99_999,
         };
 
-        let report = build(&regions, Some(&timeline));
+        let summary = profiler_summary_with_timeline(timeline, vec![]);
+        let report = build(&regions, Some(&summary));
 
-        assert!(report.synthetic);
+        assert!(!report.synthetic);
         assert!(report.command_buffers_profiler_backed);
         assert_eq!(report.command_buffers[0].timestamp_ns, 0);
         assert_eq!(report.command_buffers[0].duration_ns, Some(1_500));
         assert_eq!(report.command_buffers[1].timestamp_ns, 2_500);
 
         let text = format_report(&report);
-        assert!(text.contains("Mixed timeline report"));
+        assert!(text.contains("Profiler-backed timeline report"));
+    }
+
+    #[test]
+    fn builds_profiler_backed_dispatch_spans() {
+        let regions = vec![CommandBufferRegion {
+            command_buffer: CommandBuffer {
+                index: 0,
+                timestamp: 1_000_000,
+                offset: 0,
+            },
+            end_offset: 100,
+            encoders: vec![ComputeEncoder {
+                index: 0,
+                address: 0x10,
+                label: "main".to_owned(),
+                offset: 10,
+            }],
+            pipeline_events: vec![],
+            dispatches: vec![
+                DispatchCall {
+                    index: 0,
+                    offset: 20,
+                    encoder_id: Some(0x10),
+                    pipeline_addr: Some(0xaa),
+                    kernel_name: Some("k0".to_owned()),
+                    buffers: vec![],
+                    grid_size: [8, 1, 1],
+                    group_size: [4, 1, 1],
+                },
+                DispatchCall {
+                    index: 1,
+                    offset: 30,
+                    encoder_id: Some(0x10),
+                    pipeline_addr: Some(0xbb),
+                    kernel_name: Some("k1".to_owned()),
+                    buffers: vec![],
+                    grid_size: [16, 1, 1],
+                    group_size: [8, 1, 1],
+                },
+            ],
+        }];
+
+        let timeline = profiler::ProfilerTimelineInfo {
+            command_buffer_timestamps: vec![profiler::ProfilerCommandBufferTimestamp {
+                index: 0,
+                start_ticks: 100,
+                end_ticks: 220,
+            }],
+            encoder_profiles: vec![],
+            timebase_numer: 10,
+            timebase_denom: 1,
+            absolute_time: 0,
+        };
+        let dispatches = vec![
+            profiler::ProfilerDispatch {
+                index: 0,
+                pipeline_index: 0,
+                pipeline_id: None,
+                function_name: Some("k0".to_owned()),
+                encoder_index: 0,
+                cumulative_us: 50,
+                duration_us: 50,
+                sample_count: 2,
+                sampling_density: 0.04,
+                start_ticks: 100,
+                end_ticks: 140,
+            },
+            profiler::ProfilerDispatch {
+                index: 1,
+                pipeline_index: 1,
+                pipeline_id: None,
+                function_name: Some("k1".to_owned()),
+                encoder_index: 0,
+                cumulative_us: 120,
+                duration_us: 70,
+                sample_count: 3,
+                sampling_density: 0.043,
+                start_ticks: 140,
+                end_ticks: 220,
+            },
+        ];
+
+        let summary = profiler_summary_with_timeline(timeline, dispatches);
+        let report = build(&regions, Some(&summary));
+
+        assert!(!report.synthetic);
+        assert!(report.command_buffers_profiler_backed);
+        assert_eq!(report.dispatches[0].start_time_ns, 0);
+        assert_eq!(report.dispatches[0].duration_ns, Some(400));
+        assert_eq!(report.dispatches[1].start_time_ns, 400);
+        assert_eq!(report.dispatches[1].duration_ns, Some(800));
+        assert!(!report.dispatches[0].synthetic);
+        assert!(!report.encoders[0].synthetic);
+
+        let text = format_report(&report);
+        assert!(text.contains("Profiler-backed timeline report"));
     }
 
     #[test]
