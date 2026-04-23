@@ -11,6 +11,7 @@ use crate::diff;
 use crate::error::Result;
 use crate::markdown;
 use crate::shaders;
+use crate::timing;
 use crate::trace::TraceBundle;
 
 #[derive(Debug, Parser)]
@@ -30,6 +31,7 @@ enum CommandSet {
     Dependencies(DependenciesArgs),
     Shaders(ShadersArgs),
     ShaderSource(ShaderSourceArgs),
+    Timing(TimingArgs),
     Buffers(BuffersArgs),
     BufferTimeline(BufferTimelineArgs),
     Diff(DiffArgs),
@@ -103,6 +105,13 @@ struct ShaderSourceArgs {
     search_paths: Vec<PathBuf>,
     #[arg(long, default_value_t = 4)]
     context: usize,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct TimingArgs {
+    trace: PathBuf,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -236,6 +245,16 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", shaders::format_source(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown shader-source format")),
+            }
+        }
+        CommandSet::Timing(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = timing::report(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", timing::format_report(&report)),
+                "csv" => print!("{}", timing::format_csv(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown timing format")),
             }
         }
         CommandSet::Buffers(args) => match args.command {

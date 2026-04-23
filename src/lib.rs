@@ -8,6 +8,7 @@ pub mod diff;
 pub mod error;
 pub mod markdown;
 pub mod shaders;
+pub mod timing;
 pub mod trace;
 
 pub use error::{Error, Result};
