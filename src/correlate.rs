@@ -34,6 +34,8 @@ pub struct CorrelatedShader {
     pub synthetic_percent_of_total: f64,
     pub metric_source: String,
     pub execution_cost_percent: Option<f64>,
+    pub weighted_percent_of_total: Option<f64>,
+    pub kernel_alu_performance: Option<f64>,
     pub execution_cost_samples: usize,
     pub sample_count: usize,
     pub avg_sampling_density: f64,
@@ -159,6 +161,11 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
                 });
         let metric_source = if execution_cost_percent.is_some() {
             "execution-cost"
+        } else if source
+            .and_then(|shader| shader.weighted_percent_of_total)
+            .is_some()
+        {
+            "xcode-weighted"
         } else if source.and_then(|shader| shader.total_duration_ns).is_some() {
             "profiler-duration"
         } else if source
@@ -186,6 +193,8 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
             synthetic_percent_of_total: kernel.percent_of_total,
             metric_source: metric_source.to_owned(),
             execution_cost_percent,
+            weighted_percent_of_total: source.and_then(|shader| shader.weighted_percent_of_total),
+            kernel_alu_performance: source.and_then(|shader| shader.kernel_alu_performance),
             execution_cost_samples,
             sample_count,
             avg_sampling_density,
@@ -225,11 +234,20 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
     }
 
     shaders.sort_by(|left, right| {
-        right
-            .synthetic_total_duration_ns
-            .cmp(&left.synthetic_total_duration_ns)
-            .then_with(|| right.execution_count.cmp(&left.execution_count))
-            .then_with(|| left.shader_name.cmp(&right.shader_name))
+        compare_option_f64_desc(
+            right
+                .execution_cost_percent
+                .or(right.weighted_percent_of_total),
+            left.execution_cost_percent
+                .or(left.weighted_percent_of_total),
+        )
+        .then_with(|| {
+            right
+                .synthetic_total_duration_ns
+                .cmp(&left.synthetic_total_duration_ns)
+        })
+        .then_with(|| right.execution_count.cmp(&left.execution_count))
+        .then_with(|| left.shader_name.cmp(&right.shader_name))
     });
 
     Ok(CorrelationReport {
@@ -296,6 +314,7 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
             shader.synthetic_percent_of_total,
             shader
                 .execution_cost_percent
+                .or(shader.weighted_percent_of_total)
                 .map(|value| format!("{value:.2}"))
                 .unwrap_or_else(|| "-".to_owned()),
             shader.sample_count,
@@ -304,11 +323,19 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
         ));
         if verbose {
             out.push_str(&format!(
-                "           avg={} ns source={} samples/us={:.3} exec_samples={} occ={} occ_conf={} alu={} llc={} dev_bw={} regs={} spills={} tgmem={} inst={} alu_inst={} branch_inst={} compile_ms={} encoders={} buffers={} correlation={}\n",
+                "           avg={} ns source={} samples/us={:.3} exec_samples={} weight_pct={} alu_perf={} occ={} occ_conf={} alu={} llc={} dev_bw={} regs={} spills={} tgmem={} inst={} alu_inst={} branch_inst={} compile_ms={} encoders={} buffers={} correlation={}\n",
                 shader.synthetic_avg_duration_ns,
                 shader.metric_source,
                 shader.avg_sampling_density,
                 shader.execution_cost_samples,
+                shader
+                    .weighted_percent_of_total
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .kernel_alu_performance
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_owned()),
                 shader
                     .occupancy_percent
                     .map(|value| format!("{value:.2}"))
@@ -374,6 +401,17 @@ fn truncate(value: &str, width: usize) -> String {
     format!("{}...", &value[..keep])
 }
 
+fn compare_option_f64_desc(left: Option<f64>, right: Option<f64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left
+            .partial_cmp(&right)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +436,8 @@ mod tests {
                 synthetic_percent_of_total: 100.0,
                 metric_source: "execution-cost".into(),
                 execution_cost_percent: Some(75.0),
+                weighted_percent_of_total: None,
+                kernel_alu_performance: None,
                 execution_cost_samples: 3,
                 sample_count: 4,
                 avg_sampling_density: 0.2,

@@ -110,6 +110,36 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
 
     if profiler_summary.is_none() {
         if let Some(shader_report) = &shader_report {
+            if let Some(top_shader) = shader_report
+                .shaders
+                .iter()
+                .find(|shader| shader.weighted_percent_of_total.is_some())
+            {
+                let weight_percent = top_shader.weighted_percent_of_total.unwrap_or_default();
+                if weight_percent > 50.0 {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Bottleneck,
+                        severity: InsightSeverity::High,
+                        shader_name: Some(top_shader.name.clone()),
+                        title: format!("{} dominates Xcode-weighted cost", top_shader.name),
+                        description: format!(
+                            "{} accounts for {:.1}% of the CSV-weighted shader cost model.",
+                            top_shader.name, weight_percent
+                        ),
+                        recommendations: vec![
+                            "Treat this as the primary optimization target when CSV counters are available."
+                                .to_owned(),
+                            "Use `shader-hotspots` to inspect the most expensive source lines under the weighted model."
+                                .to_owned(),
+                        ],
+                        impact: Some(
+                            "Dominates the fallback cost model derived from Xcode counters."
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
+
             for shader in &shader_report.shaders {
                 if let Some(occupancy) = shader.occupancy_percent
                     && occupancy < 30.0
@@ -183,6 +213,35 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                         ],
                         impact: Some(
                             "Points to memory pressure without needing streamData or raw counter parsing."
+                                .to_owned(),
+                        ),
+                    });
+                }
+
+                if let Some(miss_rate) = shader
+                    .metric_source
+                    .eq("xcode-weighted")
+                    .then_some(shader.last_level_cache_percent)
+                    .flatten()
+                    && miss_rate >= 5.0
+                {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Optimization,
+                        severity: InsightSeverity::Low,
+                        shader_name: Some(shader.name.clone()),
+                        title: format!("{} shows notable cache pressure", shader.name),
+                        description: format!(
+                            "{} reports {:.1}% cache-pressure signal alongside Xcode-weighted cost.",
+                            shader.name, miss_rate
+                        ),
+                        recommendations: vec![
+                            "Inspect memory access stride and reuse around the hottest lines."
+                                .to_owned(),
+                            "Cross-check with `buffer-access` if cache pressure aligns with shared or oversized buffers."
+                                .to_owned(),
+                        ],
+                        impact: Some(
+                            "Suggests memory locality is contributing to the weighted shader cost."
                                 .to_owned(),
                         ),
                     });

@@ -26,6 +26,7 @@ pub struct ShaderEntry {
     pub name: String,
     pub pipeline_addr: u64,
     pub dispatch_count: usize,
+    pub metric_source: String,
     pub simd_groups: u64,
     pub simd_percent_of_total: Option<f64>,
     pub total_duration_ns: Option<u64>,
@@ -37,6 +38,9 @@ pub struct ShaderEntry {
     pub occupancy_percent: Option<f64>,
     pub occupancy_confidence: Option<f64>,
     pub alu_utilization_percent: Option<f64>,
+    pub kernel_alu_performance: Option<f64>,
+    pub weighted_cost: Option<f64>,
+    pub weighted_percent_of_total: Option<f64>,
     pub last_level_cache_percent: Option<f64>,
     pub device_memory_bandwidth_gbps: Option<f64>,
     pub temporary_register_count: Option<i64>,
@@ -106,6 +110,7 @@ struct XcodeCounterMatch {
     alu_utilization_percent: Option<f64>,
     occupancy_percent: Option<f64>,
     device_memory_bandwidth_gbps: Option<f64>,
+    kernel_alu_performance: Option<f64>,
 }
 
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderReport> {
@@ -260,15 +265,34 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 .get(&kernel.pipeline_addr)
                 .cloned()
                 .or_else(|| pipeline_stats_by_name.get(&kernel_name).cloned());
+            let execution_cost_percent = execution_cost_by_name.get(&kernel_name).copied();
+            let weighted_cost = xcode_counter_match
+                .and_then(|entry| entry.kernel_alu_performance)
+                .filter(|value| *value > 0.0)
+                .map(|value| value.powf(0.30));
+            let metric_source = if execution_cost_percent.is_some() {
+                "execution-cost".to_owned()
+            } else if weighted_cost.is_some() {
+                "xcode-weighted".to_owned()
+            } else if total_duration_ns_for_shader.is_some() {
+                "profiler-duration".to_owned()
+            } else if simd_percent_of_total.is_some() {
+                "simd-groups".to_owned()
+            } else if xcode_counter_match.is_some() {
+                "xcode-counters".to_owned()
+            } else {
+                "unattributed".to_owned()
+            };
             ShaderEntry {
                 name: kernel_name.clone(),
                 pipeline_addr: kernel.pipeline_addr,
                 dispatch_count: kernel.dispatch_count,
+                metric_source,
                 simd_groups,
                 simd_percent_of_total,
                 total_duration_ns: total_duration_ns_for_shader,
                 percent_of_total,
-                execution_cost_percent: execution_cost_by_name.get(&kernel_name).copied(),
+                execution_cost_percent,
                 execution_cost_samples: execution_cost_samples_by_name
                     .get(&kernel_name)
                     .copied()
@@ -282,6 +306,10 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 alu_utilization_percent: limiter
                     .map(|(alu, _, _)| alu)
                     .or(xcode_counter_match.and_then(|entry| entry.alu_utilization_percent)),
+                kernel_alu_performance: xcode_counter_match
+                    .and_then(|entry| entry.kernel_alu_performance),
+                weighted_cost,
+                weighted_percent_of_total: None,
                 last_level_cache_percent: limiter.map(|(_, llc, _)| llc),
                 device_memory_bandwidth_gbps: limiter
                     .map(|(_, _, bw)| bw)
@@ -308,8 +336,28 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
             }
         })
         .collect();
+    let total_weighted_cost = shaders
+        .iter()
+        .filter(|shader| shader.execution_cost_percent.is_none())
+        .filter_map(|shader| shader.weighted_cost)
+        .sum::<f64>();
+    if total_weighted_cost > 0.0 {
+        for shader in &mut shaders {
+            if shader.execution_cost_percent.is_none() {
+                shader.weighted_percent_of_total = shader
+                    .weighted_cost
+                    .map(|value| (value / total_weighted_cost) * 100.0);
+            }
+        }
+    }
     shaders.sort_by(|left, right| {
         compare_option_f64_desc(right.execution_cost_percent, left.execution_cost_percent)
+            .then_with(|| {
+                compare_option_f64_desc(
+                    right.weighted_percent_of_total,
+                    left.weighted_percent_of_total,
+                )
+            })
             .then_with(|| compare_option_u64_desc(right.total_duration_ns, left.total_duration_ns))
             .then_with(|| compare_option_f64_desc(right.percent_of_total, left.percent_of_total))
             .then_with(|| right.simd_groups.cmp(&left.simd_groups))
@@ -358,6 +406,8 @@ fn match_xcode_counters(
     let mut occupancy_count = 0usize;
     let mut bw_sum = 0.0;
     let mut bw_count = 0usize;
+    let mut alu_perf_sum = 0.0;
+    let mut alu_perf_count = 0usize;
 
     for encoder in matches {
         if let Some(value) = encoder.counters.get("ALU Utilization").copied() {
@@ -372,12 +422,17 @@ fn match_xcode_counters(
             bw_sum += value;
             bw_count += 1;
         }
+        if let Some(value) = encoder.counters.get("Kernel ALU Performance").copied() {
+            alu_perf_sum += value;
+            alu_perf_count += 1;
+        }
     }
 
     Some(XcodeCounterMatch {
         alu_utilization_percent: (alu_count > 0).then(|| alu_sum / alu_count as f64),
         occupancy_percent: (occupancy_count > 0).then(|| occupancy_sum / occupancy_count as f64),
         device_memory_bandwidth_gbps: (bw_count > 0).then(|| bw_sum / bw_count as f64),
+        kernel_alu_performance: (alu_perf_count > 0).then(|| alu_perf_sum / alu_perf_count as f64),
     })
 }
 
@@ -459,17 +514,10 @@ pub fn hotspot_report(
     let contents = fs::read_to_string(&source.source_file)?;
     let file_lines: Vec<_> = contents.lines().map(ToOwned::to_owned).collect();
     let (start_line, end_line) = function_bounds(&file_lines, source.source_line);
-    let metric_source = if shader.execution_cost_percent.is_some() {
-        "execution-cost".to_owned()
-    } else if shader.percent_of_total.is_some() {
-        "profiler-duration".to_owned()
-    } else if shader.simd_percent_of_total.is_some() {
-        "simd-groups".to_owned()
-    } else {
-        "unattributed".to_owned()
-    };
+    let metric_source = shader.metric_source.clone();
     let total_gpu_percent = shader
         .execution_cost_percent
+        .or(shader.weighted_percent_of_total)
         .or(shader.percent_of_total)
         .or(shader.simd_percent_of_total)
         .unwrap_or(0.0);
@@ -573,6 +621,9 @@ pub fn format_report(report: &ShaderReport) -> String {
             || shader.last_level_cache_percent.is_some()
             || shader.device_memory_bandwidth_gbps.is_some()
     });
+    let has_weighted_metrics = report.shaders.iter().any(|shader| {
+        shader.weighted_percent_of_total.is_some() || shader.kernel_alu_performance.is_some()
+    });
     let has_simd_groups = report.shaders.iter().any(|shader| shader.simd_groups > 0);
     if has_profiler_timing {
         out.push_str(&format!(
@@ -583,9 +634,13 @@ pub fn format_report(report: &ShaderReport) -> String {
             out.push_str(&format!(" {:>12} {:>8}", "SIMD Groups", "SIMD %"));
         }
         out.push_str(&format!(
-            " {:>14} {:>8} {:>8} {:>8} {:>10}",
-            "Duration ns", "Time %", "Exec %", "Samples", "Samples/us",
+            " {:>14} {:>8} {:>8}",
+            "Duration ns", "Time %", "Exec %",
         ));
+        if has_weighted_metrics {
+            out.push_str(&format!(" {:>8} {:>10}", "Weight %", "ALU Perf"));
+        }
+        out.push_str(&format!(" {:>8} {:>10}", "Samples", "Samples/us"));
         if has_pipeline_stats {
             out.push_str(&format!(
                 " {:>6} {:>8} {:>8} {:>8} {:>10}",
@@ -606,6 +661,9 @@ pub fn format_report(report: &ShaderReport) -> String {
         ));
         if has_simd_groups {
             out.push_str(&format!(" {:>12} {:>8}", "SIMD Groups", "SIMD %"));
+        }
+        if has_weighted_metrics {
+            out.push_str(&format!(" {:>8} {:>10}", "Weight %", "ALU Perf"));
         }
         if has_pipeline_stats {
             out.push_str(&format!(
@@ -644,7 +702,7 @@ pub fn format_report(report: &ShaderReport) -> String {
                 ));
             }
             out.push_str(&format!(
-                " {:>14} {:>7} {:>8} {:>8} {:>10}",
+                " {:>14} {:>7} {:>8}",
                 shader
                     .total_duration_ns
                     .map(|value| value.to_string())
@@ -657,6 +715,22 @@ pub fn format_report(report: &ShaderReport) -> String {
                     .execution_cost_percent
                     .map(|value| format!("{value:.2}"))
                     .unwrap_or_else(|| "-".to_owned()),
+            ));
+            if has_weighted_metrics {
+                out.push_str(&format!(
+                    " {:>8} {:>10}",
+                    shader
+                        .weighted_percent_of_total
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .kernel_alu_performance
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                ));
+            }
+            out.push_str(&format!(
+                " {:>8} {:>10}",
                 shader.sample_count,
                 shader
                     .avg_sampling_density
@@ -732,6 +806,19 @@ pub fn format_report(report: &ShaderReport) -> String {
                         .unwrap_or_else(|| "-".to_owned()),
                 ));
             }
+            if has_weighted_metrics {
+                out.push_str(&format!(
+                    " {:>8} {:>10}",
+                    shader
+                        .weighted_percent_of_total
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .kernel_alu_performance
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                ));
+            }
             if has_pipeline_stats {
                 out.push_str(&format!(
                     " {:>6} {:>8} {:>8} {:>8} {:>10}",
@@ -791,7 +878,7 @@ pub fn format_report(report: &ShaderReport) -> String {
 
 pub fn format_csv(report: &ShaderReport) -> String {
     let mut out = String::new();
-    out.push_str("name,pipeline_addr,dispatch_count,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
+    out.push_str("name,pipeline_addr,dispatch_count,metric_source,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,weighted_cost,weighted_percent_of_total,kernel_alu_performance,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
     for shader in &report.shaders {
         let source_file = shader
             .source_file
@@ -802,11 +889,15 @@ pub fn format_csv(report: &ShaderReport) -> String {
             format!("\"{}\"", shader.name.replace('"', "\"\"")),
             format!("0x{:x}", shader.pipeline_addr),
             shader.dispatch_count.to_string(),
+            format!("\"{}\"", shader.metric_source.replace('"', "\"\"")),
             shader.simd_groups.to_string(),
             option_csv(shader.simd_percent_of_total),
             option_csv(shader.total_duration_ns),
             option_csv(shader.percent_of_total),
             option_csv(shader.execution_cost_percent),
+            option_csv(shader.weighted_cost),
+            option_csv(shader.weighted_percent_of_total),
+            option_csv(shader.kernel_alu_performance),
             shader.execution_cost_samples.to_string(),
             shader.sample_count.to_string(),
             option_csv(shader.avg_sampling_density),
@@ -1292,6 +1383,7 @@ mod tests {
                 "ALU Utilization".into(),
                 "Kernel Occupancy".into(),
                 "Device Memory Bandwidth".into(),
+                "Kernel ALU Performance".into(),
             ],
             encoders: vec![XcodeEncoderCounters {
                 index: 0,
@@ -1302,6 +1394,7 @@ mod tests {
                     ("ALU Utilization".into(), 62.5),
                     ("Kernel Occupancy".into(), 37.5),
                     ("Device Memory Bandwidth".into(), 4.2),
+                    ("Kernel ALU Performance".into(), 2048.0),
                 ]),
             }],
         };
@@ -1310,6 +1403,7 @@ mod tests {
         assert_eq!(matched.alu_utilization_percent, Some(62.5));
         assert_eq!(matched.occupancy_percent, Some(37.5));
         assert_eq!(matched.device_memory_bandwidth_gbps, Some(4.2));
+        assert_eq!(matched.kernel_alu_performance, Some(2048.0));
     }
 
     #[test]
@@ -1322,6 +1416,7 @@ mod tests {
                 name: "kernel".into(),
                 pipeline_addr: 0x1234,
                 dispatch_count: 2,
+                metric_source: "execution-cost".into(),
                 simd_groups: 96,
                 simd_percent_of_total: Some(48.0),
                 total_duration_ns: Some(120),
@@ -1333,6 +1428,9 @@ mod tests {
                 occupancy_percent: Some(37.5),
                 occupancy_confidence: Some(0.8),
                 alu_utilization_percent: Some(61.0),
+                kernel_alu_performance: Some(2048.0),
+                weighted_cost: Some(9.85),
+                weighted_percent_of_total: Some(52.0),
                 last_level_cache_percent: Some(0.04),
                 device_memory_bandwidth_gbps: Some(8.2),
                 temporary_register_count: Some(48),
@@ -1353,6 +1451,8 @@ mod tests {
         assert!(output.contains("SIMD %"));
         assert!(output.contains("Time %"));
         assert!(output.contains("Exec %"));
+        assert!(output.contains("Weight %"));
+        assert!(output.contains("ALU Perf"));
         assert!(output.contains("Samples"));
         assert!(output.contains("Samples/us"));
         assert!(output.contains("Occ %"));
@@ -1364,6 +1464,8 @@ mod tests {
         assert!(output.contains("60.00"));
         assert!(output.contains("48.00"));
         assert!(output.contains("55.00"));
+        assert!(output.contains("52.00"));
+        assert!(output.contains("2048.00"));
         assert!(output.contains("37.50"));
         assert!(output.contains("61.00"));
         assert!(output.contains("8.20"));
@@ -1381,11 +1483,15 @@ mod tests {
                 name: "kernel".into(),
                 pipeline_addr: 0x1234,
                 dispatch_count: 2,
+                metric_source: "xcode-weighted".into(),
                 simd_groups: 96,
                 simd_percent_of_total: Some(48.0),
                 total_duration_ns: Some(120),
                 percent_of_total: Some(60.0),
                 execution_cost_percent: Some(55.0),
+                weighted_cost: Some(9.85),
+                weighted_percent_of_total: Some(52.0),
+                kernel_alu_performance: Some(2048.0),
                 execution_cost_samples: 11,
                 sample_count: 4,
                 avg_sampling_density: Some(0.2),
@@ -1407,12 +1513,59 @@ mod tests {
         };
 
         let output = format_csv(&report);
+        assert!(output.contains("metric_source"));
+        assert!(output.contains("weighted_percent_of_total"));
+        assert!(output.contains("kernel_alu_performance"));
         assert!(output.contains("simd_groups"));
         assert!(output.contains("alu_utilization_percent"));
         assert!(output.contains("device_memory_bandwidth_gbps"));
         assert!(output.contains("simd_percent_of_total"));
-        assert!(output.contains("\"kernel\",0x1234,2,96,48"));
+        assert!(output.contains("\"kernel\",0x1234,2,\"xcode-weighted\",96,48"));
         assert!(output.contains("\"/tmp/kernel.metal\",42"));
+    }
+
+    #[test]
+    fn hotspot_prefers_xcode_weighted_percent_when_execution_cost_is_missing() {
+        let shader = ShaderEntry {
+            name: "kernel".into(),
+            pipeline_addr: 0x1234,
+            dispatch_count: 2,
+            metric_source: "xcode-weighted".into(),
+            simd_groups: 0,
+            simd_percent_of_total: None,
+            total_duration_ns: Some(120),
+            percent_of_total: Some(60.0),
+            execution_cost_percent: None,
+            weighted_cost: Some(9.85),
+            weighted_percent_of_total: Some(52.0),
+            kernel_alu_performance: Some(2048.0),
+            execution_cost_samples: 0,
+            sample_count: 0,
+            avg_sampling_density: None,
+            occupancy_percent: None,
+            occupancy_confidence: None,
+            alu_utilization_percent: Some(61.0),
+            last_level_cache_percent: None,
+            device_memory_bandwidth_gbps: None,
+            temporary_register_count: None,
+            spilled_bytes: None,
+            threadgroup_memory: None,
+            instruction_count: None,
+            alu_instruction_count: None,
+            branch_instruction_count: None,
+            compilation_time_ms: None,
+            source_file: Some(PathBuf::from("/tmp/kernel.metal")),
+            source_line: Some(42),
+        };
+
+        assert_eq!(shader.metric_source, "xcode-weighted");
+        assert_eq!(
+            shader
+                .execution_cost_percent
+                .or(shader.weighted_percent_of_total)
+                .or(shader.percent_of_total),
+            Some(52.0)
+        );
     }
 
     #[test]
