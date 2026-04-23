@@ -412,6 +412,10 @@ pub fn hotspot_report(
         shader.instruction_count,
         shader.alu_instruction_count,
         shader.branch_instruction_count,
+        shader.execution_cost_percent,
+        shader.alu_utilization_percent,
+        shader.last_level_cache_percent,
+        shader.device_memory_bandwidth_gbps,
     );
 
     let hotspot_count = lines
@@ -1025,23 +1029,59 @@ fn attribute_line_costs(
     instruction_count: Option<i64>,
     alu_instruction_count: Option<i64>,
     branch_instruction_count: Option<i64>,
+    execution_cost_percent: Option<f64>,
+    alu_utilization_percent: Option<f64>,
+    last_level_cache_percent: Option<f64>,
+    device_memory_bandwidth_gbps: Option<f64>,
 ) {
     let total_cost: f64 = lines.iter().map(|line| line.estimated_cost).sum();
     if total_cost <= f64::EPSILON || total_gpu_percent <= f64::EPSILON {
         return;
     }
 
-    let mut compute_weight = 1.5;
-    let mut memory_weight = 2.0;
-    let mut control_weight = 1.0;
+    let mut compute_weight = 1.25;
+    let mut memory_weight = 1.5;
+    let mut control_weight = 0.75;
     if let Some(total_instructions) = instruction_count.filter(|value| *value > 0) {
+        let total_instructions = total_instructions as f64;
         if let Some(alu) = alu_instruction_count {
-            compute_weight += (alu.max(0) as f64 / total_instructions as f64) * 0.5;
+            let alu_ratio = (alu.max(0) as f64 / total_instructions).clamp(0.0, 1.0);
+            compute_weight += alu_ratio * 1.5;
+            memory_weight += (1.0 - alu_ratio) * 0.35;
         }
         if let Some(branch) = branch_instruction_count {
-            control_weight += (branch.max(0) as f64 / total_instructions as f64) * 0.5;
+            let branch_ratio = (branch.max(0) as f64 / total_instructions).clamp(0.0, 1.0);
+            control_weight += branch_ratio * 3.0;
         }
-        memory_weight += (1.0 - (compute_weight - 1.5).min(1.0)) * 0.25;
+    }
+
+    if let Some(alu_utilization) = alu_utilization_percent {
+        let normalized = normalize_percent_like(alu_utilization);
+        if normalized > 50.0 {
+            compute_weight += (normalized - 50.0) / 100.0;
+        }
+    }
+    if let Some(llc) = last_level_cache_percent {
+        let normalized = normalize_percent_like(llc);
+        if normalized > 5.0 {
+            memory_weight += (normalized / 100.0).min(0.75);
+        }
+    }
+    if let Some(bandwidth) = device_memory_bandwidth_gbps {
+        if bandwidth > 10.0 {
+            memory_weight += 1.0;
+        } else if bandwidth > 2.0 {
+            memory_weight += 0.5;
+        }
+    }
+    if let Some(exec_cost) = execution_cost_percent {
+        if exec_cost > 40.0 {
+            compute_weight += 0.35;
+            memory_weight += 0.35;
+        } else if exec_cost > 20.0 {
+            compute_weight += 0.15;
+            memory_weight += 0.15;
+        }
     }
 
     let weighted_total: f64 = lines
@@ -1070,6 +1110,10 @@ fn attribute_line_costs(
         line.attributed_gpu_percent =
             total_gpu_percent * ((line.estimated_cost * weight) / weighted_total);
     }
+}
+
+fn normalize_percent_like(value: f64) -> f64 {
+    if value <= 1.0 { value * 100.0 } else { value }
 }
 
 fn line_hints(line: &AttributedSourceLine) -> Vec<String> {
@@ -1295,5 +1339,85 @@ mod tests {
         assert!(output.contains("execution-cost"));
         assert!(output.contains("22.50%"));
         assert!(output.contains("texture.read(index)"));
+    }
+
+    #[test]
+    fn hotspot_weighting_prefers_compute_when_alu_mix_is_high() {
+        let mut lines = vec![
+            AttributedSourceLine {
+                line_number: 10,
+                text: "sum += a * b + c;".into(),
+                instruction_type: "compute".into(),
+                complexity: 3,
+                estimated_cost: 6.0,
+                attributed_gpu_percent: 0.0,
+                hotspot: false,
+                hints: vec![],
+            },
+            AttributedSourceLine {
+                line_number: 11,
+                text: "out[gid] = texture.read(gid);".into(),
+                instruction_type: "memory".into(),
+                complexity: 3,
+                estimated_cost: 6.0,
+                attributed_gpu_percent: 0.0,
+                hotspot: false,
+                hints: vec![],
+            },
+        ];
+
+        attribute_line_costs(
+            &mut lines,
+            60.0,
+            Some(1000),
+            Some(850),
+            Some(20),
+            Some(55.0),
+            Some(72.0),
+            Some(0.03),
+            Some(1.2),
+        );
+
+        assert!(lines[0].attributed_gpu_percent > lines[1].attributed_gpu_percent);
+    }
+
+    #[test]
+    fn hotspot_weighting_prefers_memory_when_bandwidth_and_cache_pressure_are_high() {
+        let mut lines = vec![
+            AttributedSourceLine {
+                line_number: 10,
+                text: "sum += a * b + c;".into(),
+                instruction_type: "compute".into(),
+                complexity: 3,
+                estimated_cost: 6.0,
+                attributed_gpu_percent: 0.0,
+                hotspot: false,
+                hints: vec![],
+            },
+            AttributedSourceLine {
+                line_number: 11,
+                text: "out[gid] = texture.read(gid);".into(),
+                instruction_type: "memory".into(),
+                complexity: 3,
+                estimated_cost: 6.0,
+                attributed_gpu_percent: 0.0,
+                hotspot: false,
+                hints: vec![],
+            },
+        ];
+
+        attribute_line_costs(
+            &mut lines,
+            60.0,
+            Some(1000),
+            Some(150),
+            Some(20),
+            Some(48.0),
+            Some(24.0),
+            Some(0.18),
+            Some(14.0),
+        );
+
+        assert!(lines[1].attributed_gpu_percent > lines[0].attributed_gpu_percent);
     }
 }
