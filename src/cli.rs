@@ -782,7 +782,8 @@ pub fn run() -> Result<()> {
             let report = counter_export::report(&trace)?;
             match args.format.as_str() {
                 "text" | "table" => print!("{}", counter_export::format_report(&report)),
-                "csv" => print!("{}", counter_export::format_csv(&report)),
+                "csv" | "xcode-csv" => print!("{}", counter_export::format_xcode_csv(&report)),
+                "internal-csv" => print!("{}", counter_export::format_csv(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown export-counters format")),
             }

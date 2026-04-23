@@ -433,41 +433,68 @@ fn choose_encoder_label(
 fn parse_csv_path(path: &Path) -> Result<XcodeCounterData> {
     let mut reader = csv::Reader::from_path(path)?;
     let headers = reader.headers()?.clone();
-    if headers.len() < 5 {
+    if headers.len() < 4 {
         return Err(Error::InvalidInput(format!(
-            "invalid counters CSV header: expected at least 5 columns, got {}",
+            "invalid counters CSV header: expected at least 4 columns, got {}",
             headers.len()
         )));
     }
-    let metrics = headers
+
+    let header_index = |name: &str| headers.iter().position(|header| header == name);
+    let index_col = header_index("Index")
+        .ok_or_else(|| Error::InvalidInput("missing counters CSV column: Index".to_owned()))?;
+    let function_index_col = header_index("Encoder FunctionIndex").ok_or_else(|| {
+        Error::InvalidInput("missing counters CSV column: Encoder FunctionIndex".to_owned())
+    })?;
+    let command_buffer_col = header_index("CommandBuffer Label").ok_or_else(|| {
+        Error::InvalidInput("missing counters CSV column: CommandBuffer Label".to_owned())
+    })?;
+    let encoder_label_col = header_index("Encoder Label").ok_or_else(|| {
+        Error::InvalidInput("missing counters CSV column: Encoder Label".to_owned())
+    })?;
+    let metadata_columns = [
+        index_col,
+        function_index_col,
+        command_buffer_col,
+        encoder_label_col,
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+
+    let metric_columns = headers
         .iter()
-        .skip(5)
-        .map(ToOwned::to_owned)
+        .enumerate()
+        .filter(|(index, header)| !metadata_columns.contains(index) && !header.trim().is_empty())
+        .filter(|(_, header)| *header != "Debug Group")
+        .map(|(index, header)| (index, header.to_owned()))
+        .collect::<Vec<_>>();
+    let metrics = metric_columns
+        .iter()
+        .map(|(_, metric)| metric.clone())
         .collect::<Vec<_>>();
     let mut encoders = Vec::new();
     for row in reader.records() {
         let row = row?;
-        if row.len() < 5 {
+        if row.len() <= encoder_label_col {
             continue;
         }
         let mut counters = BTreeMap::new();
-        for (index, metric) in metrics.iter().enumerate() {
-            let column = index + 5;
-            if let Some(value) = row.get(column).and_then(parse_optional_f64) {
+        for (column, metric) in &metric_columns {
+            if let Some(value) = row.get(*column).and_then(parse_optional_f64) {
                 counters.insert(metric.clone(), value);
             }
         }
         encoders.push(XcodeEncoderCounters {
             index: row
-                .get(0)
+                .get(index_col)
                 .and_then(parse_optional_usize)
                 .unwrap_or_default(),
             function_index: row
-                .get(1)
+                .get(function_index_col)
                 .and_then(parse_optional_usize)
                 .unwrap_or_default(),
-            command_buffer_label: row.get(2).unwrap_or_default().to_owned(),
-            encoder_label: row.get(3).unwrap_or_default().to_owned(),
+            command_buffer_label: row.get(command_buffer_col).unwrap_or_default().to_owned(),
+            encoder_label: row.get(encoder_label_col).unwrap_or_default().to_owned(),
             counters,
         });
     }
@@ -594,6 +621,26 @@ mod tests {
         assert_eq!(
             data.encoders[0].counters.get("ALU Utilization").copied(),
             Some(62.5)
+        );
+    }
+
+    #[test]
+    fn parses_xcode_counters_csv_with_debug_group_metadata_column() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample Counters.csv");
+        fs::write(
+            &path,
+            "Index,Encoder FunctionIndex,CommandBuffer Label,Debug Group,Encoder Label,,ALU Utilization,Kernel Invocations\n0,7,cb0,debug,enc0,,62.5,42\n",
+        )
+        .unwrap();
+
+        let data = parse_csv_path(&path).unwrap();
+        assert_eq!(data.metrics, vec!["ALU Utilization", "Kernel Invocations"]);
+        assert_eq!(data.encoders[0].command_buffer_label, "cb0");
+        assert_eq!(data.encoders[0].encoder_label, "enc0");
+        assert_eq!(
+            data.encoders[0].counters.get("Kernel Invocations").copied(),
+            Some(42.0)
         );
     }
 
