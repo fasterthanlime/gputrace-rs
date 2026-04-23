@@ -11,8 +11,17 @@ pub struct AnalysisReport {
     pub dispatch_count: usize,
     pub pipeline_function_count: usize,
     pub kernel_count: usize,
+    pub buffer_count: usize,
     pub kernel_stats: Vec<KernelStat>,
+    pub buffer_stats: Vec<BufferStat>,
     pub findings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferStat {
+    pub name: String,
+    pub kernel_count: usize,
+    pub use_count: usize,
 }
 
 pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
@@ -33,6 +42,7 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
             .cmp(&left.dispatch_count)
             .then_with(|| left.name.cmp(&right.name))
     });
+    let buffer_stats = summarize_buffers(&kernel_stats);
     let mut findings = Vec::new();
 
     if summary.device_resource_count == 0 {
@@ -72,6 +82,12 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
             ));
         }
     }
+    if let Some(top_buffer) = buffer_stats.first() {
+        findings.push(format!(
+            "Top buffer: {} ({} uses across {} kernels)",
+            top_buffer.name, top_buffer.use_count, top_buffer.kernel_count
+        ));
+    }
 
     AnalysisReport {
         trace: summary,
@@ -81,7 +97,70 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
         dispatch_count: dispatches.len(),
         pipeline_function_count: pipeline_function_map.len(),
         kernel_count: kernel_stats.len(),
+        buffer_count: buffer_stats.len(),
         kernel_stats,
+        buffer_stats,
         findings,
+    }
+}
+
+fn summarize_buffers(kernel_stats: &[KernelStat]) -> Vec<BufferStat> {
+    let mut buffers: std::collections::BTreeMap<String, BufferStat> =
+        std::collections::BTreeMap::new();
+    for kernel in kernel_stats {
+        for (buffer_name, use_count) in &kernel.buffers {
+            let entry = buffers
+                .entry(buffer_name.clone())
+                .or_insert_with(|| BufferStat {
+                    name: buffer_name.clone(),
+                    kernel_count: 0,
+                    use_count: 0,
+                });
+            entry.kernel_count += 1;
+            entry.use_count += use_count;
+        }
+    }
+    let mut values: Vec<_> = buffers.into_values().collect();
+    values.sort_by(|left, right| {
+        right
+            .use_count
+            .cmp(&left.use_count)
+            .then_with(|| right.kernel_count.cmp(&left.kernel_count))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    values
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::KernelStat;
+
+    #[test]
+    fn summarizes_buffers_across_kernels() {
+        let stats = vec![
+            KernelStat {
+                name: "a".into(),
+                pipeline_addr: 1,
+                dispatch_count: 2,
+                encoder_labels: Default::default(),
+                buffers: [("buf1".into(), 2), ("buf2".into(), 1)]
+                    .into_iter()
+                    .collect(),
+            },
+            KernelStat {
+                name: "b".into(),
+                pipeline_addr: 2,
+                dispatch_count: 3,
+                encoder_labels: Default::default(),
+                buffers: [("buf1".into(), 4)].into_iter().collect(),
+            },
+        ];
+
+        let buffers = summarize_buffers(&stats);
+        assert_eq!(buffers.len(), 2);
+        assert_eq!(buffers[0].name, "buf1");
+        assert_eq!(buffers[0].kernel_count, 2);
+        assert_eq!(buffers[0].use_count, 6);
     }
 }

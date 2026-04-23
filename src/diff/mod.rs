@@ -9,6 +9,7 @@ use crate::trace::TraceBundle;
 pub struct DiffReport {
     pub left: AnalysisReport,
     pub right: AnalysisReport,
+    pub buffer_changes: Vec<BufferChange>,
     pub kernel_changes: Vec<KernelChange>,
     pub summary: Vec<String>,
 }
@@ -21,6 +22,14 @@ pub struct KernelChange {
     pub delta: isize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferChange {
+    pub name: String,
+    pub left_uses: usize,
+    pub right_uses: usize,
+    pub delta: isize,
+}
+
 pub fn diff_paths(left: impl AsRef<Path>, right: impl AsRef<Path>) -> Result<DiffReport> {
     let left = TraceBundle::open(left)?;
     let right = TraceBundle::open(right)?;
@@ -30,6 +39,7 @@ pub fn diff_paths(left: impl AsRef<Path>, right: impl AsRef<Path>) -> Result<Dif
 pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
     let left_report = analyze(left);
     let right_report = analyze(right);
+    let buffer_changes = diff_buffer_stats(&left_report, &right_report);
     let kernel_changes = diff_kernel_stats(&left_report, &right_report);
     let mut summary = Vec::new();
 
@@ -75,6 +85,18 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
             left_report.dispatch_count, right_report.dispatch_count
         ));
     }
+    if left_report.buffer_count != right_report.buffer_count {
+        summary.push(format!(
+            "Buffer count changed: {} -> {}",
+            left_report.buffer_count, right_report.buffer_count
+        ));
+    }
+    if let Some(change) = buffer_changes.first() {
+        summary.push(format!(
+            "Largest buffer use delta: {} ({} -> {}, delta {:+})",
+            change.name, change.left_uses, change.right_uses, change.delta
+        ));
+    }
     if let Some(change) = kernel_changes.first() {
         summary.push(format!(
             "Largest kernel dispatch delta: {} ({} -> {}, delta {:+})",
@@ -88,9 +110,54 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
     DiffReport {
         left: left_report,
         right: right_report,
+        buffer_changes,
         kernel_changes,
         summary,
     }
+}
+
+fn diff_buffer_stats(left: &AnalysisReport, right: &AnalysisReport) -> Vec<BufferChange> {
+    let mut names = std::collections::BTreeSet::new();
+    for stat in &left.buffer_stats {
+        names.insert(stat.name.clone());
+    }
+    for stat in &right.buffer_stats {
+        names.insert(stat.name.clone());
+    }
+
+    let left_map: std::collections::BTreeMap<_, _> = left
+        .buffer_stats
+        .iter()
+        .map(|stat| (stat.name.as_str(), stat.use_count))
+        .collect();
+    let right_map: std::collections::BTreeMap<_, _> = right
+        .buffer_stats
+        .iter()
+        .map(|stat| (stat.name.as_str(), stat.use_count))
+        .collect();
+
+    let mut changes = Vec::new();
+    for name in names {
+        let left_uses = left_map.get(name.as_str()).copied().unwrap_or_default();
+        let right_uses = right_map.get(name.as_str()).copied().unwrap_or_default();
+        if left_uses == right_uses {
+            continue;
+        }
+        changes.push(BufferChange {
+            name,
+            left_uses,
+            right_uses,
+            delta: right_uses as isize - left_uses as isize,
+        });
+    }
+    changes.sort_by(|left, right| {
+        right
+            .delta
+            .abs()
+            .cmp(&left.delta.abs())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    changes
 }
 
 fn diff_kernel_stats(left: &AnalysisReport, right: &AnalysisReport) -> Vec<KernelChange> {
@@ -161,6 +228,7 @@ mod tests {
             dispatch_count: 0,
             pipeline_function_count: 0,
             kernel_count: 2,
+            buffer_count: 0,
             kernel_stats: vec![
                 KernelStat {
                     name: "a".into(),
@@ -177,6 +245,7 @@ mod tests {
                     buffers: Default::default(),
                 },
             ],
+            buffer_stats: vec![],
             findings: vec![],
         };
         let right = AnalysisReport {

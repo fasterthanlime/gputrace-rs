@@ -40,6 +40,7 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
         report.pipeline_function_count
     ));
     out.push_str(&format!("* Kernels: `{}`\n\n", report.kernel_count));
+    out.push_str(&format!("* Buffers: `{}`\n\n", report.buffer_count));
     if report.findings.is_empty() {
         out.push_str("No findings yet.\n");
     } else {
@@ -55,6 +56,15 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
                 stat.name,
                 stat.dispatch_count,
                 stat.buffers.len()
+            ));
+        }
+    }
+    if !report.buffer_stats.is_empty() {
+        out.push_str("\n## Buffers\n\n");
+        for stat in report.buffer_stats.iter().take(10) {
+            out.push_str(&format!(
+                "- `{}`: {} uses across {} kernels\n",
+                stat.name, stat.use_count, stat.kernel_count
             ));
         }
     }
@@ -75,6 +85,15 @@ pub fn diff_report(report: &DiffReport) -> String {
             out.push_str(&format!(
                 "- `{}`: {} -> {} ({:+})\n",
                 change.name, change.left_dispatches, change.right_dispatches, change.delta
+            ));
+        }
+    }
+    if !report.buffer_changes.is_empty() {
+        out.push_str("\n## Buffer Changes\n\n");
+        for change in report.buffer_changes.iter().take(10) {
+            out.push_str(&format!(
+                "- `{}`: {} -> {} ({:+})\n",
+                change.name, change.left_uses, change.right_uses, change.delta
             ));
         }
     }
