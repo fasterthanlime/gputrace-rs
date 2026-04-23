@@ -339,6 +339,66 @@ pub fn diff_report_with_limit(report: &DiffReport, limit: usize) -> String {
             }
             out.push('\n');
         }
+        if !profile.timeline_spike_windows.is_empty() {
+            out.push_str("## Profile Spike Windows\n\n");
+            out.push_str("| Encoder | Left start | Left end | Right start | Right end | Matches | Cumulative delta us | Max abs delta us |\n");
+            out.push_str("|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+            for window in profile.timeline_spike_windows.iter().take(limit) {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {:+} | {} |\n",
+                    window.encoder_index,
+                    window.left_start_source_index,
+                    window.left_end_source_index,
+                    window.right_start_source_index,
+                    window.right_end_source_index,
+                    window.match_count,
+                    window.total_delta_us,
+                    window.max_abs_delta_us
+                ));
+            }
+            out.push('\n');
+        }
+        if !profile.encoder_reports.is_empty() {
+            out.push_str("## Profile Encoder Focus\n\n");
+            out.push_str("| Encoder | Count Left | Count Right | Matched | Matched delta us | Unmatched | Unmatched delta us |\n");
+            out.push_str("|---:|---:|---:|---:|---:|---:|---:|\n");
+            for encoder in profile.encoder_reports.iter().take(limit) {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} | {:+} | {} | {:+} |\n",
+                    encoder.encoder_index,
+                    encoder.left_dispatch_count,
+                    encoder.right_dispatch_count,
+                    encoder.matched_count,
+                    encoder.matched_delta_us,
+                    encoder.unmatched_count,
+                    encoder.unmatched_delta_us
+                ));
+            }
+            out.push('\n');
+        }
+        if !profile.unnamed_dispatch_deltas.is_empty() {
+            out.push_str("## Unnamed Profile Dispatch Deltas\n\n");
+            out.push_str(
+                "| Pipeline | Kernel id | Count Left | Count Right | Left us | Right us | Delta us |\n",
+            );
+            out.push_str("|---:|---|---:|---:|---:|---:|---:|\n");
+            for delta in profile.unnamed_dispatch_deltas.iter().take(limit) {
+                out.push_str(&format!(
+                    "| {} | `{}` | {} | {} | {} | {} | {:+} |\n",
+                    delta
+                        .pipeline_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    escape_markdown_table_cell(&delta.kernel_id),
+                    delta.left_dispatch_count,
+                    delta.right_dispatch_count,
+                    delta.left_total_us,
+                    delta.right_total_us,
+                    delta.total_delta_us
+                ));
+            }
+            out.push('\n');
+        }
         if !profile.unmatched.is_empty() {
             out.push_str("## Unmatched Profile Dispatches\n\n");
             out.push_str("| Trace | Index | Encoder | Function | Duration us |\n");
