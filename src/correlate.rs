@@ -101,7 +101,7 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
     });
 
     Ok(CorrelationReport {
-        synthetic: true,
+        synthetic: timing.synthetic,
         trace_source: trace.path.clone(),
         search_paths: search_paths.to_vec(),
         total_shaders: shaders.len(),
@@ -115,8 +115,15 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
 
 pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
     let mut out = String::new();
-    out.push_str("Synthetic shader correlation report\n");
-    out.push_str("Combines kernel timing, trace attribution, and optional source lookup.\n");
+    if report.synthetic {
+        out.push_str("Synthetic shader correlation report\n");
+        out.push_str("Combines kernel timing, trace attribution, and optional source lookup.\n");
+    } else {
+        out.push_str("Profiler-backed shader correlation report\n");
+        out.push_str(
+            "Combines streamData timing, trace attribution, and optional source lookup.\n",
+        );
+    }
     out.push_str("Hardware profiler counters are not included in this report.\n\n");
     out.push_str(&format!("trace={}\n", report.trace_source.display()));
     out.push_str(&format!(
@@ -129,7 +136,16 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
     ));
     out.push_str(&format!(
         "{:<36} {:>10} {:>16} {:>8} {:<18}  {}\n",
-        "Shader", "Dispatches", "Synthetic ns", "%", "Pipeline", "Source"
+        "Shader",
+        "Dispatches",
+        if report.synthetic {
+            "Synthetic ns"
+        } else {
+            "Duration ns"
+        },
+        "%",
+        "Pipeline",
+        "Source"
     ));
     for shader in &report.shaders {
         let source = match (&shader.source_file, shader.source_line) {

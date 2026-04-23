@@ -51,6 +51,11 @@ pub struct InsightsReport {
 pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsReport> {
     let analysis = analysis::analyze(trace);
     let timing = timing::report(trace)?;
+    let time_label = if timing.synthetic {
+        "synthetic GPU time"
+    } else {
+        "GPU time"
+    };
     let mut insights = Vec::new();
 
     if let Some(top_kernel) = timing.kernels.first() {
@@ -61,8 +66,11 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                 shader_name: Some(top_kernel.name.clone()),
                 title: format!("{} dominates GPU time", top_kernel.name),
                 description: format!(
-                    "{} accounts for {:.1}% of synthetic GPU time across {} dispatches.",
-                    top_kernel.name, top_kernel.percent_of_total, top_kernel.dispatch_count
+                    "{} accounts for {:.1}% of {} across {} dispatches.",
+                    top_kernel.name,
+                    top_kernel.percent_of_total,
+                    time_label,
+                    top_kernel.dispatch_count
                 ),
                 recommendations: vec![
                     "Profile this shader path first.".to_owned(),
@@ -79,8 +87,11 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                 shader_name: Some(top_kernel.name.clone()),
                 title: format!("{} is a major bottleneck", top_kernel.name),
                 description: format!(
-                    "{} accounts for {:.1}% of synthetic GPU time across {} dispatches.",
-                    top_kernel.name, top_kernel.percent_of_total, top_kernel.dispatch_count
+                    "{} accounts for {:.1}% of {} across {} dispatches.",
+                    top_kernel.name,
+                    top_kernel.percent_of_total,
+                    time_label,
+                    top_kernel.dispatch_count
                 ),
                 recommendations: vec![
                     "Focus optimization work on this shader before lower-rank kernels.".to_owned(),
@@ -101,8 +112,15 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                 shader_name: Some(kernel.name.clone()),
                 title: format!("{} shows dispatch overhead pressure", kernel.name),
                 description: format!(
-                    "{} runs {} times with only {:.1} us average synthetic duration.",
-                    kernel.name, kernel.dispatch_count, avg_duration_us
+                    "{} runs {} times with only {:.1} us average {}.",
+                    kernel.name,
+                    kernel.dispatch_count,
+                    avg_duration_us,
+                    if timing.synthetic {
+                        "synthetic duration"
+                    } else {
+                        "duration"
+                    }
                 ),
                 recommendations: vec![
                     "Batch small dispatches when semantics allow.".to_owned(),
@@ -230,8 +248,8 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
             shader_name: Some(top_kernel.name.clone()),
             title: "Optimization focus is unusually clear".to_owned(),
             description: format!(
-                "{} alone accounts for {:.1}% of synthetic GPU time.",
-                top_kernel.name, top_kernel.percent_of_total
+                "{} alone accounts for {:.1}% of {}.",
+                top_kernel.name, top_kernel.percent_of_total, time_label
             ),
             recommendations: vec![
                 "Spend optimization time on this shader before broad trace-wide cleanup."
@@ -273,7 +291,7 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
         .count();
 
     Ok(InsightsReport {
-        synthetic: true,
+        synthetic: timing.synthetic,
         total_gpu_time_ms: timing.total_duration_ns as f64 / 1_000_000.0,
         top_bottlenecks: timing
             .kernels
@@ -293,7 +311,11 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
 pub fn format_report(report: &InsightsReport) -> String {
     let mut out = String::new();
     out.push_str("=== GPU Performance Insights ===\n\n");
-    out.push_str("Synthetic timing and trace attribution only.\n");
+    if report.synthetic {
+        out.push_str("Synthetic timing and trace attribution only.\n");
+    } else {
+        out.push_str("Profiler-backed timing with trace attribution.\n");
+    }
     out.push_str(&format!(
         "Total GPU Time: {:.2} ms\n",
         report.total_gpu_time_ms
