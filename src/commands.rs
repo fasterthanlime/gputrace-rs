@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::error::Result;
+use crate::timing;
 use crate::trace::TraceBundle;
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +70,35 @@ pub struct DependencyEdge {
     pub to: usize,
     pub buffers: Vec<String>,
     pub hazard: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandBuffersReport {
+    pub total_command_buffers: usize,
+    pub total_encoders: usize,
+    pub total_dispatches: usize,
+    pub average_encoders_per_buffer: f64,
+    pub average_dispatches_per_buffer: f64,
+    pub command_buffers: Vec<CommandBufferEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandBufferEntry {
+    pub index: usize,
+    pub offset: usize,
+    pub timestamp_ns: u64,
+    pub duration_ns: Option<u64>,
+    pub encoder_count: usize,
+    pub dispatch_count: usize,
+    pub encoders: Vec<CommandBufferEncoderEntry>,
+    pub kernels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandBufferEncoderEntry {
+    pub index: usize,
+    pub label: String,
+    pub address: u64,
 }
 
 pub fn kernels(trace: &TraceBundle, filter: Option<&str>) -> Result<KernelReport> {
@@ -274,6 +304,72 @@ pub fn dependencies(trace: &TraceBundle) -> Result<DependencyReport> {
     })
 }
 
+pub fn command_buffers(trace: &TraceBundle) -> Result<CommandBuffersReport> {
+    let command_buffers = trace.command_buffers()?;
+    let regions = trace.command_buffer_regions()?;
+    let timing = timing::report(trace)?;
+    let timing_by_index: BTreeMap<_, _> = timing
+        .command_buffers
+        .into_iter()
+        .map(|cb| (cb.index, cb))
+        .collect();
+
+    let mut entries = Vec::new();
+    let mut total_encoders = 0usize;
+    let mut total_dispatches = 0usize;
+
+    for (idx, region) in regions.into_iter().enumerate() {
+        let cb = command_buffers.get(idx).unwrap_or(&region.command_buffer);
+        let kernels: BTreeSet<_> = region
+            .dispatches
+            .iter()
+            .filter_map(|dispatch| dispatch.kernel_name.clone())
+            .collect();
+        let timing = timing_by_index.get(&region.command_buffer.index);
+        total_encoders += region.encoders.len();
+        total_dispatches += region.dispatches.len();
+        entries.push(CommandBufferEntry {
+            index: region.command_buffer.index,
+            offset: cb.offset,
+            timestamp_ns: cb.timestamp,
+            duration_ns: timing.and_then(|cb| cb.duration_ns),
+            encoder_count: region.encoders.len(),
+            dispatch_count: region.dispatches.len(),
+            encoders: region
+                .encoders
+                .into_iter()
+                .map(|encoder| CommandBufferEncoderEntry {
+                    index: encoder.index,
+                    label: encoder.label,
+                    address: encoder.address,
+                })
+                .collect(),
+            kernels: kernels.into_iter().collect(),
+        });
+    }
+
+    let total_command_buffers = entries.len();
+    let average_encoders_per_buffer = if total_command_buffers == 0 {
+        0.0
+    } else {
+        total_encoders as f64 / total_command_buffers as f64
+    };
+    let average_dispatches_per_buffer = if total_command_buffers == 0 {
+        0.0
+    } else {
+        total_dispatches as f64 / total_command_buffers as f64
+    };
+
+    Ok(CommandBuffersReport {
+        total_command_buffers,
+        total_encoders,
+        total_dispatches,
+        average_encoders_per_buffer,
+        average_dispatches_per_buffer,
+        command_buffers: entries,
+    })
+}
+
 pub fn format_encoders(report: &EncoderReport, verbose: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!("{} encoders\n", report.total_encoders));
@@ -367,6 +463,51 @@ pub fn format_dependencies_dot(report: &DependencyReport) -> String {
         ));
     }
     out.push_str("}\n");
+    out
+}
+
+pub fn format_command_buffers(report: &CommandBuffersReport, detailed: bool) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} command buffers\n",
+        report.total_command_buffers
+    ));
+    out.push_str(&format!(
+        "total encoders={}, total dispatches={}, {:.1} encoders/buffer, {:.1} dispatches/buffer\n\n",
+        report.total_encoders,
+        report.total_dispatches,
+        report.average_encoders_per_buffer,
+        report.average_dispatches_per_buffer
+    ));
+    for cb in &report.command_buffers {
+        out.push_str(&format!(
+            "{:>4}: offset=0x{:08x} ts={} duration={} encoders={} dispatches={}\n",
+            cb.index,
+            cb.offset,
+            cb.timestamp_ns,
+            cb.duration_ns
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_owned()),
+            cb.encoder_count,
+            cb.dispatch_count
+        ));
+        if detailed {
+            for encoder in &cb.encoders {
+                let label = if encoder.label.is_empty() {
+                    format!("0x{:x}", encoder.address)
+                } else {
+                    encoder.label.clone()
+                };
+                out.push_str(&format!(
+                    "       encoder {:>3}: {} (0x{:x})\n",
+                    encoder.index, label, encoder.address
+                ));
+            }
+            if !cb.kernels.is_empty() {
+                out.push_str(&format!("       kernels: {}\n", cb.kernels.join(", ")));
+            }
+        }
+    }
     out
 }
 
@@ -466,5 +607,36 @@ mod tests {
         assert!(rendered.contains("digraph G"));
         assert!(rendered.contains("n0 -> n1"));
         assert!(rendered.contains("buf (RW)"));
+    }
+
+    #[test]
+    fn formats_command_buffer_report() {
+        let report = CommandBuffersReport {
+            total_command_buffers: 1,
+            total_encoders: 1,
+            total_dispatches: 2,
+            average_encoders_per_buffer: 1.0,
+            average_dispatches_per_buffer: 2.0,
+            command_buffers: vec![CommandBufferEntry {
+                index: 0,
+                offset: 0x20,
+                timestamp_ns: 100,
+                duration_ns: Some(50),
+                encoder_count: 1,
+                dispatch_count: 2,
+                encoders: vec![CommandBufferEncoderEntry {
+                    index: 0,
+                    label: "enc".into(),
+                    address: 0x33,
+                }],
+                kernels: vec!["kernel".into()],
+            }],
+        };
+
+        let rendered = format_command_buffers(&report, true);
+        assert!(rendered.contains("1 command buffers"));
+        assert!(rendered.contains("offset=0x00000020"));
+        assert!(rendered.contains("encoder   0"));
+        assert!(rendered.contains("kernels: kernel"));
     }
 }

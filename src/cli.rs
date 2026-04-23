@@ -32,6 +32,7 @@ enum CommandSet {
     Shaders(ShadersArgs),
     ShaderSource(ShaderSourceArgs),
     Timing(TimingArgs),
+    CommandBuffers(CommandBuffersArgs),
     Buffers(BuffersArgs),
     BufferTimeline(BufferTimelineArgs),
     Diff(DiffArgs),
@@ -112,6 +113,15 @@ struct ShaderSourceArgs {
 #[derive(Debug, Args)]
 struct TimingArgs {
     trace: PathBuf,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct CommandBuffersArgs {
+    trace: PathBuf,
+    #[arg(short, long)]
+    detailed: bool,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -255,6 +265,18 @@ pub fn run() -> Result<()> {
                 "csv" => print!("{}", timing::format_csv(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown timing format")),
+            }
+        }
+        CommandSet::CommandBuffers(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = commands::command_buffers(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => print!(
+                    "{}",
+                    commands::format_command_buffers(&report, args.detailed)
+                ),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown command-buffers format")),
             }
         }
         CommandSet::Buffers(args) => match args.command {
