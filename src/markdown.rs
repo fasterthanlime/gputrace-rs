@@ -233,10 +233,14 @@ pub fn diff_report(report: &DiffReport) -> String {
             "Profiler Metric Changes",
             report.counter_metric_changes.iter().map(|change| {
                 format!(
-                    "- `{}`: exec {} -> {}, ALU {} -> {}, LLC {} -> {}, Dev BW {} -> {}\n",
+                    "- `{}`: inv {} -> {}, exec {} -> {}, Occ {} -> {}, ALU {} -> {}, LLC {} -> {}, Dev BW {} -> {}\n",
                     change.name,
+                    option_metric(change.left_kernel_invocations),
+                    option_metric(change.right_kernel_invocations),
                     option_metric(change.left_execution_cost_percent),
                     option_metric(change.right_execution_cost_percent),
+                    option_metric(change.left_occupancy_percent),
+                    option_metric(change.right_occupancy_percent),
                     option_metric(change.left_alu_utilization_percent),
                     option_metric(change.right_alu_utilization_percent),
                     option_metric(change.left_last_level_cache_percent),
@@ -522,8 +526,12 @@ mod tests {
             }],
             counter_metric_changes: vec![crate::diff::CounterMetricChange {
                 name: "kernel".into(),
+                left_kernel_invocations: Some(2.0),
+                right_kernel_invocations: Some(5.0),
                 left_execution_cost_percent: Some(40.0),
                 right_execution_cost_percent: Some(55.0),
+                left_occupancy_percent: Some(22.0),
+                right_occupancy_percent: Some(31.0),
                 left_alu_utilization_percent: Some(35.0),
                 right_alu_utilization_percent: Some(48.0),
                 left_last_level_cache_percent: Some(2.0),
@@ -549,7 +557,9 @@ mod tests {
         assert!(rendered.contains("## Profiler Metric Changes"));
         assert!(rendered.contains("## Buffer Changes"));
         assert!(rendered.contains("## Buffer Lifetime Changes"));
-        assert!(rendered.contains("`kernel`: exec 40.00 -> 55.00, ALU 35.00 -> 48.00"));
+        assert!(rendered.contains(
+            "`kernel`: inv 2.00 -> 5.00, exec 40.00 -> 55.00, Occ 22.00 -> 31.00, ALU 35.00 -> 48.00"
+        ));
         assert!(rendered.contains(
             "`buf` [changed]: uses 1 -> 3 (+2), encoders 1 -> 2, command buffers 1 -> 2"
         ));

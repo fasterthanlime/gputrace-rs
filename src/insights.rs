@@ -5,6 +5,7 @@ use crate::analysis;
 use crate::counter;
 use crate::error::{Error, Result};
 use crate::profiler;
+use crate::shaders;
 use crate::timing;
 use crate::trace::TraceBundle;
 
@@ -55,6 +56,7 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
     let analysis = analysis::analyze(trace);
     let timing = timing::report(trace)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    let shader_report = shaders::report(trace, &shaders::default_search_paths()).ok();
     let time_label = if timing.synthetic {
         "synthetic GPU time"
     } else {
@@ -103,6 +105,89 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                 ],
                 impact: Some("Large contributor to GPU runtime.".to_owned()),
             });
+        }
+    }
+
+    if profiler_summary.is_none() {
+        if let Some(shader_report) = &shader_report {
+            for shader in &shader_report.shaders {
+                if let Some(occupancy) = shader.occupancy_percent
+                    && occupancy < 30.0
+                {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Optimization,
+                        severity: if occupancy < 15.0 {
+                            InsightSeverity::High
+                        } else {
+                            InsightSeverity::Medium
+                        },
+                        shader_name: Some(shader.name.clone()),
+                        title: format!("{} shows low kernel occupancy", shader.name),
+                        description: format!(
+                            "{} averages {:.1}% kernel occupancy from imported Xcode counters.",
+                            shader.name, occupancy
+                        ),
+                        recommendations: vec![
+                            "Treat threadgroup size and register pressure as likely occupancy levers."
+                                .to_owned(),
+                            "Validate with `xcode-counters` or `validate-counters` if you have adjacent CSV exports."
+                                .to_owned(),
+                        ],
+                        impact: Some(
+                            "Low occupancy can leave GPU execution resources underutilized."
+                                .to_owned(),
+                        ),
+                    });
+                }
+
+                if let Some(alu) = shader.alu_utilization_percent
+                    && alu > 70.0
+                {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Info,
+                        severity: InsightSeverity::Medium,
+                        shader_name: Some(shader.name.clone()),
+                        title: format!("{} is ALU-heavy", shader.name),
+                        description: format!(
+                            "{} shows {:.1}% ALU utilization from imported Xcode counters.",
+                            shader.name, alu
+                        ),
+                        recommendations: vec![
+                            "Look for approximation opportunities and repeated math on hot lines."
+                                .to_owned(),
+                            "Use `shader-hotspots` to inspect compute-heavy source regions."
+                                .to_owned(),
+                        ],
+                        impact: Some(
+                            "Suggests arithmetic pressure even when raw profiler data is unavailable."
+                                .to_owned(),
+                        ),
+                    });
+                }
+
+                if let Some(dev_bw) = shader.device_memory_bandwidth_gbps
+                    && dev_bw >= 10.0
+                {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Optimization,
+                        severity: InsightSeverity::Medium,
+                        shader_name: Some(shader.name.clone()),
+                        title: format!("{} is bandwidth-heavy", shader.name),
+                        description: format!(
+                            "{} shows {:.2} GB/s device-memory bandwidth from imported Xcode counters.",
+                            shader.name, dev_bw
+                        ),
+                        recommendations: vec![
+                            "Inspect access locality, reuse, and buffer layout.".to_owned(),
+                            "Cross-check with `buffer-access` and `shader-hotspots`.".to_owned(),
+                        ],
+                        impact: Some(
+                            "Points to memory pressure without needing streamData or raw counter parsing."
+                                .to_owned(),
+                        ),
+                    });
+                }
+            }
         }
     }
 

@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::profiler;
 use crate::timeline;
 use crate::trace::TraceBundle;
+use crate::xcode_counters;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CounterExportReport {
@@ -63,6 +64,7 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
     let timeline = timeline::report(trace)?;
     let limiters = counter::extract_limiters_for_trace(&trace.path);
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    let xcode_counter_data = xcode_counters::parse(trace, None).ok();
 
     let limiters_by_encoder = limiters
         .into_iter()
@@ -160,6 +162,49 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             .and_then(|name| pipeline_stats_by_name.get(name));
         let limiter = limiters_by_encoder.get(&encoder.index);
         let occupancy = occupancy_by_encoder.get(&encoder.index).copied();
+        let xcode_match = xcode_counter_data
+            .as_ref()
+            .and_then(|data| match_xcode_encoder(encoder.index, &encoder.label, data));
+        let xcode_metric = |name: &str| {
+            xcode_match
+                .and_then(|encoder| encoder.counters.get(name))
+                .copied()
+        };
+        let kernel_invocations = xcode_metric("Kernel Invocations")
+            .map(|value| value.round().max(0.0) as usize)
+            .unwrap_or(encoder.dispatch_count);
+        let occupancy_percent = occupancy
+            .map(|(percent, _)| percent)
+            .or_else(|| xcode_metric("Kernel Occupancy"));
+        let alu_utilization_percent = limiter
+            .and_then(|limiter| limiter.alu_utilization)
+            .or_else(|| xcode_metric("ALU Utilization"));
+        let device_memory_bandwidth_gbps = limiter
+            .and_then(|limiter| limiter.device_memory_bandwidth_gbps)
+            .or_else(|| xcode_metric("Device Memory Bandwidth"));
+        let buffer_l1_read_bandwidth_gbps = limiter
+            .and_then(|limiter| limiter.buffer_l1_read_bandwidth_gbps)
+            .or_else(|| xcode_metric("Buffer L1 Read Bandwidth"))
+            .or_else(|| xcode_metric("L1 Read Bandwidth"));
+        let buffer_l1_write_bandwidth_gbps = limiter
+            .and_then(|limiter| limiter.buffer_l1_write_bandwidth_gbps)
+            .or_else(|| xcode_metric("Buffer L1 Write Bandwidth"))
+            .or_else(|| xcode_metric("L1 Write Bandwidth"));
+        let metric_source = if execution_cost_percent.is_some() {
+            "execution-cost".to_owned()
+        } else if sample_count > 0 {
+            "streamData".to_owned()
+        } else if xcode_match.is_some()
+            && (occupancy_percent.is_some()
+                || alu_utilization_percent.is_some()
+                || device_memory_bandwidth_gbps.is_some())
+        {
+            "xcode-counters".to_owned()
+        } else if limiter.is_some() {
+            "raw-counter".to_owned()
+        } else {
+            timeline.source.clone()
+        };
 
         rows.push(CounterExportRow {
             row_index: rows.len(),
@@ -172,24 +217,16 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             end_time_ns: encoder.end_time_ns,
             duration_ns: encoder.duration_ns,
             dispatch_count: encoder.dispatch_count,
-            kernel_invocations: encoder.dispatch_count,
-            metric_source: if execution_cost_percent.is_some() {
-                "execution-cost".to_owned()
-            } else if sample_count > 0 {
-                "streamData".to_owned()
-            } else if limiter.is_some() {
-                "raw-counter".to_owned()
-            } else {
-                timeline.source.clone()
-            },
+            kernel_invocations,
+            metric_source,
             execution_cost_percent,
             execution_cost_samples,
             sample_count,
             avg_sampling_density,
-            occupancy_percent: occupancy.map(|(percent, _)| percent),
+            occupancy_percent,
             occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
             occupancy_manager_percent: limiter.and_then(|limiter| limiter.occupancy_manager),
-            alu_utilization_percent: limiter.and_then(|limiter| limiter.alu_utilization),
+            alu_utilization_percent,
             shader_launch_limiter_percent: limiter
                 .and_then(|limiter| limiter.compute_shader_launch.map(normalize_percent_like)),
             instruction_throughput_percent: limiter
@@ -204,12 +241,9 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
                 .and_then(|limiter| limiter.last_level_cache.map(normalize_percent_like)),
             control_flow_percent: limiter
                 .and_then(|limiter| limiter.control_flow.map(normalize_percent_like)),
-            device_memory_bandwidth_gbps: limiter
-                .and_then(|limiter| limiter.device_memory_bandwidth_gbps),
-            buffer_l1_read_bandwidth_gbps: limiter
-                .and_then(|limiter| limiter.buffer_l1_read_bandwidth_gbps),
-            buffer_l1_write_bandwidth_gbps: limiter
-                .and_then(|limiter| limiter.buffer_l1_write_bandwidth_gbps),
+            device_memory_bandwidth_gbps,
+            buffer_l1_read_bandwidth_gbps,
+            buffer_l1_write_bandwidth_gbps,
             temporary_register_count: pipeline_stats.map(|stats| stats.temporary_register_count),
             uniform_register_count: pipeline_stats.map(|stats| stats.uniform_register_count),
             spilled_bytes: pipeline_stats.map(|stats| stats.spilled_bytes),
@@ -227,6 +261,42 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
         total_rows: rows.len(),
         rows,
     })
+}
+
+fn match_xcode_encoder<'a>(
+    encoder_index: usize,
+    encoder_label: &str,
+    data: &'a xcode_counters::XcodeCounterData,
+) -> Option<&'a xcode_counters::XcodeEncoderCounters> {
+    if let Some(exact) = data
+        .encoders
+        .iter()
+        .find(|encoder| encoder.index == encoder_index)
+    {
+        return Some(exact);
+    }
+
+    let normalized_label = normalize_for_matching(encoder_label);
+    if !normalized_label.is_empty() {
+        if let Some(exact) = data
+            .encoders
+            .iter()
+            .find(|encoder| normalize_for_matching(&encoder.encoder_label) == normalized_label)
+        {
+            return Some(exact);
+        }
+
+        if let Some(fuzzy) = data.encoders.iter().find(|encoder| {
+            let normalized_encoder = normalize_for_matching(&encoder.encoder_label);
+            !normalized_encoder.is_empty()
+                && (normalized_encoder.contains(&normalized_label)
+                    || normalized_label.contains(&normalized_encoder))
+        }) {
+            return Some(fuzzy);
+        }
+    }
+
+    data.encoders.get(encoder_index)
 }
 
 pub fn format_report(report: &CounterExportReport) -> String {
@@ -360,9 +430,22 @@ fn normalize_percent_like(value: f64) -> f64 {
     if value <= 1.0 { value * 100.0 } else { value }
 }
 
+fn normalize_for_matching(name: &str) -> String {
+    name.chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                Some(ch.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn formats_counter_export_report() {
@@ -422,5 +505,38 @@ mod tests {
         assert!(csv.contains("\"main_encoder\""));
         assert!(csv.contains("\"blur\""));
         assert!(csv.contains("55"));
+    }
+
+    #[test]
+    fn matches_xcode_encoder_by_index_then_label() {
+        let data = xcode_counters::XcodeCounterData {
+            source: PathBuf::from("/tmp/example.csv"),
+            metrics: vec!["Kernel Occupancy".into()],
+            encoders: vec![
+                xcode_counters::XcodeEncoderCounters {
+                    index: 7,
+                    function_index: 0,
+                    command_buffer_label: "cb0".into(),
+                    encoder_label: "Compute Encoder 7 0x1234".into(),
+                    counters: BTreeMap::new(),
+                },
+                xcode_counters::XcodeEncoderCounters {
+                    index: 99,
+                    function_index: 1,
+                    command_buffer_label: "cb1".into(),
+                    encoder_label: "main_encoder".into(),
+                    counters: BTreeMap::new(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            match_xcode_encoder(7, "ignored", &data).map(|encoder| encoder.index),
+            Some(7)
+        );
+        assert_eq!(
+            match_xcode_encoder(1, "Main Encoder", &data).map(|encoder| encoder.index),
+            Some(99)
+        );
     }
 }

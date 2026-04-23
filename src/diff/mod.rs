@@ -71,8 +71,12 @@ pub struct BufferLifecycleChange {
 #[derive(Debug, Clone, Serialize)]
 pub struct CounterMetricChange {
     pub name: String,
+    pub left_kernel_invocations: Option<f64>,
+    pub right_kernel_invocations: Option<f64>,
     pub left_execution_cost_percent: Option<f64>,
     pub right_execution_cost_percent: Option<f64>,
+    pub left_occupancy_percent: Option<f64>,
+    pub right_occupancy_percent: Option<f64>,
     pub left_alu_utilization_percent: Option<f64>,
     pub right_alu_utilization_percent: Option<f64>,
     pub left_last_level_cache_percent: Option<f64>,
@@ -229,10 +233,14 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
     }
     if let Some(change) = counter_metric_changes.first() {
         summary.push(format!(
-            "Largest profiler metric delta: {} (exec {} -> {}, alu {} -> {}, llc {} -> {}, dev_bw {} -> {})",
+            "Largest profiler metric delta: {} (inv {} -> {}, exec {} -> {}, occ {} -> {}, alu {} -> {}, llc {} -> {}, dev_bw {} -> {})",
             change.name,
+            format_option_f64(change.left_kernel_invocations),
+            format_option_f64(change.right_kernel_invocations),
             format_option_f64(change.left_execution_cost_percent),
             format_option_f64(change.right_execution_cost_percent),
+            format_option_f64(change.left_occupancy_percent),
+            format_option_f64(change.right_occupancy_percent),
             format_option_f64(change.left_alu_utilization_percent),
             format_option_f64(change.right_alu_utilization_percent),
             format_option_f64(change.left_last_level_cache_percent),
@@ -282,8 +290,12 @@ fn diff_counter_metrics(left: &TraceBundle, right: &TraceBundle) -> Vec<CounterM
         }
         changes.push(CounterMetricChange {
             name,
+            left_kernel_invocations: left_metrics.kernel_invocations,
+            right_kernel_invocations: right_metrics.kernel_invocations,
             left_execution_cost_percent: left_metrics.execution_cost_percent,
             right_execution_cost_percent: right_metrics.execution_cost_percent,
+            left_occupancy_percent: left_metrics.occupancy_percent,
+            right_occupancy_percent: right_metrics.occupancy_percent,
             left_alu_utilization_percent: left_metrics.alu_utilization_percent,
             right_alu_utilization_percent: right_metrics.alu_utilization_percent,
             left_last_level_cache_percent: left_metrics.last_level_cache_percent,
@@ -306,28 +318,49 @@ fn aggregate_counter_metrics(
 ) -> std::collections::BTreeMap<String, CounterAggregate> {
     let mut sums = std::collections::BTreeMap::<
         String,
-        (f64, usize, f64, usize, f64, usize, f64, usize),
+        (
+            f64,
+            usize,
+            f64,
+            usize,
+            f64,
+            usize,
+            f64,
+            usize,
+            f64,
+            usize,
+            f64,
+            usize,
+        ),
     >::new();
     for row in &report.rows {
         let Some(name) = row.kernel_name.clone() else {
             continue;
         };
         let entry = sums.entry(name).or_default();
-        if let Some(value) = row.execution_cost_percent {
-            entry.0 += value;
+        if row.kernel_invocations > 0 {
+            entry.0 += row.kernel_invocations as f64;
             entry.1 += 1;
         }
-        if let Some(value) = row.alu_utilization_percent {
+        if let Some(value) = row.execution_cost_percent {
             entry.2 += value;
             entry.3 += 1;
         }
-        if let Some(value) = row.last_level_cache_percent {
+        if let Some(value) = row.occupancy_percent {
             entry.4 += value;
             entry.5 += 1;
         }
-        if let Some(value) = row.device_memory_bandwidth_gbps {
+        if let Some(value) = row.alu_utilization_percent {
             entry.6 += value;
             entry.7 += 1;
+        }
+        if let Some(value) = row.last_level_cache_percent {
+            entry.8 += value;
+            entry.9 += 1;
+        }
+        if let Some(value) = row.device_memory_bandwidth_gbps {
+            entry.10 += value;
+            entry.11 += 1;
         }
     }
 
@@ -336,10 +369,12 @@ fn aggregate_counter_metrics(
             (
                 name,
                 CounterAggregate {
-                    execution_cost_percent: average_option(sums.0, sums.1),
-                    alu_utilization_percent: average_option(sums.2, sums.3),
-                    last_level_cache_percent: average_option(sums.4, sums.5),
-                    device_memory_bandwidth_gbps: average_option(sums.6, sums.7),
+                    kernel_invocations: average_option(sums.0, sums.1),
+                    execution_cost_percent: average_option(sums.2, sums.3),
+                    occupancy_percent: average_option(sums.4, sums.5),
+                    alu_utilization_percent: average_option(sums.6, sums.7),
+                    last_level_cache_percent: average_option(sums.8, sums.9),
+                    device_memory_bandwidth_gbps: average_option(sums.10, sums.11),
                 },
             )
         })
@@ -348,7 +383,9 @@ fn aggregate_counter_metrics(
 
 #[derive(Default, Clone, Copy)]
 struct CounterAggregate {
+    kernel_invocations: Option<f64>,
     execution_cost_percent: Option<f64>,
+    occupancy_percent: Option<f64>,
     alu_utilization_percent: Option<f64>,
     last_level_cache_percent: Option<f64>,
     device_memory_bandwidth_gbps: Option<f64>,
@@ -359,7 +396,9 @@ fn average_option(sum: f64, count: usize) -> Option<f64> {
 }
 
 fn metrics_equal(left: CounterAggregate, right: CounterAggregate) -> bool {
-    approx_option_eq(left.execution_cost_percent, right.execution_cost_percent)
+    approx_option_eq(left.kernel_invocations, right.kernel_invocations)
+        && approx_option_eq(left.execution_cost_percent, right.execution_cost_percent)
+        && approx_option_eq(left.occupancy_percent, right.occupancy_percent)
         && approx_option_eq(left.alu_utilization_percent, right.alu_utilization_percent)
         && approx_option_eq(
             left.last_level_cache_percent,
@@ -381,10 +420,20 @@ fn approx_option_eq(left: Option<f64>, right: Option<f64>) -> bool {
 
 fn aggregate_change_magnitude(change: &CounterMetricChange) -> f64 {
     option_delta(
-        change.left_execution_cost_percent,
-        change.right_execution_cost_percent,
+        change.left_kernel_invocations,
+        change.right_kernel_invocations,
     )
     .abs()
+        + option_delta(
+            change.left_execution_cost_percent,
+            change.right_execution_cost_percent,
+        )
+        .abs()
+        + option_delta(
+            change.left_occupancy_percent,
+            change.right_occupancy_percent,
+        )
+        .abs()
         + option_delta(
             change.left_alu_utilization_percent,
             change.right_alu_utilization_percent,

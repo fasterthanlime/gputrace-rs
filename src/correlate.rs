@@ -9,6 +9,7 @@ use crate::profiler;
 use crate::shaders;
 use crate::timing;
 use crate::trace::TraceBundle;
+use crate::xcode_counters;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CorrelationReport {
@@ -59,6 +60,7 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
     let timing = timing::report(trace)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     let limiter_metrics = counter::extract_limiters_for_trace(&trace.path);
+    let xcode_counter_data = xcode_counters::parse(trace, None).ok();
     let shader_report = shaders::report(trace, search_paths)?;
     let kernel_stats = trace.analyze_kernels()?;
 
@@ -164,6 +166,14 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
             .is_some()
         {
             "simd-groups"
+        } else if xcode_counter_data.is_some()
+            && source.is_some_and(|shader| {
+                shader.occupancy_percent.is_some()
+                    || shader.alu_utilization_percent.is_some()
+                    || shader.device_memory_bandwidth_gbps.is_some()
+            })
+        {
+            "xcode-counters"
         } else {
             "timing-only"
         };
