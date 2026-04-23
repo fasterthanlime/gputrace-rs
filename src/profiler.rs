@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use plist::{Dictionary, Uid, Value};
@@ -42,11 +43,27 @@ pub struct ProfilerEncoderTiming {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilerCommandBufferTimestamp {
+    pub index: usize,
+    pub start_ticks: u64,
+    pub end_ticks: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilerTimelineInfo {
+    pub command_buffer_timestamps: Vec<ProfilerCommandBufferTimestamp>,
+    pub timebase_numer: u64,
+    pub timebase_denom: u64,
+    pub absolute_time: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProfilerStreamDataSummary {
     pub function_names: Vec<String>,
     pub pipelines: Vec<ProfilerPipeline>,
     pub dispatches: Vec<ProfilerDispatch>,
     pub encoder_timings: Vec<ProfilerEncoderTiming>,
+    pub timeline: Option<ProfilerTimelineInfo>,
     pub num_pipelines: usize,
     pub num_gpu_commands: usize,
     pub num_encoders: usize,
@@ -199,6 +216,15 @@ pub fn format_report(report: &ProfilerReport) -> String {
             summary.total_time_us,
             summary.function_names.len()
         ));
+        if let Some(timeline) = &summary.timeline {
+            out.push_str(&format!(
+                "command_buffers={} timebase={}/{} absolute_time={}\n",
+                timeline.command_buffer_timestamps.len(),
+                timeline.timebase_numer,
+                timeline.timebase_denom,
+                timeline.absolute_time
+            ));
+        }
 
         let top = top_dispatch_functions(summary);
         if !top.is_empty() {
@@ -263,6 +289,7 @@ fn parse_stream_data(path: &Path) -> Result<ProfilerStreamDataSummary> {
     let pipelines = extract_pipelines(objects, root, &pipeline_addresses, &pipeline_functions);
     let encoder_timings = extract_encoder_timings(objects, root);
     let dispatches = extract_dispatches(objects, root, &pipelines);
+    let timeline = extract_timeline(objects, root);
 
     Ok(ProfilerStreamDataSummary {
         function_names,
@@ -276,6 +303,7 @@ fn parse_stream_data(path: &Path) -> Result<ProfilerStreamDataSummary> {
         pipelines,
         dispatches,
         encoder_timings,
+        timeline,
     })
 }
 
@@ -479,6 +507,112 @@ fn extract_dispatches(
     dispatches
 }
 
+fn extract_timeline(objects: &[Value], root: &Dictionary) -> Option<ProfilerTimelineInfo> {
+    let blobs = ns_data_array_from_root_key(objects, root, "APSTimelineData");
+    (!blobs.is_empty())
+        .then(|| parse_aps_timeline_data(&blobs))
+        .flatten()
+}
+
+fn parse_aps_timeline_data(blobs: &[Vec<u8>]) -> Option<ProfilerTimelineInfo> {
+    let mut info = ProfilerTimelineInfo {
+        command_buffer_timestamps: Vec::new(),
+        timebase_numer: 1,
+        timebase_denom: 1,
+        absolute_time: 0,
+    };
+
+    for blob in blobs.iter().rev() {
+        if blob.len() > 1000 && parse_timeline_metadata_blob(blob, &mut info) {
+            return Some(info);
+        }
+    }
+
+    for blob in blobs.iter().rev() {
+        if parse_timeline_metadata_blob(blob, &mut info) {
+            return Some(info);
+        }
+    }
+
+    None
+}
+
+fn parse_timeline_metadata_blob(data: &[u8], info: &mut ProfilerTimelineInfo) -> bool {
+    let Ok(plist) = Value::from_reader(Cursor::new(data)) else {
+        return false;
+    };
+    let Some(archive) = plist.as_dictionary() else {
+        return false;
+    };
+    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(top) = archive.get("$top").and_then(Value::as_dictionary) else {
+        return false;
+    };
+    let Some(root_uid) = top.get("root").and_then(as_uid) else {
+        return false;
+    };
+    let Some(root) = object_dictionary(objects, root_uid) else {
+        return false;
+    };
+    let Some(keys) = root.get("NS.keys").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(values) = root.get("NS.objects").and_then(Value::as_array) else {
+        return false;
+    };
+    if keys.len() != values.len() {
+        return false;
+    }
+
+    let mut found = false;
+    for (key, value) in keys.iter().zip(values.iter()) {
+        let Some(key_uid) = as_uid(key) else {
+            continue;
+        };
+        let Some(key_name) = object(objects, key_uid).and_then(Value::as_string) else {
+            continue;
+        };
+        let Some(resolved) = resolve_value(objects, value) else {
+            continue;
+        };
+
+        match key_name {
+            "Command Buffer Timestamps" => {
+                if let Some(data) = ns_data_from_value(resolved) {
+                    info.command_buffer_timestamps = parse_command_buffer_timestamps(data);
+                    found = !info.command_buffer_timestamps.is_empty();
+                }
+            }
+            "Absolute Time" => {
+                info.absolute_time = extract_scalar_u64(objects, resolved).unwrap_or_default();
+            }
+            "Timebase" => {
+                if let Some((numer, denom)) = extract_timebase(objects, resolved) {
+                    info.timebase_numer = numer.max(1);
+                    info.timebase_denom = denom.max(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    found
+}
+
+fn parse_command_buffer_timestamps(data: &[u8]) -> Vec<ProfilerCommandBufferTimestamp> {
+    let mut timestamps = Vec::with_capacity(data.len() / 16);
+    for (index, chunk) in data.chunks_exact(16).enumerate() {
+        timestamps.push(ProfilerCommandBufferTimestamp {
+            index,
+            start_ticks: read_u64(chunk, 0),
+            end_ticks: read_u64(chunk, 8),
+        });
+    }
+    timestamps
+}
+
 pub(crate) fn find_profiler_directory(path: &Path) -> Option<PathBuf> {
     if path
         .extension()
@@ -571,6 +705,75 @@ fn ns_objects_from_root_key<'a>(
         .collect()
 }
 
+fn ns_data_array_from_root_key(objects: &[Value], root: &Dictionary, key: &str) -> Vec<Vec<u8>> {
+    let Some(uid) = root.get(key).and_then(as_uid) else {
+        return Vec::new();
+    };
+    let Some(array_dict) = object_dictionary(objects, uid) else {
+        return Vec::new();
+    };
+    let Some(values) = array_dict.get("NS.objects").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    values
+        .iter()
+        .filter_map(|value| resolve_value(objects, value))
+        .filter_map(|value| {
+            value
+                .as_dictionary()
+                .and_then(|dict| dict.get("NS.data"))
+                .and_then(Value::as_data)
+                .map(|bytes| bytes.to_vec())
+        })
+        .collect()
+}
+
+fn ns_data_from_value(value: &Value) -> Option<&[u8]> {
+    value
+        .as_dictionary()
+        .and_then(|dict| dict.get("NS.data"))
+        .and_then(Value::as_data)
+        .or_else(|| value.as_data())
+}
+
+fn extract_scalar_u64(objects: &[Value], value: &Value) -> Option<u64> {
+    as_u64(value).or_else(|| {
+        value
+            .as_dictionary()
+            .and_then(|dict| dict.get("NS.objects"))
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| resolve_value(objects, entry))
+            .and_then(as_u64)
+    })
+}
+
+fn extract_timebase(objects: &[Value], value: &Value) -> Option<(u64, u64)> {
+    let entries = value
+        .as_dictionary()
+        .and_then(|dict| dict.get("NS.objects"))
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())?;
+
+    let numer = entries
+        .first()
+        .and_then(|entry| resolve_value(objects, entry))
+        .and_then(|entry| extract_scalar_u64(objects, entry))?;
+    let denom = entries
+        .get(1)
+        .and_then(|entry| resolve_value(objects, entry))
+        .and_then(|entry| extract_scalar_u64(objects, entry))?;
+    Some((numer, denom))
+}
+
+fn resolve_value<'a>(objects: &'a [Value], value: &'a Value) -> Option<&'a Value> {
+    match value {
+        Value::Uid(uid) => object(objects, *uid),
+        other => Some(other),
+    }
+}
+
 fn as_uid(value: &Value) -> Option<Uid> {
     match value {
         Value::Uid(uid) => Some(*uid),
@@ -639,6 +842,10 @@ mod tests {
 
     fn data(bytes: Vec<u8>) -> Value {
         dict(&[("NS.data", Value::Data(bytes))])
+    }
+
+    fn array(entries: &[Value]) -> Value {
+        dict(&[("NS.objects", Value::Array(entries.to_vec()))])
     }
 
     fn array_uids(values: &[u64]) -> Value {
@@ -713,6 +920,54 @@ mod tests {
         dict(&[("$objects", Value::Array(objects))])
     }
 
+    fn timeline_blob() -> Vec<u8> {
+        let mut timestamps = Vec::new();
+        timestamps.extend_from_slice(&100_u64.to_le_bytes());
+        timestamps.extend_from_slice(&160_u64.to_le_bytes());
+        timestamps.extend_from_slice(&200_u64.to_le_bytes());
+        timestamps.extend_from_slice(&320_u64.to_le_bytes());
+
+        let metadata = dict(&[
+            ("$top", dict(&[("root", uid(1))])),
+            (
+                "$objects",
+                Value::Array(vec![
+                    string("$null"),
+                    dict_uids(&[2, 3, 4], &[5, 9, 6]),
+                    string("Command Buffer Timestamps"),
+                    string("Absolute Time"),
+                    string("Timebase"),
+                    data(timestamps),
+                    array(&[uid(7), uid(8)]),
+                    integer(125),
+                    integer(3),
+                    integer(99_999),
+                ]),
+            ),
+        ]);
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metadata.plist");
+        metadata.to_file_binary(&path).unwrap();
+        fs::read(path).unwrap()
+    }
+
+    fn streamdata_fixture_with_timeline() -> Value {
+        let mut fixture = streamdata_fixture();
+        let objects = fixture
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("$objects")
+            .and_then(Value::as_array_mut)
+            .unwrap();
+        objects[1]
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("APSTimelineData".to_owned(), uid(12));
+        objects.push(array(&[data(vec![0u8; 32]), data(timeline_blob())]));
+        fixture
+    }
+
     #[test]
     fn finds_adjacent_profiler_directory() {
         let dir = tempdir().unwrap();
@@ -752,6 +1007,27 @@ mod tests {
             Some("kernel_main")
         );
         assert_eq!(summary.dispatches[0].duration_us, 90);
+        assert!(summary.timeline.is_none());
+    }
+
+    #[test]
+    fn parses_timeline_metadata_from_streamdata() {
+        let dir = tempdir().unwrap();
+        let stream_data_path = dir.path().join("streamData");
+        streamdata_fixture_with_timeline()
+            .to_file_binary(&stream_data_path)
+            .unwrap();
+
+        let summary = parse_stream_data(&stream_data_path).unwrap();
+        let timeline = summary.timeline.expect("timeline metadata");
+        assert_eq!(timeline.timebase_numer, 125);
+        assert_eq!(timeline.timebase_denom, 3);
+        assert_eq!(timeline.absolute_time, 99_999);
+        assert_eq!(timeline.command_buffer_timestamps.len(), 2);
+        assert_eq!(timeline.command_buffer_timestamps[0].start_ticks, 100);
+        assert_eq!(timeline.command_buffer_timestamps[0].end_ticks, 160);
+        assert_eq!(timeline.command_buffer_timestamps[1].start_ticks, 200);
+        assert_eq!(timeline.command_buffer_timestamps[1].end_ticks, 320);
     }
 
     #[test]
@@ -819,6 +1095,16 @@ mod tests {
                     end_offset_micros: 250,
                     duration_micros: 250,
                 }],
+                timeline: Some(ProfilerTimelineInfo {
+                    command_buffer_timestamps: vec![ProfilerCommandBufferTimestamp {
+                        index: 0,
+                        start_ticks: 100,
+                        end_ticks: 160,
+                    }],
+                    timebase_numer: 125,
+                    timebase_denom: 3,
+                    absolute_time: 99_999,
+                }),
                 num_pipelines: 1,
                 num_gpu_commands: 1,
                 num_encoders: 1,
@@ -842,5 +1128,6 @@ mod tests {
         assert!(text.contains("GPU Profiler Inventory"));
         assert!(text.contains("streamData=present"));
         assert!(text.contains("kernel_main"));
+        assert!(text.contains("command_buffers=1"));
     }
 }

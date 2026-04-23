@@ -168,18 +168,38 @@ fn report_from_profiler(
     summary: &profiler::ProfilerStreamDataSummary,
 ) -> TimingReport {
     let command_buffers = trace.command_buffers().unwrap_or_default();
+    let command_buffer_regions = trace.command_buffer_regions().unwrap_or_default();
+    let profiler_command_buffers = summary
+        .timeline
+        .as_ref()
+        .map(command_buffer_timings_from_timeline)
+        .unwrap_or_default();
 
     let command_buffer_timings = command_buffers
         .iter()
         .enumerate()
         .map(|(index, cb)| CommandBufferTiming {
             index: cb.index,
-            timestamp_ns: cb.timestamp,
-            duration_ns: command_buffers
-                .get(index + 1)
-                .and_then(|next| next.timestamp.checked_sub(cb.timestamp)),
-            encoder_count: 0,
-            dispatch_count: 0,
+            timestamp_ns: profiler_command_buffers
+                .get(index)
+                .map(|profiler| profiler.timestamp_ns)
+                .unwrap_or(cb.timestamp),
+            duration_ns: profiler_command_buffers
+                .get(index)
+                .and_then(|profiler| profiler.duration_ns)
+                .or_else(|| {
+                    command_buffers
+                        .get(index + 1)
+                        .and_then(|next| next.timestamp.checked_sub(cb.timestamp))
+                }),
+            encoder_count: command_buffer_regions
+                .get(index)
+                .map(|region| region.encoders.len())
+                .unwrap_or(0),
+            dispatch_count: command_buffer_regions
+                .get(index)
+                .map(|region| region.dispatches.len())
+                .unwrap_or(0),
         })
         .collect::<Vec<_>>();
 
@@ -253,15 +273,54 @@ fn report_from_profiler(
     }
 }
 
+fn command_buffer_timings_from_timeline(
+    timeline: &profiler::ProfilerTimelineInfo,
+) -> Vec<CommandBufferTiming> {
+    let first_start = timeline
+        .command_buffer_timestamps
+        .first()
+        .map(|entry| entry.start_ticks)
+        .unwrap_or_default();
+
+    timeline
+        .command_buffer_timestamps
+        .iter()
+        .map(|entry| CommandBufferTiming {
+            index: entry.index,
+            timestamp_ns: ticks_to_ns(
+                entry.start_ticks.saturating_sub(first_start),
+                timeline.timebase_numer,
+                timeline.timebase_denom,
+            ),
+            duration_ns: Some(ticks_to_ns(
+                entry.end_ticks.saturating_sub(entry.start_ticks),
+                timeline.timebase_numer,
+                timeline.timebase_denom,
+            )),
+            encoder_count: 0,
+            dispatch_count: 0,
+        })
+        .collect()
+}
+
+fn ticks_to_ns(ticks: u64, numer: u64, denom: u64) -> u64 {
+    ticks.saturating_mul(numer.max(1)) / denom.max(1)
+}
+
 pub fn format_report(report: &TimingReport) -> String {
     let mut out = String::new();
+    let duration_label = if report.synthetic {
+        "Synthetic ns"
+    } else {
+        "Duration ns"
+    };
     if report.synthetic {
         out.push_str("Synthetic timing report\n");
         out.push_str("Derived from command-buffer timestamps and dispatch attribution.\n\n");
     } else {
         out.push_str("Profiler-backed timing report\n");
         out.push_str(
-            "Kernel, dispatch, and encoder timing come from streamData; command-buffer rows still use trace timestamps when available.\n\n",
+            "Kernel, dispatch, and encoder timing come from streamData; command-buffer rows prefer APSTimelineData spans when present.\n\n",
         );
     }
     out.push_str(&format!(
@@ -275,7 +334,7 @@ pub fn format_report(report: &TimingReport) -> String {
         out.push_str("Kernels:\n");
         out.push_str(&format!(
             "{:<36} {:>10} {:>16} {:>8}\n",
-            "Name", "Dispatches", "Synthetic ns", "%"
+            "Name", "Dispatches", duration_label, "%"
         ));
         for kernel in report.kernels.iter().take(20) {
             out.push_str(&format!(
@@ -292,7 +351,7 @@ pub fn format_report(report: &TimingReport) -> String {
         out.push_str("Encoders:\n");
         out.push_str(&format!(
             "{:<32} {:>10} {:>16}\n",
-            "Label", "Dispatches", "Synthetic ns"
+            "Label", "Dispatches", duration_label
         ));
         for encoder in report.encoders.iter().take(20) {
             let label = if encoder.label.is_empty() {
@@ -400,5 +459,40 @@ mod tests {
         let csv = format_csv(&report);
         assert!(csv.contains("kernel,kernel,2,100,100"));
         assert!(csv.contains("encoder,enc,2,100"));
+    }
+
+    #[test]
+    fn formats_profiler_backed_report() {
+        let report = TimingReport {
+            synthetic: false,
+            total_duration_ns: 1_500,
+            command_buffer_count: 1,
+            encoder_count: 1,
+            dispatch_count: 2,
+            command_buffers: vec![CommandBufferTiming {
+                index: 0,
+                timestamp_ns: 0,
+                duration_ns: Some(1_500),
+                encoder_count: 1,
+                dispatch_count: 2,
+            }],
+            encoders: vec![EncoderTiming {
+                label: "enc".into(),
+                address: 1,
+                dispatch_count: 2,
+                synthetic_duration_ns: 1_500,
+            }],
+            kernels: vec![KernelTiming {
+                name: "kernel".into(),
+                dispatch_count: 2,
+                synthetic_duration_ns: 1_500,
+                percent_of_total: 100.0,
+            }],
+        };
+
+        let text = format_report(&report);
+        assert!(text.contains("Profiler-backed timing report"));
+        assert!(text.contains("APSTimelineData"));
+        assert!(text.contains("Duration ns"));
     }
 }
