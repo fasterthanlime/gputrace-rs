@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod automation;
+pub mod buffer_timeline;
 pub mod cli;
 pub mod diff;
 pub mod error;

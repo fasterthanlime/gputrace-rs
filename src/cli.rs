@@ -4,6 +4,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::analysis;
 use crate::automation::{self, XcodeProfileRun};
+use crate::buffer_timeline;
 use crate::diff;
 use crate::error::Result;
 use crate::markdown;
@@ -21,6 +22,7 @@ pub struct Cli {
 enum CommandSet {
     Stats(TracePath),
     Analyze(TracePath),
+    BufferTimeline(BufferTimelineArgs),
     Diff(DiffArgs),
     Markdown(MarkdownArgs),
     XcodeProfile(XcodeProfileArgs),
@@ -37,6 +39,15 @@ struct DiffArgs {
     right: PathBuf,
     #[arg(long)]
     markdown: bool,
+}
+
+#[derive(Debug, Args)]
+struct BufferTimelineArgs {
+    trace: PathBuf,
+    #[arg(short, long, default_value = "ascii")]
+    format: String,
+    #[arg(short, long, default_value_t = 100)]
+    width: usize,
 }
 
 #[derive(Debug, Args)]
@@ -76,6 +87,16 @@ pub fn run() -> Result<()> {
             let trace = TraceBundle::open(args.trace)?;
             let report = analysis::analyze(&trace);
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        CommandSet::BufferTimeline(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = buffer_timeline::analyze(&trace);
+            match args.format.as_str() {
+                "ascii" => print!("{}", buffer_timeline::format_ascii(&report, args.width)),
+                "summary" => print!("{}", buffer_timeline::format_summary(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown buffer timeline format")),
+            }
         }
         CommandSet::Diff(args) => {
             let report = diff::diff_paths(args.left, args.right)?;
