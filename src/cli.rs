@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::{io, io::Write};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -59,6 +60,7 @@ enum CommandSet {
     Insights(InsightsArgs),
     Diff(DiffArgs),
     Markdown(MarkdownArgs),
+    Version(VersionArgs),
     XcodeProfile(XcodeProfileArgs),
 }
 
@@ -104,9 +106,17 @@ struct AnalyzeUsageArgs {
 struct ClearBuffersArgs {
     trace: PathBuf,
     #[arg(long, default_value_t = false)]
-    execute: bool,
+    dry_run: bool,
+    #[arg(short = 'y', long, default_value_t = false)]
+    yes: bool,
     #[arg(short, long, default_value = "text")]
     format: String,
+}
+
+#[derive(Debug, Args)]
+struct VersionArgs {
+    #[arg(long, default_value_t = false)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -360,23 +370,39 @@ pub fn run() -> Result<()> {
         }
         CommandSet::ClearBuffers(args) => {
             let report = clear_buffers::inventory(&args.trace)?;
-            if args.execute {
+            if args.dry_run {
+                match args.format.as_str() {
+                    "text" | "table" => {
+                        let mut text = clear_buffers::format_report(&report);
+                        if !report.is_empty() {
+                            text.push_str("\n\nDry run: no changes made\n");
+                        }
+                        print!("{text}");
+                    }
+                    "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                    _ => return Err(crate::Error::Unsupported("unknown clear-buffers format")),
+                }
+            } else if report.is_empty() {
+                match args.format.as_str() {
+                    "text" | "table" => print!("{}", clear_buffers::format_report(&report)),
+                    "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                    _ => return Err(crate::Error::Unsupported("unknown clear-buffers format")),
+                }
+            } else {
+                if !args.yes && !confirm_clear_buffers(&report)? {
+                    print!("Cancelled\n");
+                    return Ok(());
+                }
                 let run = clear_buffers::clear_report(&report)?;
                 match args.format.as_str() {
                     "text" | "table" => {
                         print!(
-                            "Cleared {} buffer files ({} total)\n",
+                            "Zeroed {} buffer files ({})\n",
                             run.files_cleared,
                             clear_buffers::format_byte_size(run.bytes_cleared)
                         );
                     }
                     "json" => println!("{}", serde_json::to_string_pretty(&run)?),
-                    _ => return Err(crate::Error::Unsupported("unknown clear-buffers format")),
-                }
-            } else {
-                match args.format.as_str() {
-                    "text" | "table" => print!("{}", clear_buffers::format_report(&report)),
-                    "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                     _ => return Err(crate::Error::Unsupported("unknown clear-buffers format")),
                 }
             }
@@ -686,6 +712,17 @@ pub fn run() -> Result<()> {
                 print!("{}", buffers::markdown_diff(&report));
             }
         },
+        CommandSet::Version(args) => {
+            let info = serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "package": env!("CARGO_PKG_NAME"),
+            });
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            } else {
+                println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            }
+        }
         CommandSet::XcodeProfile(args) => {
             if args.activate {
                 automation::activate_xcode()?;
@@ -702,6 +739,19 @@ pub fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn confirm_clear_buffers(report: &clear_buffers::ClearBuffersReport) -> Result<bool> {
+    print!(
+        "{}\n\nZero out all buffer files? [y/N]: ",
+        clear_buffers::format_report(report)
+    );
+    io::stdout().flush()?;
+
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    let response = response.trim().to_ascii_lowercase();
+    Ok(matches!(response.as_str(), "y" | "yes"))
 }
 
 fn parse_record_type(value: &str) -> Result<RecordType> {
