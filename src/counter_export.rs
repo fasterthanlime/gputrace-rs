@@ -29,6 +29,7 @@ pub struct CounterExportRow {
     pub end_time_ns: u64,
     pub duration_ns: Option<u64>,
     pub dispatch_count: usize,
+    pub kernel_invocations: usize,
     pub metric_source: String,
     pub execution_cost_percent: Option<f64>,
     pub execution_cost_samples: usize,
@@ -171,6 +172,7 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             end_time_ns: encoder.end_time_ns,
             duration_ns: encoder.duration_ns,
             dispatch_count: encoder.dispatch_count,
+            kernel_invocations: encoder.dispatch_count,
             metric_source: if execution_cost_percent.is_some() {
                 "execution-cost".to_owned()
             } else if sample_count > 0 {
@@ -237,11 +239,11 @@ pub fn format_report(report: &CounterExportReport) -> String {
         report.total_rows
     ));
     out.push_str(
-        "row cb enc label kernel source duration_ns dispatches exec% samples occ occ_mgr alu llc dev_bw regs spills inst\n",
+        "row cb enc label kernel source duration_ns dispatches invocations exec% samples occ occ_mgr alu llc dev_bw regs spills inst\n",
     );
     for row in &report.rows {
         out.push_str(&format!(
-            "{:>3} {:>2} {:>3} {:<16} {:<20} {:<14} {:>12} {:>10} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6} {:>6} {:>6}\n",
+            "{:>3} {:>2} {:>3} {:<16} {:<20} {:<14} {:>12} {:>10} {:>10} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6} {:>6} {:>6}\n",
             row.row_index,
             row.command_buffer_index,
             row.encoder_index,
@@ -252,6 +254,7 @@ pub fn format_report(report: &CounterExportReport) -> String {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_owned()),
             row.dispatch_count,
+            row.kernel_invocations,
             row.execution_cost_percent
                 .map(|value| format!("{value:.2}"))
                 .unwrap_or_else(|| "-".to_owned()),
@@ -287,7 +290,7 @@ pub fn format_report(report: &CounterExportReport) -> String {
 
 pub fn format_csv(report: &CounterExportReport) -> String {
     let mut out = String::new();
-    out.push_str("row_index,command_buffer_index,encoder_index,encoder_label,kernel_name,pipeline_addr,start_time_ns,end_time_ns,duration_ns,dispatch_count,metric_source,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,occupancy_manager_percent,alu_utilization_percent,shader_launch_limiter_percent,instruction_throughput_percent,integer_complex_percent,f32_limiter_percent,l1_cache_percent,last_level_cache_percent,control_flow_percent,device_memory_bandwidth_gbps,buffer_l1_read_bandwidth_gbps,buffer_l1_write_bandwidth_gbps,temporary_register_count,uniform_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms\n");
+    out.push_str("row_index,command_buffer_index,encoder_index,encoder_label,kernel_name,pipeline_addr,start_time_ns,end_time_ns,duration_ns,dispatch_count,kernel_invocations,metric_source,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,occupancy_manager_percent,alu_utilization_percent,shader_launch_limiter_percent,instruction_throughput_percent,integer_complex_percent,f32_limiter_percent,l1_cache_percent,last_level_cache_percent,control_flow_percent,device_memory_bandwidth_gbps,buffer_l1_read_bandwidth_gbps,buffer_l1_write_bandwidth_gbps,temporary_register_count,uniform_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms\n");
     for row in &report.rows {
         let columns = vec![
             row.row_index.to_string(),
@@ -302,6 +305,7 @@ pub fn format_csv(report: &CounterExportReport) -> String {
             row.end_time_ns.to_string(),
             option_csv(row.duration_ns),
             row.dispatch_count.to_string(),
+            row.kernel_invocations.to_string(),
             csv_string(&row.metric_source),
             option_csv(row.execution_cost_percent),
             row.execution_cost_samples.to_string(),
@@ -377,6 +381,7 @@ mod tests {
                 end_time_ns: 200,
                 duration_ns: Some(100),
                 dispatch_count: 3,
+                kernel_invocations: 3,
                 metric_source: "execution-cost".into(),
                 execution_cost_percent: Some(55.0),
                 execution_cost_samples: 4,

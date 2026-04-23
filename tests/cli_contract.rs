@@ -92,6 +92,18 @@ fn validate_counters_help_mentions_csv_and_tolerance() {
 }
 
 #[test]
+fn perfcounters_validate_alias_parses_to_validate_counters() {
+    let cli = Cli::try_parse_from([
+        "gputrace",
+        "perfcounters-validate",
+        "trace.gputrace",
+        "--csv",
+        "Counters.csv",
+    ]);
+    assert!(cli.is_ok());
+}
+
+#[test]
 fn xcode_status_help_keeps_trace_and_format_flags() {
     let help = render_help(&["xcode-status"]);
     assert!(help.contains("xcode-status"));

@@ -45,6 +45,7 @@ enum CommandSet {
     ClearBuffers(ClearBuffersArgs),
     DumpRecords(DumpRecordsArgs),
     ExportCounters(ExportCountersArgs),
+    #[command(alias = "perfcounters-validate")]
     ValidateCounters(ValidateCountersArgs),
     Fences(FencesArgs),
     Mtlb(MtlbArgs),

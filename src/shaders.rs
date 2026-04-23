@@ -11,6 +11,7 @@ use crate::counter;
 use crate::error::{Error, Result};
 use crate::profiler;
 use crate::trace::TraceBundle;
+use crate::xcode_counters;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ShaderReport {
@@ -100,10 +101,18 @@ struct ShaderSourceIndex {
     kernel_to_line: BTreeMap<String, usize>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct XcodeCounterMatch {
+    alu_utilization_percent: Option<f64>,
+    occupancy_percent: Option<f64>,
+    device_memory_bandwidth_gbps: Option<f64>,
+}
+
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderReport> {
     let index = ShaderSourceIndex::build(search_paths)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     let limiter_metrics = counter::extract_limiters_for_trace(&trace.path);
+    let xcode_counter_data = xcode_counters::parse(trace, None).ok();
     let dispatches = trace.dispatch_calls()?;
     let mut simd_groups_by_name = BTreeMap::<String, u64>::new();
     let mut total_simd_groups = 0u64;
@@ -244,6 +253,9 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                             bw_sum / *count as f64,
                         ))
                     });
+            let xcode_counter_match = xcode_counter_data
+                .as_ref()
+                .and_then(|data| match_xcode_counters(&kernel_name, data));
             let pipeline_stats = pipeline_stats_by_addr
                 .get(&kernel.pipeline_addr)
                 .cloned()
@@ -263,11 +275,17 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                     .unwrap_or(0),
                 sample_count: sample_count_by_name.get(&kernel_name).copied().unwrap_or(0),
                 avg_sampling_density,
-                occupancy_percent: occupancy.map(|(value, _)| value),
+                occupancy_percent: occupancy
+                    .map(|(value, _)| value)
+                    .or(xcode_counter_match.and_then(|entry| entry.occupancy_percent)),
                 occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
-                alu_utilization_percent: limiter.map(|(alu, _, _)| alu),
+                alu_utilization_percent: limiter
+                    .map(|(alu, _, _)| alu)
+                    .or(xcode_counter_match.and_then(|entry| entry.alu_utilization_percent)),
                 last_level_cache_percent: limiter.map(|(_, llc, _)| llc),
-                device_memory_bandwidth_gbps: limiter.map(|(_, _, bw)| bw),
+                device_memory_bandwidth_gbps: limiter
+                    .map(|(_, _, bw)| bw)
+                    .or(xcode_counter_match.and_then(|entry| entry.device_memory_bandwidth_gbps)),
                 temporary_register_count: pipeline_stats
                     .as_ref()
                     .map(|stats| stats.temporary_register_count),
@@ -305,6 +323,74 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
         indexed_symbols,
         shaders,
     })
+}
+
+fn match_xcode_counters(
+    kernel_name: &str,
+    data: &xcode_counters::XcodeCounterData,
+) -> Option<XcodeCounterMatch> {
+    let normalized_kernel = normalize_for_matching(kernel_name);
+    let mut exact = Vec::new();
+    let mut fuzzy = Vec::new();
+
+    for encoder in &data.encoders {
+        let normalized_label = normalize_for_matching(&encoder.encoder_label);
+        if normalized_label.is_empty() || normalized_kernel.is_empty() {
+            continue;
+        }
+        if normalized_label == normalized_kernel {
+            exact.push(encoder);
+        } else if normalized_label.contains(&normalized_kernel)
+            || normalized_kernel.contains(&normalized_label)
+        {
+            fuzzy.push(encoder);
+        }
+    }
+
+    let matches = if !exact.is_empty() { exact } else { fuzzy };
+    if matches.is_empty() {
+        return None;
+    }
+
+    let mut alu_sum = 0.0;
+    let mut alu_count = 0usize;
+    let mut occupancy_sum = 0.0;
+    let mut occupancy_count = 0usize;
+    let mut bw_sum = 0.0;
+    let mut bw_count = 0usize;
+
+    for encoder in matches {
+        if let Some(value) = encoder.counters.get("ALU Utilization").copied() {
+            alu_sum += value;
+            alu_count += 1;
+        }
+        if let Some(value) = encoder.counters.get("Kernel Occupancy").copied() {
+            occupancy_sum += value;
+            occupancy_count += 1;
+        }
+        if let Some(value) = encoder.counters.get("Device Memory Bandwidth").copied() {
+            bw_sum += value;
+            bw_count += 1;
+        }
+    }
+
+    Some(XcodeCounterMatch {
+        alu_utilization_percent: (alu_count > 0).then(|| alu_sum / alu_count as f64),
+        occupancy_percent: (occupancy_count > 0).then(|| occupancy_sum / occupancy_count as f64),
+        device_memory_bandwidth_gbps: (bw_count > 0).then(|| bw_sum / bw_count as f64),
+    })
+}
+
+fn normalize_for_matching(name: &str) -> String {
+    name.chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                Some(ch.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 pub fn source(
@@ -1190,11 +1276,40 @@ fn option_csv<T: std::fmt::Display>(value: Option<T>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xcode_counters::{XcodeCounterData, XcodeEncoderCounters};
 
     #[test]
     fn strips_type_suffixes() {
         assert_eq!(strip_type_suffixes("rope_float16"), "rope");
         assert_eq!(strip_type_suffixes("kernel"), "kernel");
+    }
+
+    #[test]
+    fn matches_xcode_counters_by_normalized_encoder_label() {
+        let data = XcodeCounterData {
+            source: PathBuf::from("/tmp/example.csv"),
+            metrics: vec![
+                "ALU Utilization".into(),
+                "Kernel Occupancy".into(),
+                "Device Memory Bandwidth".into(),
+            ],
+            encoders: vec![XcodeEncoderCounters {
+                index: 0,
+                function_index: 0,
+                command_buffer_label: "cb0".into(),
+                encoder_label: "encoder0_simple_add".into(),
+                counters: BTreeMap::from([
+                    ("ALU Utilization".into(), 62.5),
+                    ("Kernel Occupancy".into(), 37.5),
+                    ("Device Memory Bandwidth".into(), 4.2),
+                ]),
+            }],
+        };
+
+        let matched = match_xcode_counters("simple_add", &data).unwrap();
+        assert_eq!(matched.alu_utilization_percent, Some(62.5));
+        assert_eq!(matched.occupancy_percent, Some(37.5));
+        assert_eq!(matched.device_memory_bandwidth_gbps, Some(4.2));
     }
 
     #[test]

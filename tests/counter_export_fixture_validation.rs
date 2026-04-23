@@ -16,7 +16,9 @@ struct FixtureCase {
 struct ReferenceCounterRow {
     index: usize,
     encoder_label: String,
+    kernel_invocations: Option<f64>,
     alu_utilization_percent: Option<f64>,
+    kernel_occupancy_percent: Option<f64>,
     device_memory_bandwidth_gbps: Option<f64>,
     buffer_l1_read_bandwidth_gbps: Option<f64>,
     buffer_l1_write_bandwidth_gbps: Option<f64>,
@@ -91,9 +93,25 @@ fn validates_counter_export_against_xcode_reference_csv_when_fixtures_are_availa
             assert_metric_close(
                 case.name,
                 expected.index,
+                "Kernel Invocations",
+                Some(actual.kernel_invocations as f64),
+                expected.kernel_invocations,
+                0.5,
+            );
+            assert_metric_close(
+                case.name,
+                expected.index,
                 "ALU Utilization",
                 actual.alu_utilization_percent,
                 expected.alu_utilization_percent,
+                0.5,
+            );
+            assert_metric_close(
+                case.name,
+                expected.index,
+                "Kernel Occupancy",
+                actual.occupancy_percent,
+                expected.kernel_occupancy_percent,
                 0.5,
             );
             assert_metric_close(
@@ -155,7 +173,9 @@ fn parse_reference_csv(path: &Path) -> Result<Vec<ReferenceCounterRow>, Box<dyn 
     let headers = reader.headers()?.clone();
     let index_col = find_column(&headers, "Index")?;
     let encoder_label_col = find_column(&headers, "Encoder Label")?;
+    let invocations_col = find_column(&headers, "Kernel Invocations")?;
     let alu_col = find_column(&headers, "ALU Utilization")?;
+    let occupancy_col = find_column(&headers, "Kernel Occupancy")?;
     let device_bw_col = find_column(&headers, "Device Memory Bandwidth")?;
     let buffer_l1_read_bw_col = find_column(&headers, "Buffer L1 Read Bandwidth")?;
     let buffer_l1_write_bw_col = find_column(&headers, "Buffer L1 Write Bandwidth")?;
@@ -166,7 +186,9 @@ fn parse_reference_csv(path: &Path) -> Result<Vec<ReferenceCounterRow>, Box<dyn 
         rows.push(ReferenceCounterRow {
             index: parse_usize(record.get(index_col))?,
             encoder_label: record.get(encoder_label_col).unwrap_or_default().to_owned(),
+            kernel_invocations: parse_optional_f64(record.get(invocations_col)),
             alu_utilization_percent: parse_optional_f64(record.get(alu_col)),
+            kernel_occupancy_percent: parse_optional_f64(record.get(occupancy_col)),
             device_memory_bandwidth_gbps: parse_optional_f64(record.get(device_bw_col)),
             buffer_l1_read_bandwidth_gbps: parse_optional_f64(record.get(buffer_l1_read_bw_col)),
             buffer_l1_write_bandwidth_gbps: parse_optional_f64(record.get(buffer_l1_write_bw_col)),

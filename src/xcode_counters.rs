@@ -67,6 +67,7 @@ pub fn validate(
     let exported = counter_export::report(trace)?;
     let imported = parse(trace, csv_path)?;
     let compared_metrics = vec![
+        "Kernel Invocations".to_owned(),
         "ALU Utilization".to_owned(),
         "Kernel Occupancy".to_owned(),
         "Device Memory Bandwidth".to_owned(),
@@ -79,6 +80,12 @@ pub fn validate(
 
     for (exported_row, reference_row) in exported.rows.iter().zip(imported.encoders.iter()) {
         let metrics = vec![
+            compare_metric(
+                "Kernel Invocations",
+                Some(exported_row.kernel_invocations as f64),
+                reference_row.counters.get("Kernel Invocations").copied(),
+                tolerance,
+            ),
             compare_metric(
                 "ALU Utilization",
                 exported_row.alu_utilization_percent,
