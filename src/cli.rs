@@ -26,6 +26,7 @@ enum CommandSet {
     Analyze(TracePath),
     Kernels(KernelsArgs),
     Encoders(EncodersArgs),
+    Dependencies(DependenciesArgs),
     Buffers(BuffersArgs),
     BufferTimeline(BufferTimelineArgs),
     Diff(DiffArgs),
@@ -72,6 +73,13 @@ struct EncodersArgs {
     #[arg(short, long)]
     verbose: bool,
     #[arg(long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct DependenciesArgs {
+    trace: PathBuf,
+    #[arg(short, long, default_value = "dot")]
     format: String,
 }
 
@@ -166,6 +174,16 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", commands::format_encoders(&report, args.verbose)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown encoders format")),
+            }
+        }
+        CommandSet::Dependencies(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = commands::dependencies(&trace)?;
+            match args.format.as_str() {
+                "dot" => print!("{}", commands::format_dependencies_dot(&report)),
+                "text" | "table" => print!("{}", commands::format_dependencies(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown dependencies format")),
             }
         }
         CommandSet::Buffers(args) => match args.command {

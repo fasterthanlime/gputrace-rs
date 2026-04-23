@@ -46,6 +46,31 @@ pub struct CommandBufferEncoderSummary {
     pub dispatch_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DependencyReport {
+    pub total_nodes: usize,
+    pub total_edges: usize,
+    pub nodes: Vec<DependencyNode>,
+    pub edges: Vec<DependencyEdge>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DependencyNode {
+    pub id: usize,
+    pub label: String,
+    pub command_buffer_index: usize,
+    pub encoder_label: Option<String>,
+    pub kernel_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DependencyEdge {
+    pub from: usize,
+    pub to: usize,
+    pub buffers: Vec<String>,
+    pub hazard: String,
+}
+
 pub fn kernels(trace: &TraceBundle, filter: Option<&str>) -> Result<KernelReport> {
     let filter_lower = filter.map(|value| value.to_ascii_lowercase());
     let mut kernels: Vec<_> = trace
@@ -177,6 +202,78 @@ pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
     })
 }
 
+pub fn dependencies(trace: &TraceBundle) -> Result<DependencyReport> {
+    let regions = trace.command_buffer_regions()?;
+    let mut nodes = Vec::new();
+    let mut edges: BTreeMap<(usize, usize), BTreeSet<String>> = BTreeMap::new();
+    let mut last_user: BTreeMap<String, usize> = BTreeMap::new();
+
+    for region in regions {
+        for dispatch in region.dispatches {
+            let label = dispatch
+                .kernel_name
+                .clone()
+                .or_else(|| {
+                    region
+                        .encoders
+                        .iter()
+                        .find(|encoder| Some(encoder.address) == dispatch.encoder_id)
+                        .map(|encoder| encoder.label.clone())
+                })
+                .unwrap_or_else(|| format!("dispatch_{}", dispatch.index));
+
+            nodes.push(DependencyNode {
+                id: dispatch.index,
+                label: label.clone(),
+                command_buffer_index: region.command_buffer.index,
+                encoder_label: region
+                    .encoders
+                    .iter()
+                    .find(|encoder| Some(encoder.address) == dispatch.encoder_id)
+                    .map(|encoder| encoder.label.clone())
+                    .filter(|label| !label.is_empty()),
+                kernel_name: dispatch.kernel_name.clone(),
+            });
+
+            let mut seen_buffers = BTreeSet::new();
+            for buffer in dispatch.buffers {
+                let buffer_name = buffer
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("0x{:x}", buffer.address));
+                if !seen_buffers.insert(buffer_name.clone()) {
+                    continue;
+                }
+                if let Some(previous) = last_user.insert(buffer_name.clone(), dispatch.index)
+                    && previous != dispatch.index
+                {
+                    edges
+                        .entry((previous, dispatch.index))
+                        .or_default()
+                        .insert(buffer_name);
+                }
+            }
+        }
+    }
+
+    let edges: Vec<_> = edges
+        .into_iter()
+        .map(|((from, to), buffers)| DependencyEdge {
+            from,
+            to,
+            buffers: buffers.into_iter().collect(),
+            hazard: "RW".to_owned(),
+        })
+        .collect();
+
+    Ok(DependencyReport {
+        total_nodes: nodes.len(),
+        total_edges: edges.len(),
+        nodes,
+        edges,
+    })
+}
+
 pub fn format_encoders(report: &EncoderReport, verbose: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!("{} encoders\n", report.total_encoders));
@@ -215,12 +312,74 @@ pub fn format_encoders(report: &EncoderReport, verbose: bool) -> String {
     out
 }
 
+pub fn format_dependencies(report: &DependencyReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} nodes, {} edges\n\n",
+        report.total_nodes, report.total_edges
+    ));
+    for node in &report.nodes {
+        out.push_str(&format!("n{}: {}", node.id, node.label));
+        if let Some(encoder_label) = &node.encoder_label {
+            out.push_str(&format!(" [{}]", encoder_label));
+        }
+        out.push_str(&format!(" (CB {})\n", node.command_buffer_index));
+    }
+    if !report.edges.is_empty() {
+        out.push_str("\nEdges:\n");
+        for edge in &report.edges {
+            out.push_str(&format!(
+                "  n{} -> n{} [{}] via {}\n",
+                edge.from,
+                edge.to,
+                edge.hazard,
+                edge.buffers.join(", ")
+            ));
+        }
+    }
+    out
+}
+
+pub fn format_dependencies_dot(report: &DependencyReport) -> String {
+    let mut out = String::new();
+    out.push_str("digraph G {\n");
+    out.push_str("  rankdir=LR;\n");
+    out.push_str("  node [shape=box, style=filled, fontname=\"Helvetica\"];\n");
+    out.push_str("  edge [fontname=\"Helvetica\", fontsize=10];\n");
+    for node in &report.nodes {
+        let mut label = node.label.clone();
+        if label.len() > 50 {
+            label = format!("{}...", &label[..47]);
+        }
+        out.push_str(&format!(
+            "  n{} [label=\"{}\"];\n",
+            node.id,
+            escape_dot(&label)
+        ));
+    }
+    for edge in &report.edges {
+        out.push_str(&format!(
+            "  n{} -> n{} [label=\"{} ({})\"];\n",
+            edge.from,
+            edge.to,
+            escape_dot(&edge.buffers.join(", ")),
+            edge.hazard
+        ));
+    }
+    out.push_str("}\n");
+    out
+}
+
 fn truncate(value: &str, width: usize) -> String {
     if value.len() <= width {
         return value.to_owned();
     }
     let keep = width.saturating_sub(3);
     format!("{}...", &value[..keep])
+}
+
+fn escape_dot(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -272,5 +431,40 @@ mod tests {
         assert!(rendered.contains("my_encoder"));
         assert!(rendered.contains("dispatches=2"));
         assert!(rendered.contains("CB 0"));
+    }
+
+    #[test]
+    fn formats_dependency_dot() {
+        let report = DependencyReport {
+            total_nodes: 2,
+            total_edges: 1,
+            nodes: vec![
+                DependencyNode {
+                    id: 0,
+                    label: "first".into(),
+                    command_buffer_index: 0,
+                    encoder_label: Some("enc0".into()),
+                    kernel_name: Some("first".into()),
+                },
+                DependencyNode {
+                    id: 1,
+                    label: "second".into(),
+                    command_buffer_index: 0,
+                    encoder_label: Some("enc1".into()),
+                    kernel_name: Some("second".into()),
+                },
+            ],
+            edges: vec![DependencyEdge {
+                from: 0,
+                to: 1,
+                buffers: vec!["buf".into()],
+                hazard: "RW".into(),
+            }],
+        };
+
+        let rendered = format_dependencies_dot(&report);
+        assert!(rendered.contains("digraph G"));
+        assert!(rendered.contains("n0 -> n1"));
+        assert!(rendered.contains("buf (RW)"));
     }
 }
