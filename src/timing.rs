@@ -42,6 +42,75 @@ pub struct KernelTiming {
     pub dispatch_count: usize,
     pub synthetic_duration_ns: u64,
     pub percent_of_total: f64,
+    pub min_duration_ns: u64,
+    pub max_duration_ns: u64,
+    pub avg_duration_ns: f64,
+    pub p50_duration_ns: u64,
+    pub p95_duration_ns: u64,
+    pub p99_duration_ns: u64,
+}
+
+fn push_kernel_duration(
+    kernel_stats: &mut BTreeMap<String, KernelTiming>,
+    kernel_samples: &mut BTreeMap<String, Vec<u64>>,
+    name: String,
+    duration_ns: u64,
+) {
+    let kernel = kernel_stats
+        .entry(name.clone())
+        .or_insert_with(|| KernelTiming {
+            name: name.clone(),
+            dispatch_count: 0,
+            synthetic_duration_ns: 0,
+            percent_of_total: 0.0,
+            min_duration_ns: 0,
+            max_duration_ns: 0,
+            avg_duration_ns: 0.0,
+            p50_duration_ns: 0,
+            p95_duration_ns: 0,
+            p99_duration_ns: 0,
+        });
+    kernel.dispatch_count += 1;
+    kernel.synthetic_duration_ns = kernel.synthetic_duration_ns.saturating_add(duration_ns);
+    kernel_samples.entry(name).or_default().push(duration_ns);
+}
+
+fn finalize_kernel_timings(
+    kernels: &mut [KernelTiming],
+    samples_by_name: &BTreeMap<String, Vec<u64>>,
+    total_duration_ns: u64,
+) {
+    for kernel in kernels {
+        if total_duration_ns > 0 {
+            kernel.percent_of_total =
+                (kernel.synthetic_duration_ns as f64 / total_duration_ns as f64) * 100.0;
+        }
+
+        let Some(samples) = samples_by_name.get(&kernel.name) else {
+            continue;
+        };
+        if samples.is_empty() {
+            continue;
+        }
+
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        kernel.min_duration_ns = sorted[0];
+        kernel.max_duration_ns = sorted[sorted.len() - 1];
+        kernel.avg_duration_ns = sorted.iter().sum::<u64>() as f64 / sorted.len() as f64;
+        kernel.p50_duration_ns = percentile_nearest_rank(&sorted, 50);
+        kernel.p95_duration_ns = percentile_nearest_rank(&sorted, 95);
+        kernel.p99_duration_ns = percentile_nearest_rank(&sorted, 99);
+    }
+}
+
+fn percentile_nearest_rank(sorted_samples: &[u64], percentile: u64) -> u64 {
+    if sorted_samples.is_empty() {
+        return 0;
+    }
+    let percentile = percentile.clamp(1, 100);
+    let rank = (percentile as usize * sorted_samples.len()).div_ceil(100);
+    sorted_samples[rank.saturating_sub(1).min(sorted_samples.len() - 1)]
 }
 
 pub fn report(trace: &TraceBundle) -> Result<TimingReport> {
@@ -60,6 +129,7 @@ pub fn report(trace: &TraceBundle) -> Result<TimingReport> {
     let mut command_buffer_timings = Vec::new();
     let mut encoder_stats: BTreeMap<u64, EncoderTiming> = BTreeMap::new();
     let mut kernel_stats: BTreeMap<String, KernelTiming> = BTreeMap::new();
+    let mut kernel_samples: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     let mut total_duration_ns = 0u64;
     let mut total_dispatch_count = 0usize;
 
@@ -101,18 +171,12 @@ pub fn report(trace: &TraceBundle) -> Result<TimingReport> {
                 .kernel_name
                 .clone()
                 .unwrap_or_else(|| "unknown".to_owned());
-            let kernel = kernel_stats
-                .entry(kernel_name.clone())
-                .or_insert_with(|| KernelTiming {
-                    name: kernel_name,
-                    dispatch_count: 0,
-                    synthetic_duration_ns: 0,
-                    percent_of_total: 0.0,
-                });
-            kernel.dispatch_count += 1;
-            kernel.synthetic_duration_ns = kernel
-                .synthetic_duration_ns
-                .saturating_add(per_dispatch_duration);
+            push_kernel_duration(
+                &mut kernel_stats,
+                &mut kernel_samples,
+                kernel_name,
+                per_dispatch_duration,
+            );
         }
 
         for encoder in &region.encoders {
@@ -144,12 +208,7 @@ pub fn report(trace: &TraceBundle) -> Result<TimingReport> {
     });
 
     let mut kernels: Vec<_> = kernel_stats.into_values().collect();
-    for kernel in &mut kernels {
-        if total_duration_ns > 0 {
-            kernel.percent_of_total =
-                (kernel.synthetic_duration_ns as f64 / total_duration_ns as f64) * 100.0;
-        }
-    }
+    finalize_kernel_timings(&mut kernels, &kernel_samples, total_duration_ns);
     kernels.sort_by(|left, right| {
         right
             .synthetic_duration_ns
@@ -226,33 +285,23 @@ fn report_from_profiler(
         .collect::<Vec<_>>();
 
     let mut kernel_stats = BTreeMap::<String, KernelTiming>::new();
+    let mut kernel_samples = BTreeMap::<String, Vec<u64>>::new();
     for dispatch in &summary.dispatches {
         let name = dispatch
             .function_name
             .clone()
             .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
-        let kernel = kernel_stats
-            .entry(name.clone())
-            .or_insert_with(|| KernelTiming {
-                name,
-                dispatch_count: 0,
-                synthetic_duration_ns: 0,
-                percent_of_total: 0.0,
-            });
-        kernel.dispatch_count += 1;
-        kernel.synthetic_duration_ns = kernel
-            .synthetic_duration_ns
-            .saturating_add(dispatch.duration_us.saturating_mul(1_000));
+        push_kernel_duration(
+            &mut kernel_stats,
+            &mut kernel_samples,
+            name,
+            dispatch.duration_us.saturating_mul(1_000),
+        );
     }
 
     let total_duration_ns = summary.total_time_us.saturating_mul(1_000);
     let mut kernels = kernel_stats.into_values().collect::<Vec<_>>();
-    for kernel in &mut kernels {
-        if total_duration_ns > 0 {
-            kernel.percent_of_total =
-                (kernel.synthetic_duration_ns as f64 / total_duration_ns as f64) * 100.0;
-        }
-    }
+    finalize_kernel_timings(&mut kernels, &kernel_samples, total_duration_ns);
     kernels.sort_by(|left, right| {
         right
             .synthetic_duration_ns
@@ -313,11 +362,12 @@ fn report_from_raw_profiler(
     }
 
     let mut kernel_stats = BTreeMap::<String, KernelTiming>::new();
+    let mut kernel_samples = BTreeMap::<String, Vec<u64>>::new();
+    let encoder_duration_by_addr = encoder_rows
+        .iter()
+        .map(|encoder| (encoder.address, encoder.synthetic_duration_ns))
+        .collect::<BTreeMap<_, _>>();
     for region in &regions {
-        let encoder_duration_by_addr = encoder_rows
-            .iter()
-            .map(|encoder| (encoder.address, encoder.synthetic_duration_ns))
-            .collect::<BTreeMap<_, _>>();
         let mut dispatches_by_encoder = BTreeMap::<u64, usize>::new();
         for dispatch in &region.dispatches {
             if let Some(encoder_id) = dispatch.encoder_id {
@@ -340,28 +390,17 @@ fn report_from_raw_profiler(
                             .unwrap_or(1) as u64
                 })
                 .unwrap_or(0);
-            let kernel = kernel_stats
-                .entry(kernel_name.clone())
-                .or_insert_with(|| KernelTiming {
-                    name: kernel_name,
-                    dispatch_count: 0,
-                    synthetic_duration_ns: 0,
-                    percent_of_total: 0.0,
-                });
-            kernel.dispatch_count += 1;
-            kernel.synthetic_duration_ns = kernel
-                .synthetic_duration_ns
-                .saturating_add(per_dispatch_duration);
+            push_kernel_duration(
+                &mut kernel_stats,
+                &mut kernel_samples,
+                kernel_name,
+                per_dispatch_duration,
+            );
         }
     }
 
     let mut kernels: Vec<_> = kernel_stats.into_values().collect();
-    for kernel in &mut kernels {
-        if total_duration_ns > 0 {
-            kernel.percent_of_total =
-                (kernel.synthetic_duration_ns as f64 / total_duration_ns as f64) * 100.0;
-        }
-    }
+    finalize_kernel_timings(&mut kernels, &kernel_samples, total_duration_ns);
     kernels.sort_by(|left, right| {
         right
             .synthetic_duration_ns
@@ -475,15 +514,18 @@ pub fn format_report(report: &TimingReport) -> String {
     if !report.kernels.is_empty() {
         out.push_str("Kernels:\n");
         out.push_str(&format!(
-            "{:<36} {:>10} {:>16} {:>8}\n",
-            "Name", "Dispatches", duration_label, "%"
+            "{:<30} {:>10} {:>14} {:>12} {:>12} {:>12} {:>8}\n",
+            "Name", "Dispatches", duration_label, "Avg ns", "P95 ns", "P99 ns", "%"
         ));
         for kernel in report.kernels.iter().take(20) {
             out.push_str(&format!(
-                "{:<36} {:>10} {:>16} {:>7.2}\n",
-                truncate(&kernel.name, 36),
+                "{:<30} {:>10} {:>14} {:>12.0} {:>12} {:>12} {:>7.2}\n",
+                truncate(&kernel.name, 30),
                 kernel.dispatch_count,
                 kernel.synthetic_duration_ns,
+                kernel.avg_duration_ns,
+                kernel.p95_duration_ns,
+                kernel.p99_duration_ns,
                 kernel.percent_of_total
             ));
         }
@@ -530,14 +572,20 @@ pub fn format_report(report: &TimingReport) -> String {
 
 pub fn format_csv(report: &TimingReport) -> String {
     let mut out = String::new();
-    out.push_str("kind,name,dispatch_count,synthetic_duration_ns,percent_of_total\n");
+    out.push_str("kind,name,dispatch_count,synthetic_duration_ns,percent_of_total,min_duration_ns,max_duration_ns,avg_duration_ns,p50_duration_ns,p95_duration_ns,p99_duration_ns\n");
     for kernel in &report.kernels {
         out.push_str(&format!(
-            "kernel,{},{},{},{}\n",
+            "kernel,{},{},{},{},{},{},{},{},{},{}\n",
             escape_csv(&kernel.name),
             kernel.dispatch_count,
             kernel.synthetic_duration_ns,
-            kernel.percent_of_total
+            kernel.percent_of_total,
+            kernel.min_duration_ns,
+            kernel.max_duration_ns,
+            kernel.avg_duration_ns,
+            kernel.p50_duration_ns,
+            kernel.p95_duration_ns,
+            kernel.p99_duration_ns
         ));
     }
     for encoder in &report.encoders {
@@ -547,7 +595,7 @@ pub fn format_csv(report: &TimingReport) -> String {
             encoder.label.clone()
         };
         out.push_str(&format!(
-            "encoder,{},{},{},\n",
+            "encoder,{},{},{},,,,,,,\n",
             escape_csv(&label),
             encoder.dispatch_count,
             encoder.synthetic_duration_ns
@@ -597,11 +645,25 @@ mod tests {
                 dispatch_count: 2,
                 synthetic_duration_ns: 100,
                 percent_of_total: 100.0,
+                min_duration_ns: 40,
+                max_duration_ns: 60,
+                avg_duration_ns: 50.0,
+                p50_duration_ns: 40,
+                p95_duration_ns: 60,
+                p99_duration_ns: 60,
             }],
         };
         let csv = format_csv(&report);
-        assert!(csv.contains("kernel,kernel,2,100,100"));
+        assert!(csv.contains("p50_duration_ns"));
+        assert!(csv.contains("kernel,kernel,2,100,100,40,60,50,40,60,60"));
         assert!(csv.contains("encoder,enc,2,100"));
+    }
+
+    #[test]
+    fn computes_nearest_rank_percentiles() {
+        assert_eq!(percentile_nearest_rank(&[10, 20, 30, 40], 50), 20);
+        assert_eq!(percentile_nearest_rank(&[10, 20, 30, 40], 95), 40);
+        assert_eq!(percentile_nearest_rank(&[10], 99), 10);
     }
 
     #[test]
@@ -631,6 +693,12 @@ mod tests {
                 dispatch_count: 2,
                 synthetic_duration_ns: 1_500,
                 percent_of_total: 100.0,
+                min_duration_ns: 500,
+                max_duration_ns: 1_000,
+                avg_duration_ns: 750.0,
+                p50_duration_ns: 500,
+                p95_duration_ns: 1_000,
+                p99_duration_ns: 1_000,
             }],
         };
 
@@ -638,6 +706,7 @@ mod tests {
         assert!(text.contains("Profiler-backed timing report"));
         assert!(text.contains("APSTimelineData"));
         assert!(text.contains("Duration ns"));
+        assert!(text.contains("P95 ns"));
     }
 
     #[test]
@@ -667,6 +736,12 @@ mod tests {
                 dispatch_count: 2,
                 synthetic_duration_ns: 900,
                 percent_of_total: 100.0,
+                min_duration_ns: 450,
+                max_duration_ns: 450,
+                avg_duration_ns: 450.0,
+                p50_duration_ns: 450,
+                p95_duration_ns: 450,
+                p99_duration_ns: 450,
             }],
         };
 
