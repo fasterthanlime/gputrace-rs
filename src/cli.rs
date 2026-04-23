@@ -3,19 +3,22 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::analysis;
+use crate::apicalls;
 use crate::automation::{self, XcodeProfileRun};
 use crate::buffer_timeline;
 use crate::buffers;
 use crate::commands;
 use crate::correlate;
 use crate::diff;
+use crate::dump;
 use crate::error::Result;
 use crate::graphing;
 use crate::insights;
 use crate::markdown;
+use crate::mtlb;
 use crate::shaders;
 use crate::timing;
-use crate::trace::TraceBundle;
+use crate::trace::{RecordType, TraceBundle};
 
 #[derive(Debug, Parser)]
 #[command(name = "gputrace")]
@@ -29,6 +32,9 @@ pub struct Cli {
 enum CommandSet {
     Stats(TracePath),
     Analyze(TracePath),
+    ApiCalls(ApiCallsArgs),
+    DumpRecords(DumpRecordsArgs),
+    Mtlb(MtlbArgs),
     Kernels(KernelsArgs),
     Encoders(EncodersArgs),
     Dependencies(DependenciesArgs),
@@ -68,6 +74,39 @@ struct BufferTimelineArgs {
     format: String,
     #[arg(short, long, default_value_t = 100)]
     width: usize,
+}
+
+#[derive(Debug, Args)]
+struct ApiCallsArgs {
+    trace: PathBuf,
+    #[arg(short = 'k', long)]
+    kernel: Option<String>,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct DumpRecordsArgs {
+    trace: PathBuf,
+    #[arg(long = "type")]
+    record_type: Option<String>,
+    #[arg(long)]
+    contains: Option<String>,
+    #[arg(long, default_value_t = 0)]
+    start_index: usize,
+    #[arg(long)]
+    limit: Option<usize>,
+    #[arg(long)]
+    hex_preview: bool,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct MtlbArgs {
+    path: PathBuf,
+    #[arg(short, long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Debug, Args)]
@@ -259,6 +298,58 @@ pub fn run() -> Result<()> {
             let trace = TraceBundle::open(args.trace)?;
             let report = analysis::analyze(&trace);
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        CommandSet::ApiCalls(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = apicalls::report(&trace, args.kernel.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", apicalls::format_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown api-calls format")),
+            }
+        }
+        CommandSet::DumpRecords(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let filter = dump::DumpFilter {
+                record_type: args
+                    .record_type
+                    .as_deref()
+                    .map(parse_record_type)
+                    .transpose()?,
+                text_contains: args.contains,
+                start_index: args.start_index,
+                limit: args.limit,
+                include_hex_preview: args.hex_preview,
+                max_preview_bytes: dump::DEFAULT_HEX_PREVIEW_BYTES,
+            };
+            let report = dump::parse_record_dump(&trace.capture_data()?, filter)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", dump::format_record_listing(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown dump-records format")),
+            }
+        }
+        CommandSet::Mtlb(args) => {
+            let metadata = std::fs::metadata(&args.path)?;
+            match (metadata.is_dir(), args.format.as_str()) {
+                (true, "text" | "table") => {
+                    let report = mtlb::scan_bundle(args.path)?;
+                    print!("{}", mtlb::format_bundle_report(&report));
+                }
+                (true, "json") => {
+                    let report = mtlb::scan_bundle(args.path)?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                (false, "text" | "table") => {
+                    let report = mtlb::inspect_file(args.path)?;
+                    print!("{}", mtlb::format_file_report(&report));
+                }
+                (false, "json") => {
+                    let report = mtlb::inspect_file(args.path)?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                _ => return Err(crate::Error::Unsupported("unknown mtlb format")),
+            }
         }
         CommandSet::Kernels(args) => {
             let trace = TraceBundle::open(args.trace)?;
@@ -509,4 +600,30 @@ pub fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_record_type(value: &str) -> Result<RecordType> {
+    match value {
+        "C" => Ok(RecordType::C),
+        "C@3ul@3ul" | "C3ul" => Ok(RecordType::C3ul),
+        "CS" => Ok(RecordType::CS),
+        "CSuwuw" => Ok(RecordType::CSuwuw),
+        "Ct" => Ok(RecordType::Ct),
+        "Ctt" => Ok(RecordType::Ctt),
+        "CtU" => Ok(RecordType::CtU),
+        "Ctulul" => Ok(RecordType::Ctulul),
+        "CU" => Ok(RecordType::CU),
+        "Cui" => Ok(RecordType::Cui),
+        "Cul" => Ok(RecordType::Cul),
+        "Culul" => Ok(RecordType::Culul),
+        "Cut" => Ok(RecordType::Cut),
+        "Cuw" => Ok(RecordType::Cuw),
+        "Ci" => Ok(RecordType::Ci),
+        "CiulSl" => Ok(RecordType::CiulSl),
+        "Ciulul" => Ok(RecordType::Ciulul),
+        "Unknown" | "unknown" => Ok(RecordType::Unknown),
+        _ => Err(crate::Error::InvalidInput(format!(
+            "unknown record type: {value}"
+        ))),
+    }
 }
