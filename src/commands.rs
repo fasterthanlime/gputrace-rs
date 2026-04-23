@@ -51,6 +51,7 @@ pub struct CommandBufferEncoderSummary {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DependencyReport {
+    pub source: String,
     pub total_nodes: usize,
     pub total_edges: usize,
     pub nodes: Vec<DependencyNode>,
@@ -292,6 +293,10 @@ pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
 pub fn dependencies(trace: &TraceBundle) -> Result<DependencyReport> {
     let regions = trace.command_buffer_regions()?;
     let timeline = timeline::report(trace).ok();
+    let source = timeline
+        .as_ref()
+        .map(|report| report.source.clone())
+        .unwrap_or_else(|| "synthetic".to_owned());
     let dispatch_spans = timeline
         .as_ref()
         .map(|report| {
@@ -412,6 +417,7 @@ pub fn dependencies(trace: &TraceBundle) -> Result<DependencyReport> {
         .collect();
 
     Ok(DependencyReport {
+        source,
         total_nodes: nodes.len(),
         total_edges: edges.len(),
         nodes,
@@ -693,8 +699,8 @@ pub fn format_encoders(report: &EncoderReport, verbose: bool) -> String {
 pub fn format_dependencies(report: &DependencyReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "{} dispatch nodes, {} dependency edges\n\n",
-        report.total_nodes, report.total_edges
+        "{} dispatch nodes, {} dependency edges\nordering={}\n\n",
+        report.total_nodes, report.total_edges, report.source
     ));
     for node in &report.nodes {
         out.push_str(&format!("n{}: {}", node.id, node.label));
@@ -729,6 +735,10 @@ pub fn format_dependencies_dot(report: &DependencyReport) -> String {
     let mut out = String::new();
     out.push_str("digraph G {\n");
     out.push_str("  rankdir=LR;\n");
+    out.push_str(&format!(
+        "  label=\"dependency ordering: {}\";\n  labelloc=t;\n",
+        escape_dot(&report.source)
+    ));
     out.push_str("  node [shape=box, style=filled, fontname=\"Helvetica\"];\n");
     out.push_str("  edge [fontname=\"Helvetica\", fontsize=10];\n");
     for node in &report.nodes {
@@ -1187,6 +1197,7 @@ mod tests {
     #[test]
     fn formats_dependency_dot() {
         let report = DependencyReport {
+            source: "synthetic".into(),
             total_nodes: 2,
             total_edges: 1,
             nodes: vec![
@@ -1219,6 +1230,7 @@ mod tests {
 
         let rendered = format_dependencies_dot(&report);
         assert!(rendered.contains("digraph G"));
+        assert!(rendered.contains("dependency ordering: synthetic"));
         assert!(rendered.contains("n0 -> n1"));
         assert!(rendered.contains("buf (RW)"));
     }
@@ -1258,6 +1270,7 @@ mod tests {
     #[test]
     fn formats_dependency_report_with_fallbacks_and_truncation() {
         let report = DependencyReport {
+            source: "raw-profiler-heuristic".into(),
             total_nodes: 2,
             total_edges: 1,
             nodes: vec![
@@ -1296,6 +1309,7 @@ mod tests {
 
         let rendered = format_dependencies(&report);
         assert!(rendered.contains("2 dispatch nodes, 1 dependency edges"));
+        assert!(rendered.contains("ordering=raw-profiler-heuristic"));
         assert!(rendered.contains("n2: dispatch_2 [kernel: blur] [encoder: main] (CB 3)"));
         assert!(rendered.contains("n2 -> n4 [RW] via buf0, buf1, buf2, buf3, +1 more"));
     }
@@ -1303,6 +1317,7 @@ mod tests {
     #[test]
     fn formats_dependency_report_without_edges() {
         let report = DependencyReport {
+            source: "synthetic".into(),
             total_nodes: 1,
             total_edges: 0,
             nodes: vec![DependencyNode {
