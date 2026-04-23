@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::counter;
 use crate::error::Result;
 use crate::profiler;
 use crate::trace::{BoundBuffer, CommandBufferRegion, TraceBundle};
@@ -20,9 +21,11 @@ pub struct TimelineReport {
     pub command_buffer_count: usize,
     pub encoder_count: usize,
     pub dispatch_count: usize,
+    pub counter_track_count: usize,
     pub command_buffers: Vec<TimelineCommandBuffer>,
     pub encoders: Vec<TimelineEncoder>,
     pub dispatches: Vec<TimelineDispatch>,
+    pub counter_tracks: Vec<TimelineCounterTrack>,
     pub events: Vec<TimelineEvent>,
 }
 
@@ -71,6 +74,22 @@ pub struct TimelineBufferBinding {
     pub address: u64,
     pub name: Option<String>,
     pub usage: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineCounterTrack {
+    pub name: String,
+    pub unit: String,
+    pub samples: Vec<TimelineCounterSample>,
+    pub min_value: f64,
+    pub max_value: f64,
+    pub average_value: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineCounterSample {
+    pub timestamp_ns: u64,
+    pub value: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,16 +162,29 @@ struct DispatchSpan {
 pub fn report(trace: &TraceBundle) -> Result<TimelineReport> {
     let regions = trace.command_buffer_regions()?;
     if let Ok(profiler_summary) = profiler::stream_data_summary(&trace.path) {
-        return Ok(build(&regions, Some(&profiler_summary), None));
+        let counter_limiters = counter::extract_limiters_for_trace(&trace.path);
+        return Ok(build(
+            &regions,
+            Some(&profiler_summary),
+            None,
+            Some(&counter_limiters),
+        ));
     }
     let raw_timings = profiler::raw_encoder_timings(&trace.path).ok();
-    Ok(build(&regions, None, raw_timings.as_deref()))
+    let counter_limiters = counter::extract_limiters_for_trace(&trace.path);
+    Ok(build(
+        &regions,
+        None,
+        raw_timings.as_deref(),
+        Some(&counter_limiters),
+    ))
 }
 
 pub fn build(
     regions: &[CommandBufferRegion],
     profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
     raw_encoder_timings: Option<&[profiler::ProfilerRawEncoderTiming]>,
+    counter_limiters: Option<&[counter::CounterLimiter]>,
 ) -> TimelineReport {
     let mut command_buffers = Vec::new();
     let mut encoders = Vec::new();
@@ -404,6 +436,15 @@ pub fn build(
     });
     dispatches.sort_by(|left, right| left.index.cmp(&right.index));
 
+    let counter_tracks = build_counter_tracks(&encoders, counter_limiters);
+    append_counter_track_events(&mut events, &counter_tracks);
+    events.sort_by(|left, right| {
+        left.timestamp_us
+            .cmp(&right.timestamp_us)
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
     TimelineReport {
         synthetic: profiler_summary.is_none() && raw_encoder_timings.is_none(),
         source: if profiler_summary.is_some() {
@@ -420,9 +461,11 @@ pub fn build(
         command_buffer_count: command_buffers.len(),
         encoder_count: encoders.len(),
         dispatch_count: dispatches.len(),
+        counter_track_count: counter_tracks.len(),
         command_buffers,
         encoders,
         dispatches,
+        counter_tracks,
         events,
     }
 }
@@ -462,13 +505,14 @@ pub fn format_report(report: &TimelineReport) -> String {
         out.push_str("Derived from command-buffer ordering and adjacent timestamps.\n\n");
     }
     out.push_str(&format!(
-        "start={} ns end={} ns duration={} ns command_buffers={} encoders={} dispatches={}\n\n",
+        "start={} ns end={} ns duration={} ns command_buffers={} encoders={} dispatches={} counter_tracks={}\n\n",
         report.start_time_ns,
         report.end_time_ns,
         report.duration_ns,
         report.command_buffer_count,
         report.encoder_count,
-        report.dispatch_count
+        report.dispatch_count,
+        report.counter_track_count
     ));
 
     for cb in &report.command_buffers {
@@ -533,6 +577,21 @@ pub fn format_report(report: &TimelineReport) -> String {
                 format_duration_ms(dispatch.duration_ns),
                 dispatch.grid_size,
                 dispatch.group_size
+            ));
+        }
+    }
+
+    if !report.counter_tracks.is_empty() {
+        out.push_str("\nCounter tracks:\n");
+        for track in &report.counter_tracks {
+            out.push_str(&format!(
+                "  {} [{}] samples={} min={:.3} max={:.3} avg={:.3}\n",
+                track.name,
+                track.unit,
+                track.samples.len(),
+                track.min_value,
+                track.max_value,
+                track.average_value
             ));
         }
     }
@@ -947,6 +1006,166 @@ fn bound_buffer_to_timeline(buffer: &BoundBuffer) -> TimelineBufferBinding {
     }
 }
 
+fn build_counter_tracks(
+    encoders: &[TimelineEncoder],
+    counter_limiters: Option<&[counter::CounterLimiter]>,
+) -> Vec<TimelineCounterTrack> {
+    let Some(counter_limiters) = counter_limiters else {
+        return Vec::new();
+    };
+    if encoders.is_empty() || counter_limiters.is_empty() {
+        return Vec::new();
+    }
+
+    let encoder_by_index = encoders
+        .iter()
+        .map(|encoder| (encoder.index, encoder))
+        .collect::<BTreeMap<_, _>>();
+    let mut tracks = vec![
+        CounterTrackBuilder::new("Occupancy Manager", "%"),
+        CounterTrackBuilder::new("ALU Utilization", "%"),
+        CounterTrackBuilder::new("Shader Launch Limiter", "%"),
+        CounterTrackBuilder::new("Instruction Throughput", "%"),
+        CounterTrackBuilder::new("Integer Complex", "%"),
+        CounterTrackBuilder::new("F32 Limiter", "%"),
+        CounterTrackBuilder::new("L1 Cache", "%"),
+        CounterTrackBuilder::new("Last Level Cache", "%"),
+        CounterTrackBuilder::new("Control Flow", "%"),
+        CounterTrackBuilder::new("Device Memory Bandwidth", "GB/s"),
+        CounterTrackBuilder::new("Buffer L1 Read Bandwidth", "GB/s"),
+        CounterTrackBuilder::new("Buffer L1 Write Bandwidth", "GB/s"),
+    ];
+
+    for limiter in counter_limiters {
+        let Some(encoder) = encoder_by_index.get(&limiter.encoder_index) else {
+            continue;
+        };
+        let start = encoder.start_time_ns;
+        let end = encoder.end_time_ns.max(start);
+        if let Some(value) = limiter.occupancy_manager {
+            tracks[0].push(start, end, value);
+        }
+        if let Some(value) = limiter.alu_utilization {
+            tracks[1].push(start, end, value);
+        }
+        if let Some(value) = limiter.compute_shader_launch {
+            tracks[2].push(start, end, value * 100.0);
+        }
+        if let Some(value) = limiter.instruction_throughput {
+            tracks[3].push(start, end, value);
+        }
+        if let Some(value) = limiter.integer_complex {
+            tracks[4].push(start, end, value * 100.0);
+        }
+        if let Some(value) = limiter.f32_limiter {
+            tracks[5].push(start, end, value * 100.0);
+        }
+        if let Some(value) = limiter.l1_cache {
+            tracks[6].push(start, end, value * 100.0);
+        }
+        if let Some(value) = limiter.last_level_cache {
+            tracks[7].push(start, end, value * 100.0);
+        }
+        if let Some(value) = limiter.control_flow {
+            tracks[8].push(start, end, value * 100.0);
+        }
+        if let Some(value) = limiter.device_memory_bandwidth_gbps {
+            tracks[9].push(start, end, value);
+        }
+        if let Some(value) = limiter.buffer_l1_read_bandwidth_gbps {
+            tracks[10].push(start, end, value);
+        }
+        if let Some(value) = limiter.buffer_l1_write_bandwidth_gbps {
+            tracks[11].push(start, end, value);
+        }
+    }
+
+    tracks
+        .into_iter()
+        .filter_map(CounterTrackBuilder::build)
+        .collect()
+}
+
+fn append_counter_track_events(
+    events: &mut Vec<TimelineEvent>,
+    counter_tracks: &[TimelineCounterTrack],
+) {
+    let mut thread_id = 10_000u32;
+    for track in counter_tracks {
+        events.push(metadata_event(1, thread_id, "thread_name", &track.name));
+        for sample in &track.samples {
+            let mut args = BTreeMap::new();
+            args.insert("value".to_owned(), json!(sample.value));
+            args.insert("unit".to_owned(), json!(track.unit));
+            events.push(TimelineEvent {
+                name: track.name.clone(),
+                category: Some("counter".to_owned()),
+                phase: "C".to_owned(),
+                timestamp_us: ns_to_us(sample.timestamp_ns),
+                duration_us: None,
+                process_id: 1,
+                thread_id,
+                args,
+            });
+        }
+        thread_id = thread_id.saturating_add(1);
+    }
+}
+
+#[derive(Debug)]
+struct CounterTrackBuilder {
+    name: String,
+    unit: String,
+    samples: Vec<TimelineCounterSample>,
+}
+
+impl CounterTrackBuilder {
+    fn new(name: &str, unit: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            unit: unit.to_owned(),
+            samples: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, start_time_ns: u64, end_time_ns: u64, value: f64) {
+        self.samples.push(TimelineCounterSample {
+            timestamp_ns: start_time_ns,
+            value,
+        });
+        if end_time_ns != start_time_ns {
+            self.samples.push(TimelineCounterSample {
+                timestamp_ns: end_time_ns,
+                value,
+            });
+        }
+    }
+
+    fn build(mut self) -> Option<TimelineCounterTrack> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        self.samples
+            .sort_by(|left, right| left.timestamp_ns.cmp(&right.timestamp_ns));
+        let mut min_value = f64::INFINITY;
+        let mut max_value = f64::NEG_INFINITY;
+        let mut total = 0.0;
+        for sample in &self.samples {
+            min_value = min_value.min(sample.value);
+            max_value = max_value.max(sample.value);
+            total += sample.value;
+        }
+        Some(TimelineCounterTrack {
+            name: self.name,
+            unit: self.unit,
+            average_value: total / self.samples.len() as f64,
+            min_value,
+            max_value,
+            samples: self.samples,
+        })
+    }
+}
+
 fn build_raw_report_for_path(trace_path: &Path) -> Result<RawTimelineReport> {
     let profiler_directory = find_profiler_directory(trace_path);
     let mut files = Vec::new();
@@ -1218,7 +1437,7 @@ mod tests {
             },
         ];
 
-        let report = build(&regions, None, None);
+        let report = build(&regions, None, None, None);
 
         assert!(report.synthetic);
         assert_eq!(report.source, "synthetic");
@@ -1291,7 +1510,7 @@ mod tests {
         };
 
         let summary = profiler_summary_with_timeline(timeline, vec![]);
-        let report = build(&regions, Some(&summary), None);
+        let report = build(&regions, Some(&summary), None, None);
 
         assert!(!report.synthetic);
         assert_eq!(report.source, "streamData");
@@ -1385,7 +1604,7 @@ mod tests {
         ];
 
         let summary = profiler_summary_with_timeline(timeline, dispatches);
-        let report = build(&regions, Some(&summary), None);
+        let report = build(&regions, Some(&summary), None, None);
 
         assert!(!report.synthetic);
         assert_eq!(report.source, "streamData");
@@ -1485,7 +1704,7 @@ mod tests {
             },
         ];
 
-        let report = build(&regions, None, Some(&raw_timings));
+        let report = build(&regions, None, Some(&raw_timings), None);
 
         assert!(!report.synthetic);
         assert_eq!(report.source, "raw-profiler-heuristic");
@@ -1501,6 +1720,82 @@ mod tests {
 
         let text = format_report(&report);
         assert!(text.contains("Raw-profiler timeline report"));
+    }
+
+    #[test]
+    fn builds_counter_tracks_from_real_counter_limiters() {
+        let encoders = vec![
+            TimelineEncoder {
+                index: 0,
+                command_buffer_index: 0,
+                label: "main".into(),
+                address: 0x10,
+                dispatch_count: 2,
+                start_time_ns: 1_000,
+                end_time_ns: 5_000,
+                duration_ns: Some(4_000),
+                synthetic: false,
+            },
+            TimelineEncoder {
+                index: 1,
+                command_buffer_index: 0,
+                label: "aux".into(),
+                address: 0x20,
+                dispatch_count: 1,
+                start_time_ns: 5_000,
+                end_time_ns: 8_000,
+                duration_ns: Some(3_000),
+                synthetic: false,
+            },
+        ];
+        let limiters = vec![
+            counter::CounterLimiter {
+                encoder_index: 0,
+                occupancy_manager: Some(80.0),
+                alu_utilization: Some(62.0),
+                compute_shader_launch: Some(0.12),
+                instruction_throughput: Some(2.4),
+                integer_complex: Some(1.1),
+                control_flow: Some(0.09),
+                f32_limiter: Some(6.5),
+                l1_cache: Some(0.08),
+                last_level_cache: Some(0.07),
+                device_memory_bandwidth_gbps: Some(3.2),
+                buffer_l1_read_bandwidth_gbps: Some(1.4),
+                buffer_l1_write_bandwidth_gbps: Some(0.8),
+            },
+            counter::CounterLimiter {
+                encoder_index: 1,
+                occupancy_manager: Some(75.0),
+                alu_utilization: Some(55.0),
+                compute_shader_launch: Some(0.10),
+                instruction_throughput: Some(2.0),
+                integer_complex: Some(0.9),
+                control_flow: Some(0.05),
+                f32_limiter: Some(5.0),
+                l1_cache: Some(0.06),
+                last_level_cache: Some(0.04),
+                device_memory_bandwidth_gbps: Some(2.8),
+                buffer_l1_read_bandwidth_gbps: Some(1.2),
+                buffer_l1_write_bandwidth_gbps: Some(0.6),
+            },
+        ];
+
+        let tracks = build_counter_tracks(&encoders, Some(&limiters));
+        assert!(!tracks.is_empty());
+        assert_eq!(tracks[0].name, "Occupancy Manager");
+        assert_eq!(tracks[0].samples.len(), 4);
+        assert_eq!(tracks[0].min_value, 75.0);
+        assert_eq!(tracks[0].max_value, 80.0);
+
+        let mut events = Vec::new();
+        append_counter_track_events(&mut events, &tracks);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.category.as_deref() == Some("counter"))
+        );
+        assert!(events.iter().any(|event| event.phase == "C"));
     }
 
     #[test]
