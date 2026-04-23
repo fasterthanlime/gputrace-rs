@@ -78,6 +78,13 @@ pub struct ProfilerEncoderTiming {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilerRawEncoderTiming {
+    pub index: usize,
+    pub duration_ns: u64,
+    pub confidence_milli: u16,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProfilerCommandBufferTimestamp {
     pub index: usize,
     pub start_ticks: u64,
@@ -240,6 +247,79 @@ pub fn stream_data_summary<P: AsRef<Path>>(path: P) -> Result<ProfilerStreamData
         return Err(Error::MissingFile(stream_data_path));
     }
     parse_stream_data(&stream_data_path, Some(&profiler_directory))
+}
+
+pub fn raw_encoder_timings<P: AsRef<Path>>(path: P) -> Result<Vec<ProfilerRawEncoderTiming>> {
+    let input_path = path.as_ref().to_path_buf();
+    let profiler_directory =
+        find_profiler_directory(&input_path).ok_or_else(|| Error::NotFound(input_path.clone()))?;
+
+    let mut files = fs::read_dir(&profiler_directory)?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let index = name
+                .strip_prefix("Counters_f_")
+                .and_then(|rest| rest.strip_suffix(".raw"))
+                .and_then(|rest| rest.parse::<usize>().ok())?;
+            Some((index, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|(index, _)| *index);
+
+    let mut timings = Vec::new();
+    for (index, path) in files {
+        let data = fs::read(path)?;
+        let starts = raw_record_starts(&data);
+        if starts.is_empty() {
+            continue;
+        }
+        let mut relative_duration = 0f64;
+        let mut sample_records = 0usize;
+        for (record_index, offset) in starts.iter().enumerate() {
+            let next = starts.get(record_index + 1).copied().unwrap_or(data.len());
+            let record_size = next.saturating_sub(*offset);
+            if record_size != 464 {
+                continue;
+            }
+            let record = &data[*offset..next];
+            let limiter_values = record
+                .chunks_exact(mem::size_of::<u32>())
+                .filter_map(|chunk: &[u8]| {
+                    let value =
+                        f32::from_bits(u32::from_le_bytes(chunk.try_into().unwrap())) as f64;
+                    (value.is_finite() && (0.001..=10.0).contains(&value)).then_some(value)
+                })
+                .take(30)
+                .collect::<Vec<_>>();
+            if limiter_values.is_empty() {
+                continue;
+            }
+            relative_duration += limiter_values.iter().sum::<f64>();
+            sample_records += 1;
+        }
+        if relative_duration <= f64::EPSILON {
+            continue;
+        }
+        timings.push(ProfilerRawEncoderTiming {
+            index,
+            duration_ns: (relative_duration * 1_000_000.0) as u64,
+            confidence_milli: if sample_records >= 4 { 300 } else { 200 },
+        });
+    }
+
+    timings.sort_by(|left, right| right.duration_ns.cmp(&left.duration_ns));
+    Ok(timings)
+}
+
+fn raw_record_starts(data: &[u8]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    for i in 0..data.len().saturating_sub(mem::size_of::<u32>()) {
+        if data[i..].starts_with(&[0x4e, 0x00, 0x00, 0x00]) {
+            starts.push(i);
+        }
+    }
+    starts
 }
 
 pub fn format_report(report: &ProfilerReport) -> String {
@@ -1909,5 +1989,29 @@ mod tests {
         assert!(text.contains("occ_mgr=72.00%"));
         assert!(text.contains("encoder 0: 37.50%"));
         assert!(text.contains("regs=32"));
+    }
+
+    #[test]
+    fn extracts_raw_encoder_timings_from_counter_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiler_dir = dir.path().join("trace.gputrace.gpuprofiler_raw");
+        fs::create_dir_all(&profiler_dir).unwrap();
+
+        let mut data = vec![0u8; 2400];
+        data[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
+        let mut record = vec![0u8; 464];
+        record[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
+        for (index, value) in [1.5f32, 2.0, 0.5].iter().enumerate() {
+            let offset = 4 + index * 4;
+            record[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&record);
+        fs::write(profiler_dir.join("Counters_f_0.raw"), data).unwrap();
+
+        let timings = raw_encoder_timings(dir.path().join("trace.gputrace")).unwrap();
+        assert_eq!(timings.len(), 1);
+        assert_eq!(timings[0].index, 0);
+        assert!(timings[0].duration_ns > 0);
+        assert_eq!(timings[0].confidence_milli, 200);
     }
 }

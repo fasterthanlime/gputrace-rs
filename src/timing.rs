@@ -9,6 +9,7 @@ use crate::trace::TraceBundle;
 #[derive(Debug, Clone, Serialize)]
 pub struct TimingReport {
     pub synthetic: bool,
+    pub source: String,
     pub total_duration_ns: u64,
     pub command_buffer_count: usize,
     pub encoder_count: usize,
@@ -46,6 +47,11 @@ pub struct KernelTiming {
 pub fn report(trace: &TraceBundle) -> Result<TimingReport> {
     if let Ok(summary) = profiler::stream_data_summary(&trace.path) {
         return Ok(report_from_profiler(trace, &summary));
+    }
+    if let Ok(raw_timings) = profiler::raw_encoder_timings(&trace.path)
+        && !raw_timings.is_empty()
+    {
+        return report_from_raw_profiler(trace, &raw_timings);
     }
 
     let command_buffers = trace.command_buffers()?;
@@ -153,6 +159,7 @@ pub fn report(trace: &TraceBundle) -> Result<TimingReport> {
 
     Ok(TimingReport {
         synthetic: true,
+        source: "synthetic".to_owned(),
         total_duration_ns,
         command_buffer_count: command_buffer_timings.len(),
         encoder_count: encoders.len(),
@@ -263,6 +270,7 @@ fn report_from_profiler(
 
     TimingReport {
         synthetic: false,
+        source: "streamData".to_owned(),
         total_duration_ns,
         command_buffer_count: command_buffer_timings.len(),
         encoder_count: encoders.len(),
@@ -271,6 +279,135 @@ fn report_from_profiler(
         encoders,
         kernels,
     }
+}
+
+fn report_from_raw_profiler(
+    trace: &TraceBundle,
+    raw_timings: &[profiler::ProfilerRawEncoderTiming],
+) -> Result<TimingReport> {
+    let regions = trace.command_buffer_regions()?;
+    let encoders = trace.compute_encoders()?;
+
+    let mut encoder_rows = Vec::new();
+    let mut total_duration_ns = 0u64;
+    for timing in raw_timings {
+        total_duration_ns = total_duration_ns.saturating_add(timing.duration_ns);
+        let encoder = encoders
+            .iter()
+            .find(|encoder| encoder.index == timing.index);
+        let dispatch_count = regions
+            .iter()
+            .flat_map(|region| region.dispatches.iter())
+            .filter(|dispatch| dispatch.encoder_id == encoder.map(|encoder| encoder.address))
+            .count();
+        encoder_rows.push(EncoderTiming {
+            label: encoder
+                .map(|encoder| encoder.label.clone())
+                .unwrap_or_else(|| format!("encoder {}", timing.index)),
+            address: encoder
+                .map(|encoder| encoder.address)
+                .unwrap_or(timing.index as u64),
+            dispatch_count,
+            synthetic_duration_ns: timing.duration_ns,
+        });
+    }
+
+    let mut kernel_stats = BTreeMap::<String, KernelTiming>::new();
+    for region in &regions {
+        let encoder_duration_by_addr = encoder_rows
+            .iter()
+            .map(|encoder| (encoder.address, encoder.synthetic_duration_ns))
+            .collect::<BTreeMap<_, _>>();
+        let mut dispatches_by_encoder = BTreeMap::<u64, usize>::new();
+        for dispatch in &region.dispatches {
+            if let Some(encoder_id) = dispatch.encoder_id {
+                *dispatches_by_encoder.entry(encoder_id).or_default() += 1;
+            }
+        }
+        for dispatch in &region.dispatches {
+            let kernel_name = dispatch
+                .kernel_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
+            let per_dispatch_duration = dispatch
+                .encoder_id
+                .and_then(|encoder_id| encoder_duration_by_addr.get(&encoder_id).copied())
+                .map(|duration| {
+                    duration
+                        / dispatches_by_encoder
+                            .get(&dispatch.encoder_id.unwrap_or_default())
+                            .copied()
+                            .unwrap_or(1) as u64
+                })
+                .unwrap_or(0);
+            let kernel = kernel_stats
+                .entry(kernel_name.clone())
+                .or_insert_with(|| KernelTiming {
+                    name: kernel_name,
+                    dispatch_count: 0,
+                    synthetic_duration_ns: 0,
+                    percent_of_total: 0.0,
+                });
+            kernel.dispatch_count += 1;
+            kernel.synthetic_duration_ns = kernel
+                .synthetic_duration_ns
+                .saturating_add(per_dispatch_duration);
+        }
+    }
+
+    let mut kernels: Vec<_> = kernel_stats.into_values().collect();
+    for kernel in &mut kernels {
+        if total_duration_ns > 0 {
+            kernel.percent_of_total =
+                (kernel.synthetic_duration_ns as f64 / total_duration_ns as f64) * 100.0;
+        }
+    }
+    kernels.sort_by(|left, right| {
+        right
+            .synthetic_duration_ns
+            .cmp(&left.synthetic_duration_ns)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let command_buffers = trace.command_buffers()?;
+    let command_buffer_rows = command_buffers
+        .iter()
+        .enumerate()
+        .map(|(index, cb)| CommandBufferTiming {
+            index: cb.index,
+            timestamp_ns: cb.timestamp,
+            duration_ns: command_buffers
+                .get(index + 1)
+                .and_then(|next| next.timestamp.checked_sub(cb.timestamp)),
+            encoder_count: regions
+                .get(index)
+                .map(|region| region.encoders.len())
+                .unwrap_or(0),
+            dispatch_count: regions
+                .get(index)
+                .map(|region| region.dispatches.len())
+                .unwrap_or(0),
+        })
+        .collect::<Vec<_>>();
+
+    encoder_rows.sort_by(|left, right| {
+        right
+            .synthetic_duration_ns
+            .cmp(&left.synthetic_duration_ns)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+
+    Ok(TimingReport {
+        synthetic: false,
+        source: "raw-profiler-heuristic".to_owned(),
+        total_duration_ns,
+        command_buffer_count: command_buffer_rows.len(),
+        encoder_count: encoder_rows.len(),
+        dispatch_count: regions.iter().map(|region| region.dispatches.len()).sum(),
+        command_buffers: command_buffer_rows,
+        encoders: encoder_rows,
+        kernels,
+    })
 }
 
 fn command_buffer_timings_from_timeline(
@@ -317,10 +454,15 @@ pub fn format_report(report: &TimingReport) -> String {
     if report.synthetic {
         out.push_str("Synthetic timing report\n");
         out.push_str("Derived from command-buffer timestamps and dispatch attribution.\n\n");
-    } else {
+    } else if report.source == "streamData" {
         out.push_str("Profiler-backed timing report\n");
         out.push_str(
             "Kernel, dispatch, and encoder timing come from streamData; command-buffer rows prefer APSTimelineData spans when present.\n\n",
+        );
+    } else {
+        out.push_str("Raw-profiler timing report\n");
+        out.push_str(
+            "Encoder timing comes from Counters_f_* heuristic aggregation; command-buffer rows still come from trace timestamps when available.\n\n",
         );
     }
     out.push_str(&format!(
@@ -438,6 +580,7 @@ mod tests {
     fn formats_csv() {
         let report = TimingReport {
             synthetic: true,
+            source: "synthetic".into(),
             total_duration_ns: 100,
             command_buffer_count: 1,
             encoder_count: 1,
@@ -465,6 +608,7 @@ mod tests {
     fn formats_profiler_backed_report() {
         let report = TimingReport {
             synthetic: false,
+            source: "streamData".into(),
             total_duration_ns: 1_500,
             command_buffer_count: 1,
             encoder_count: 1,
@@ -494,5 +638,40 @@ mod tests {
         assert!(text.contains("Profiler-backed timing report"));
         assert!(text.contains("APSTimelineData"));
         assert!(text.contains("Duration ns"));
+    }
+
+    #[test]
+    fn formats_raw_profiler_report() {
+        let report = TimingReport {
+            synthetic: false,
+            source: "raw-profiler-heuristic".into(),
+            total_duration_ns: 900,
+            command_buffer_count: 1,
+            encoder_count: 1,
+            dispatch_count: 2,
+            command_buffers: vec![CommandBufferTiming {
+                index: 0,
+                timestamp_ns: 0,
+                duration_ns: Some(900),
+                encoder_count: 1,
+                dispatch_count: 2,
+            }],
+            encoders: vec![EncoderTiming {
+                label: "enc".into(),
+                address: 1,
+                dispatch_count: 2,
+                synthetic_duration_ns: 900,
+            }],
+            kernels: vec![KernelTiming {
+                name: "kernel".into(),
+                dispatch_count: 2,
+                synthetic_duration_ns: 900,
+                percent_of_total: 100.0,
+            }],
+        };
+
+        let text = format_report(&report);
+        assert!(text.contains("Raw-profiler timing report"));
+        assert!(text.contains("Counters_f_* heuristic"));
     }
 }
