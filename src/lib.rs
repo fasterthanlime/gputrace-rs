@@ -16,6 +16,7 @@ pub mod graphing;
 pub mod insights;
 pub mod markdown;
 pub mod mtlb;
+pub mod profiler;
 pub mod shaders;
 pub mod timeline;
 pub mod timing;

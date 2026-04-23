@@ -20,6 +20,7 @@ use crate::graphing;
 use crate::insights;
 use crate::markdown;
 use crate::mtlb;
+use crate::profiler;
 use crate::shaders;
 use crate::timeline;
 use crate::timing;
@@ -43,6 +44,10 @@ enum CommandSet {
     DumpRecords(DumpRecordsArgs),
     Fences(FencesArgs),
     Mtlb(MtlbArgs),
+    MtlbInventory(MtlbPathArgs),
+    MtlbStats(MtlbPathArgs),
+    MtlbFunctions(MtlbFunctionsArgs),
+    Profiler(ProfilerArgs),
     Timeline(TimelineArgs),
     Kernels(KernelsArgs),
     Encoders(EncodersArgs),
@@ -61,7 +66,13 @@ enum CommandSet {
     Diff(DiffArgs),
     Markdown(MarkdownArgs),
     Version(VersionArgs),
+    XcodeButtons(XcodeTraceQueryArgs),
+    XcodeInspect(XcodeTraceQueryArgs),
     XcodeProfile(XcodeProfileArgs),
+    XcodeTabs(XcodeTraceQueryArgs),
+    XcodeUiElements(XcodeTraceQueryArgs),
+    XcodeWindows(XcodeFormatArgs),
+    XcodeMenuItems(XcodeMenuItemsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -144,8 +155,55 @@ struct MtlbArgs {
 }
 
 #[derive(Debug, Args)]
+struct MtlbPathArgs {
+    path: PathBuf,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct MtlbFunctionsArgs {
+    path: PathBuf,
+    #[arg(long)]
+    filter: Option<String>,
+    #[arg(long, default_value_t = false)]
+    used_only: bool,
+    #[arg(long = "no-usage", default_value_t = false)]
+    no_usage: bool,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
 struct FencesArgs {
     trace: PathBuf,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct XcodeFormatArgs {
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct XcodeTraceQueryArgs {
+    trace: Option<PathBuf>,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct XcodeMenuItemsArgs {
+    menu_path: Vec<String>,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ProfilerArgs {
+    path: PathBuf,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -450,6 +508,46 @@ pub fn run() -> Result<()> {
                 _ => return Err(crate::Error::Unsupported("unknown mtlb format")),
             }
         }
+        CommandSet::MtlbInventory(args) => {
+            let report = mtlb::inventory(args.path)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", mtlb::format_inventory_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown mtlb-inventory format")),
+            }
+        }
+        CommandSet::MtlbStats(args) => {
+            let report = mtlb::stats(args.path)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", mtlb::format_stats_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown mtlb-stats format")),
+            }
+        }
+        CommandSet::MtlbFunctions(args) => {
+            let report = mtlb::functions(
+                args.path,
+                &mtlb::MTLBFunctionsOptions {
+                    filter: args.filter,
+                    used_only: args.used_only,
+                    include_usage: !args.no_usage,
+                },
+            )?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", mtlb::format_functions_report(&report)),
+                "csv" => print!("{}", mtlb::export_functions_csv(&report)),
+                "json" => print!("{}", mtlb::export_functions_json(&report)),
+                _ => return Err(crate::Error::Unsupported("unknown mtlb-functions format")),
+            }
+        }
+        CommandSet::Profiler(args) => {
+            let report = profiler::report(args.path)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", profiler::format_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown profiler format")),
+            }
+        }
         CommandSet::Fences(args) => {
             let trace = TraceBundle::open(args.trace)?;
             let report = fences::report(&trace)?;
@@ -723,6 +821,63 @@ pub fn run() -> Result<()> {
                 println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             }
         }
+        CommandSet::XcodeWindows(args) => {
+            let report = automation::list_windows()?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_windows(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-windows format")),
+            }
+        }
+        CommandSet::XcodeInspect(args) => {
+            let report = automation::inspect_window(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_window_snapshot(report.as_ref())),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-inspect format")),
+            }
+        }
+        CommandSet::XcodeButtons(args) => {
+            let report = automation::list_buttons(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_buttons(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-buttons format")),
+            }
+        }
+        CommandSet::XcodeTabs(args) => {
+            let report = automation::list_tabs(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_tabs(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-tabs format")),
+            }
+        }
+        CommandSet::XcodeUiElements(args) => {
+            let report = automation::list_ui_elements(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_ui_elements(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-ui-elements format",
+                    ));
+                }
+            }
+        }
+        CommandSet::XcodeMenuItems(args) => {
+            let menu_segments = args
+                .menu_path
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let report = automation::list_menu_items(&menu_segments)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_menu_items(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-menu-items format")),
+            }
+        }
         CommandSet::XcodeProfile(args) => {
             if args.activate {
                 automation::activate_xcode()?;
@@ -752,6 +907,148 @@ fn confirm_clear_buffers(report: &clear_buffers::ClearBuffersReport) -> Result<b
     io::stdin().read_line(&mut response)?;
     let response = response.trim().to_ascii_lowercase();
     Ok(matches!(response.as_str(), "y" | "yes"))
+}
+
+fn format_xcode_windows(windows: &[automation::XcodeWindowInfo]) -> String {
+    if windows.is_empty() {
+        return "No Xcode windows found\n".to_owned();
+    }
+
+    let mut out = String::new();
+    for window in windows {
+        out.push_str(&format!(
+            "{} [{}{}{}]\n",
+            window.title,
+            window.role,
+            if window.focused { ", focused" } else { "" },
+            if window.main { ", main" } else { "" }
+        ));
+        if let Some(document) = &window.document {
+            out.push_str(&format!("  document: {document}\n"));
+        }
+        if let Some(subrole) = &window.subrole {
+            out.push_str(&format!("  subrole: {subrole}\n"));
+        }
+        if window.modal {
+            out.push_str("  modal: yes\n");
+        }
+    }
+    out
+}
+
+fn format_xcode_window_snapshot(snapshot: Option<&automation::XcodeWindowSnapshot>) -> String {
+    match snapshot {
+        None => "No matching Xcode window found\n".to_owned(),
+        Some(snapshot) => {
+            let mut out = String::new();
+            out.push_str(&format!("{}\n", snapshot.window.title));
+            out.push_str(&format!("  status: {:?}\n", snapshot.status));
+            out.push_str(&format!(
+                "  buttons: {}  tabs: {}  toolbars: {}\n",
+                snapshot.button_count, snapshot.tab_count, snapshot.toolbar_count
+            ));
+            if let Some(document) = &snapshot.window.document {
+                out.push_str(&format!("  document: {document}\n"));
+            }
+            out
+        }
+    }
+}
+
+fn format_xcode_buttons(buttons: &[automation::XcodeButtonInfo]) -> String {
+    if buttons.is_empty() {
+        return "No buttons found\n".to_owned();
+    }
+
+    let mut out = String::new();
+    for button in buttons {
+        out.push_str(&format!(
+            "{} [{}]{}\n",
+            button.name,
+            if button.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            button
+                .description
+                .as_ref()
+                .map(|description| format!(" - {description}"))
+                .unwrap_or_default()
+        ));
+    }
+    out
+}
+
+fn format_xcode_tabs(tabs: &[automation::XcodeTabInfo]) -> String {
+    if tabs.is_empty() {
+        return "No tabs found\n".to_owned();
+    }
+
+    let mut out = String::new();
+    for tab in tabs {
+        out.push_str(&format!(
+            "{} [{}{}]\n",
+            tab.name,
+            if tab.enabled { "enabled" } else { "disabled" },
+            if tab.selected { ", selected" } else { "" }
+        ));
+        out.push_str(&format!("  role: {}", tab.role));
+        if let Some(subrole) = &tab.subrole {
+            out.push_str(&format!(" ({subrole})"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn format_xcode_menu_items(items: &[automation::XcodeMenuItemInfo]) -> String {
+    if items.is_empty() {
+        return "No menu items found\n".to_owned();
+    }
+
+    let mut out = String::new();
+    for item in items {
+        out.push_str(&format!(
+            "{} [{}{}]\n",
+            item.menu_path.join(" > "),
+            if item.enabled { "enabled" } else { "disabled" },
+            if item.has_submenu { ", submenu" } else { "" }
+        ));
+        out.push_str(&format!("  title: {}\n", item.title));
+    }
+    out
+}
+
+fn format_xcode_ui_elements(elements: &[automation::XcodeUiElementInfo]) -> String {
+    if elements.is_empty() {
+        return "No UI elements found\n".to_owned();
+    }
+
+    let mut out = String::new();
+    for element in elements {
+        out.push_str(&format!(
+            "{} [{}]\n",
+            element.path.join(" > "),
+            element.role
+        ));
+        if let Some(title) = &element.title {
+            out.push_str(&format!("  title: {title}\n"));
+        }
+        if let Some(description) = &element.description {
+            out.push_str(&format!("  description: {description}\n"));
+        }
+        if let Some(identifier) = &element.identifier {
+            out.push_str(&format!("  identifier: {identifier}\n"));
+        }
+        if let Some(enabled) = element.enabled {
+            out.push_str(&format!(
+                "  enabled: {}\n",
+                if enabled { "yes" } else { "no" }
+            ));
+        }
+    }
+    out
 }
 
 fn parse_record_type(value: &str) -> Result<RecordType> {
