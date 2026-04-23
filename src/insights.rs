@@ -2,6 +2,7 @@ use serde::Serialize;
 
 use crate::analysis;
 use crate::error::{Error, Result};
+use crate::profiler;
 use crate::timing;
 use crate::trace::TraceBundle;
 
@@ -51,6 +52,7 @@ pub struct InsightsReport {
 pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsReport> {
     let analysis = analysis::analyze(trace);
     let timing = timing::report(trace)?;
+    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     let time_label = if timing.synthetic {
         "synthetic GPU time"
     } else {
@@ -133,6 +135,56 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                     "Likely wasting CPU submission overhead on tiny dispatches.".to_owned(),
                 ),
             });
+        }
+    }
+
+    if let Some(summary) = &profiler_summary {
+        let mut sample_totals =
+            std::collections::BTreeMap::<String, (usize, u64, usize, f64)>::new();
+        let mut total_samples = 0usize;
+        let mut total_duration_us = 0u64;
+        for dispatch in &summary.dispatches {
+            let name = dispatch
+                .function_name
+                .clone()
+                .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
+            let entry = sample_totals.entry(name).or_default();
+            entry.0 += dispatch.sample_count;
+            entry.1 += dispatch.duration_us;
+            entry.2 += 1;
+            entry.3 += dispatch.sampling_density;
+            total_samples += dispatch.sample_count;
+            total_duration_us += dispatch.duration_us;
+        }
+
+        for (name, (samples, duration_us, dispatch_count, density_sum)) in sample_totals {
+            if samples == 0 || total_samples == 0 || total_duration_us == 0 {
+                continue;
+            }
+            let sample_pct = samples as f64 * 100.0 / total_samples as f64;
+            let time_pct = duration_us as f64 * 100.0 / total_duration_us as f64;
+            let delta = sample_pct - time_pct;
+            let avg_density = density_sum / dispatch_count.max(1) as f64;
+
+            if delta > 10.0 {
+                insights.push(PerformanceInsight {
+                    insight_type: InsightType::Bottleneck,
+                    severity: InsightSeverity::High,
+                    shader_name: Some(name.clone()),
+                    title: format!("{name} is sample-heavy relative to its runtime"),
+                    description: format!(
+                        "{name} accounts for {:.1}% of correlated profiler samples but only {:.1}% of GPU time, with {:.3} samples/us on average.",
+                        sample_pct, time_pct, avg_density
+                    ),
+                    recommendations: vec![
+                        "Inspect this shader for sustained ALU or bandwidth pressure.".to_owned(),
+                        "Compare sample-heavy kernels against source using `shader-source` and `correlate`.".to_owned(),
+                    ],
+                    impact: Some(
+                        "Suggests higher GPU utilization than duration alone would imply.".to_owned(),
+                    ),
+                });
+            }
         }
     }
 

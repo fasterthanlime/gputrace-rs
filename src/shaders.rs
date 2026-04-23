@@ -26,6 +26,8 @@ pub struct ShaderEntry {
     pub dispatch_count: usize,
     pub total_duration_ns: Option<u64>,
     pub percent_of_total: Option<f64>,
+    pub sample_count: usize,
+    pub avg_sampling_density: Option<f64>,
     pub source_file: Option<PathBuf>,
     pub source_line: Option<usize>,
 }
@@ -59,6 +61,9 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
     let index = ShaderSourceIndex::build(search_paths)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     let mut duration_by_name = BTreeMap::<String, u64>::new();
+    let mut sample_count_by_name = BTreeMap::<String, usize>::new();
+    let mut density_sum_by_name = BTreeMap::<String, f64>::new();
+    let mut density_count_by_name = BTreeMap::<String, usize>::new();
     let mut total_duration_ns = 0u64;
     if let Some(summary) = &profiler_summary {
         total_duration_ns = summary.total_time_us.saturating_mul(1_000);
@@ -67,8 +72,13 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 .function_name
                 .clone()
                 .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
-            *duration_by_name.entry(name).or_default() +=
+            *duration_by_name.entry(name.clone()).or_default() +=
                 dispatch.duration_us.saturating_mul(1_000);
+            *sample_count_by_name.entry(name.clone()).or_default() += dispatch.sample_count;
+            if dispatch.sample_count > 0 {
+                *density_sum_by_name.entry(name.clone()).or_default() += dispatch.sampling_density;
+                *density_count_by_name.entry(name).or_default() += 1;
+            }
         }
     }
 
@@ -76,21 +86,33 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
         .analyze_kernels()?
         .into_values()
         .map(|kernel| {
+            let kernel_name = kernel.name.clone();
             let (source_file, source_line) = match index.lookup(&kernel.name) {
                 Some((file, line)) => (Some(file), Some(line)),
                 None => (None, None),
             };
-            let total_duration_ns_for_shader = duration_by_name.get(&kernel.name).copied();
+            let total_duration_ns_for_shader = duration_by_name.get(&kernel_name).copied();
             let percent_of_total = total_duration_ns_for_shader.and_then(|duration| {
                 (total_duration_ns > 0)
                     .then(|| (duration as f64 / total_duration_ns as f64) * 100.0)
             });
+            let avg_sampling_density = density_count_by_name
+                .get(&kernel_name)
+                .copied()
+                .filter(|count| *count > 0)
+                .and_then(|count| {
+                    density_sum_by_name
+                        .get(&kernel_name)
+                        .map(|sum| *sum / count as f64)
+                });
             ShaderEntry {
-                name: kernel.name,
+                name: kernel_name.clone(),
                 pipeline_addr: kernel.pipeline_addr,
                 dispatch_count: kernel.dispatch_count,
                 total_duration_ns: total_duration_ns_for_shader,
                 percent_of_total,
+                sample_count: sample_count_by_name.get(&kernel_name).copied().unwrap_or(0),
+                avg_sampling_density,
                 source_file,
                 source_line,
             }
@@ -172,8 +194,15 @@ pub fn format_report(report: &ShaderReport) -> String {
         .any(|shader| shader.total_duration_ns.is_some());
     if has_profiler_timing {
         out.push_str(&format!(
-            "{:<36} {:<18} {:>10} {:>14} {:>8}  {}\n",
-            "Name", "Pipeline State", "Dispatches", "Duration ns", "Cost %", "Source"
+            "{:<36} {:<18} {:>10} {:>14} {:>8} {:>8} {:>10}  {}\n",
+            "Name",
+            "Pipeline State",
+            "Dispatches",
+            "Duration ns",
+            "Cost %",
+            "Samples",
+            "Samples/us",
+            "Source"
         ));
     } else {
         out.push_str(&format!(
@@ -188,7 +217,7 @@ pub fn format_report(report: &ShaderReport) -> String {
         };
         if has_profiler_timing {
             out.push_str(&format!(
-                "{:<36} 0x{:<16x} {:>10} {:>14} {:>7}  {}\n",
+                "{:<36} 0x{:<16x} {:>10} {:>14} {:>7} {:>8} {:>10}  {}\n",
                 truncate(&shader.name, 36),
                 shader.pipeline_addr,
                 shader.dispatch_count,
@@ -199,6 +228,11 @@ pub fn format_report(report: &ShaderReport) -> String {
                 shader
                     .percent_of_total
                     .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader.sample_count,
+                shader
+                    .avg_sampling_density
+                    .map(|value| format!("{value:.3}"))
                     .unwrap_or_else(|| "-".to_owned()),
                 source
             ));
@@ -388,6 +422,8 @@ mod tests {
                 dispatch_count: 2,
                 total_duration_ns: Some(120),
                 percent_of_total: Some(60.0),
+                sample_count: 4,
+                avg_sampling_density: Some(0.2),
                 source_file: Some(PathBuf::from("/tmp/kernel.metal")),
                 source_line: Some(42),
             }],
@@ -396,6 +432,8 @@ mod tests {
         let output = format_report(&report);
         assert!(output.contains("Duration ns"));
         assert!(output.contains("Cost %"));
+        assert!(output.contains("Samples"));
+        assert!(output.contains("Samples/us"));
         assert!(output.contains("60.00"));
     }
 }
