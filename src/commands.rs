@@ -211,18 +211,16 @@ pub fn format_kernels(report: &KernelReport, verbose: bool) -> String {
         ));
         if verbose {
             if !kernel.encoder_labels.is_empty() {
-                out.push_str("           encoders:");
-                for (label, count) in kernel.encoder_labels.iter().take(5) {
-                    out.push_str(&format!(" {}({})", label, count));
-                }
-                out.push('\n');
+                out.push_str(&format!(
+                    "           encoders: {}\n",
+                    summarize_counted_entries(kernel.encoder_labels.iter(), 5)
+                ));
             }
             if !kernel.buffers.is_empty() {
-                out.push_str("           buffers:");
-                for (name, count) in kernel.buffers.iter().take(5) {
-                    out.push_str(&format!(" {}({})", name, count));
-                }
-                out.push('\n');
+                out.push_str(&format!(
+                    "           buffers: {}\n",
+                    summarize_counted_entries(kernel.buffers.iter(), 5)
+                ));
             }
         }
     }
@@ -291,8 +289,8 @@ pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
 pub fn dependencies(trace: &TraceBundle) -> Result<DependencyReport> {
     let regions = trace.command_buffer_regions()?;
     let mut nodes = Vec::new();
-    let mut edges: BTreeMap<(usize, usize), BTreeSet<String>> = BTreeMap::new();
-    let mut last_user: BTreeMap<String, usize> = BTreeMap::new();
+    let mut edges: BTreeMap<(usize, usize), DependencyAccumulator> = BTreeMap::new();
+    let mut last_user: BTreeMap<String, (usize, crate::trace::MTLResourceUsage)> = BTreeMap::new();
 
     for region in regions {
         for dispatch in region.dispatches {
@@ -330,13 +328,14 @@ pub fn dependencies(trace: &TraceBundle) -> Result<DependencyReport> {
                 if !seen_buffers.insert(buffer_name.clone()) {
                     continue;
                 }
-                if let Some(previous) = last_user.insert(buffer_name.clone(), dispatch.index)
+                if let Some((previous, previous_usage)) =
+                    last_user.insert(buffer_name.clone(), (dispatch.index, buffer.usage))
                     && previous != dispatch.index
                 {
                     edges
                         .entry((previous, dispatch.index))
                         .or_default()
-                        .insert(buffer_name);
+                        .push(buffer_name, classify_hazard(previous_usage, buffer.usage));
                 }
             }
         }
@@ -344,11 +343,11 @@ pub fn dependencies(trace: &TraceBundle) -> Result<DependencyReport> {
 
     let edges: Vec<_> = edges
         .into_iter()
-        .map(|((from, to), buffers)| DependencyEdge {
+        .map(|((from, to), edge)| DependencyEdge {
             from,
             to,
-            buffers: buffers.into_iter().collect(),
-            hazard: "RW".to_owned(),
+            buffers: edge.buffers.into_iter().collect(),
+            hazard: edge.hazard,
         })
         .collect();
 
@@ -358,6 +357,64 @@ pub fn dependencies(trace: &TraceBundle) -> Result<DependencyReport> {
         nodes,
         edges,
     })
+}
+
+#[derive(Debug, Default)]
+struct DependencyAccumulator {
+    buffers: BTreeSet<String>,
+    hazard: String,
+}
+
+impl DependencyAccumulator {
+    fn push(&mut self, buffer: String, hazard: &'static str) {
+        self.buffers.insert(buffer);
+        self.hazard = merge_hazards(&self.hazard, hazard);
+    }
+}
+
+fn classify_hazard(
+    previous: crate::trace::MTLResourceUsage,
+    current: crate::trace::MTLResourceUsage,
+) -> &'static str {
+    let prev_read = previous.contains(crate::trace::MTLResourceUsage::READ)
+        || previous.contains(crate::trace::MTLResourceUsage::SAMPLE);
+    let prev_write = previous.contains(crate::trace::MTLResourceUsage::WRITE);
+    let curr_read = current.contains(crate::trace::MTLResourceUsage::READ)
+        || current.contains(crate::trace::MTLResourceUsage::SAMPLE);
+    let curr_write = current.contains(crate::trace::MTLResourceUsage::WRITE);
+
+    if prev_read && prev_write && curr_read && curr_write {
+        return "RAW/WAR/WAW";
+    }
+    if prev_read && prev_write && curr_write {
+        return "WAW/WAR";
+    }
+
+    match (prev_read, prev_write, curr_read, curr_write) {
+        (_, true, true, false) => "RAW",
+        (_, true, _, true) => "WAW",
+        (true, false, _, true) => "WAR",
+        (false, false, _, _) => "USE",
+        _ => "RW",
+    }
+}
+
+fn merge_hazards(existing: &str, new_hazard: &str) -> String {
+    let mut hazards = BTreeSet::new();
+    for hazard in existing.split('/') {
+        if !hazard.is_empty() {
+            hazards.insert(hazard.to_owned());
+        }
+    }
+    for hazard in new_hazard.split('/') {
+        if !hazard.is_empty() {
+            hazards.insert(hazard.to_owned());
+        }
+    }
+    if hazards.is_empty() {
+        return new_hazard.to_owned();
+    }
+    hazards.into_iter().collect::<Vec<_>>().join("/")
 }
 
 pub fn command_buffers(trace: &TraceBundle) -> Result<CommandBuffersReport> {
@@ -576,27 +633,34 @@ pub fn format_encoders(report: &EncoderReport, verbose: bool) -> String {
 pub fn format_dependencies(report: &DependencyReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "{} nodes, {} edges\n\n",
+        "{} dispatch nodes, {} dependency edges\n\n",
         report.total_nodes, report.total_edges
     ));
     for node in &report.nodes {
         out.push_str(&format!("n{}: {}", node.id, node.label));
+        if let Some(kernel_name) = &node.kernel_name
+            && kernel_name != &node.label
+        {
+            out.push_str(&format!(" [kernel: {kernel_name}]"));
+        }
         if let Some(encoder_label) = &node.encoder_label {
-            out.push_str(&format!(" [{}]", encoder_label));
+            out.push_str(&format!(" [encoder: {encoder_label}]"));
         }
         out.push_str(&format!(" (CB {})\n", node.command_buffer_index));
     }
-    if !report.edges.is_empty() {
-        out.push_str("\nEdges:\n");
-        for edge in &report.edges {
-            out.push_str(&format!(
-                "  n{} -> n{} [{}] via {}\n",
-                edge.from,
-                edge.to,
-                edge.hazard,
-                edge.buffers.join(", ")
-            ));
-        }
+    out.push_str("\nDependencies:\n");
+    if report.edges.is_empty() {
+        out.push_str("  none\n");
+        return out;
+    }
+    for edge in &report.edges {
+        out.push_str(&format!(
+            "  n{} -> n{} [{}] via {}\n",
+            edge.from,
+            edge.to,
+            edge.hazard,
+            summarize_items(edge.buffers.iter().map(String::as_str), 4)
+        ));
     }
     out
 }
@@ -934,6 +998,32 @@ fn render_tree_node(out: &mut String, node: &TreeNode, depth: usize) {
     }
 }
 
+fn summarize_counted_entries<'a>(
+    entries: impl IntoIterator<Item = (&'a String, &'a usize)>,
+    limit: usize,
+) -> String {
+    let values: Vec<_> = entries
+        .into_iter()
+        .map(|(label, count)| format!("{label}({count})"))
+        .collect();
+    summarize_items(values.iter().map(String::as_str), limit)
+}
+
+fn summarize_items<'a>(items: impl IntoIterator<Item = &'a str>, limit: usize) -> String {
+    let values: Vec<_> = items.into_iter().collect();
+    if values.is_empty() {
+        return "none".to_owned();
+    }
+
+    let shown = values.iter().take(limit).copied().collect::<Vec<_>>();
+    let remaining = values.len().saturating_sub(shown.len());
+    let mut summary = shown.join(", ");
+    if remaining > 0 {
+        summary.push_str(&format!(", +{remaining} more"));
+    }
+    summary
+}
+
 fn truncate(value: &str, width: usize) -> String {
     if value.len() <= width {
         return value.to_owned();
@@ -969,6 +1059,43 @@ mod tests {
         assert!(rendered.contains("Dispatches"));
         assert!(rendered.contains("encoders:"));
         assert!(rendered.contains("buffers:"));
+    }
+
+    #[test]
+    fn truncates_verbose_kernel_details() {
+        let report = KernelReport {
+            total_kernels: 1,
+            filter: None,
+            kernels: vec![KernelEntry {
+                name: "copy_kernel".into(),
+                pipeline_addr: 0x1234,
+                dispatch_count: 7,
+                encoder_labels: [
+                    ("enc0".into(), 1),
+                    ("enc1".into(), 1),
+                    ("enc2".into(), 1),
+                    ("enc3".into(), 1),
+                    ("enc4".into(), 1),
+                    ("enc5".into(), 1),
+                ]
+                .into_iter()
+                .collect(),
+                buffers: [
+                    ("buf0".into(), 1),
+                    ("buf1".into(), 1),
+                    ("buf2".into(), 1),
+                    ("buf3".into(), 1),
+                    ("buf4".into(), 1),
+                    ("buf5".into(), 1),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+        };
+
+        let rendered = format_kernels(&report, true);
+        assert!(rendered.contains("enc0(1), enc1(1), enc2(1), enc3(1), enc4(1), +1 more"));
+        assert!(rendered.contains("buf0(1), buf1(1), buf2(1), buf3(1), buf4(1), +1 more"));
     }
 
     #[test]
@@ -1030,6 +1157,98 @@ mod tests {
         assert!(rendered.contains("digraph G"));
         assert!(rendered.contains("n0 -> n1"));
         assert!(rendered.contains("buf (RW)"));
+    }
+
+    #[test]
+    fn classifies_hazards_from_usage_flags() {
+        use crate::trace::MTLResourceUsage;
+
+        assert_eq!(
+            classify_hazard(MTLResourceUsage::WRITE, MTLResourceUsage::READ),
+            "RAW"
+        );
+        assert_eq!(
+            classify_hazard(MTLResourceUsage::WRITE, MTLResourceUsage::WRITE),
+            "WAW"
+        );
+        assert_eq!(
+            classify_hazard(MTLResourceUsage::READ, MTLResourceUsage::WRITE),
+            "WAR"
+        );
+        assert_eq!(
+            classify_hazard(
+                MTLResourceUsage::READ | MTLResourceUsage::WRITE,
+                MTLResourceUsage::READ | MTLResourceUsage::WRITE
+            ),
+            "RAW/WAR/WAW"
+        );
+    }
+
+    #[test]
+    fn merges_hazard_labels_without_duplicates() {
+        assert_eq!(merge_hazards("", "RAW"), "RAW");
+        assert_eq!(merge_hazards("RAW", "WAW"), "RAW/WAW");
+        assert_eq!(merge_hazards("RAW/WAW", "RAW"), "RAW/WAW");
+    }
+
+    #[test]
+    fn formats_dependency_report_with_fallbacks_and_truncation() {
+        let report = DependencyReport {
+            total_nodes: 2,
+            total_edges: 1,
+            nodes: vec![
+                DependencyNode {
+                    id: 2,
+                    label: "dispatch_2".into(),
+                    command_buffer_index: 3,
+                    encoder_label: Some("main".into()),
+                    kernel_name: Some("blur".into()),
+                },
+                DependencyNode {
+                    id: 4,
+                    label: "dispatch_4".into(),
+                    command_buffer_index: 3,
+                    encoder_label: None,
+                    kernel_name: None,
+                },
+            ],
+            edges: vec![DependencyEdge {
+                from: 2,
+                to: 4,
+                buffers: vec![
+                    "buf0".into(),
+                    "buf1".into(),
+                    "buf2".into(),
+                    "buf3".into(),
+                    "buf4".into(),
+                ],
+                hazard: "RW".into(),
+            }],
+        };
+
+        let rendered = format_dependencies(&report);
+        assert!(rendered.contains("2 dispatch nodes, 1 dependency edges"));
+        assert!(rendered.contains("n2: dispatch_2 [kernel: blur] [encoder: main] (CB 3)"));
+        assert!(rendered.contains("n2 -> n4 [RW] via buf0, buf1, buf2, buf3, +1 more"));
+    }
+
+    #[test]
+    fn formats_dependency_report_without_edges() {
+        let report = DependencyReport {
+            total_nodes: 1,
+            total_edges: 0,
+            nodes: vec![DependencyNode {
+                id: 1,
+                label: "only".into(),
+                command_buffer_index: 0,
+                encoder_label: None,
+                kernel_name: None,
+            }],
+            edges: vec![],
+        };
+
+        let rendered = format_dependencies(&report);
+        assert!(rendered.contains("Dependencies:\n  none"));
     }
 
     #[test]
@@ -1142,5 +1361,13 @@ mod tests {
         assert!(rendered.contains("- command_buffer: Command Buffer 0"));
         assert!(rendered.contains("- encoder: enc"));
         assert!(rendered.contains("- kernel: kernel"));
+    }
+
+    #[test]
+    fn summarizes_items_with_overflow() {
+        assert_eq!(
+            summarize_items(["a", "b", "c", "d"].into_iter(), 3),
+            "a, b, c, +1 more"
+        );
     }
 }

@@ -9,6 +9,7 @@ pub mod correlate;
 pub mod diff;
 pub mod dump;
 pub mod error;
+pub mod fences;
 pub mod graphing;
 pub mod insights;
 pub mod markdown;
