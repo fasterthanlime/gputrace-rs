@@ -54,6 +54,7 @@ enum CommandSet {
     Dependencies(DependenciesArgs),
     Shaders(ShadersArgs),
     ShaderSource(ShaderSourceArgs),
+    ShaderHotspots(ShaderHotspotsArgs),
     Correlate(CorrelateArgs),
     Timing(TimingArgs),
     CommandBuffers(CommandBuffersArgs),
@@ -67,6 +68,7 @@ enum CommandSet {
     Markdown(MarkdownArgs),
     Version(VersionArgs),
     XcodeButtons(XcodeTraceQueryArgs),
+    XcodeCheckPermissions(XcodePermissionArgs),
     XcodeCheckboxes(XcodeTraceQueryArgs),
     XcodeClickButton(XcodeActionArgs),
     XcodeClose(XcodeTraceQueryArgs),
@@ -210,6 +212,14 @@ struct XcodeTraceQueryArgs {
 }
 
 #[derive(Debug, Args)]
+struct XcodePermissionArgs {
+    #[arg(long, default_value_t = false)]
+    no_prompt: bool,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
 struct XcodeActionArgs {
     #[arg(long)]
     trace: Option<PathBuf>,
@@ -314,6 +324,16 @@ struct ShaderSourceArgs {
     search_paths: Vec<PathBuf>,
     #[arg(long, default_value_t = 4)]
     context: usize,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ShaderHotspotsArgs {
+    trace: PathBuf,
+    shader: String,
+    #[arg(long = "search-path")]
+    search_paths: Vec<PathBuf>,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -433,6 +453,12 @@ struct XcodeProfileArgs {
     output: Option<PathBuf>,
     #[arg(long, default_value_t = 300)]
     timeout_seconds: u64,
+    #[arg(long, default_value_t = 0)]
+    wait_seconds: u64,
+    #[arg(long, default_value_t = false)]
+    force: bool,
+    #[arg(long, default_value_t = false)]
+    no_prompt: bool,
     #[arg(long)]
     open_only: bool,
     #[arg(long)]
@@ -659,6 +685,7 @@ pub fn run() -> Result<()> {
             let report = shaders::report(&trace, &search_paths)?;
             match args.format.as_str() {
                 "text" | "table" => print!("{}", shaders::format_report(&report)),
+                "csv" => print!("{}", shaders::format_csv(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown shaders format")),
             }
@@ -675,6 +702,20 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", shaders::format_source(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown shader-source format")),
+            }
+        }
+        CommandSet::ShaderHotspots(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let search_paths = if args.search_paths.is_empty() {
+                shaders::default_search_paths()
+            } else {
+                args.search_paths
+            };
+            let report = shaders::hotspot_report(&trace, &args.shader, &search_paths)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", shaders::format_hotspot_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown shader-hotspots format")),
             }
         }
         CommandSet::Correlate(args) => {
@@ -889,6 +930,23 @@ pub fn run() -> Result<()> {
                 _ => return Err(crate::Error::Unsupported("unknown xcode-buttons format")),
             }
         }
+        CommandSet::XcodeCheckPermissions(args) => {
+            let report = automation::check_accessibility_permissions(!args.no_prompt)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_permissions(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-check-permissions format",
+                    ));
+                }
+            }
+            if !report.accessibility_granted {
+                return Err(crate::Error::InvalidInput(
+                    "accessibility permission required".to_owned(),
+                ));
+            }
+        }
         CommandSet::XcodeCheckboxes(args) => {
             let report = automation::list_checkboxes(args.trace.as_deref())?;
             match args.format.as_str() {
@@ -1100,6 +1158,9 @@ pub fn run() -> Result<()> {
                     trace_path: args.trace,
                     output_path: args.output,
                     timeout_seconds: args.timeout_seconds,
+                    wait_for_running_profile_seconds: args.wait_seconds,
+                    force: args.force,
+                    prompt_for_permissions: !args.no_prompt,
                 })?;
                 print!("{}", format_xcode_export(&report));
             }
@@ -1235,6 +1296,20 @@ fn format_xcode_export(result: &automation::XcodeExportResult) -> String {
         result.window_title,
         result.export_kind,
         result.output_path.display()
+    )
+}
+
+fn format_xcode_permissions(result: &automation::XcodePermissionReport) -> String {
+    format!(
+        "Accessibility granted: {}\nXcode running: {}\nAX probe OK: {}\nPrompt opened: {}\n",
+        if result.accessibility_granted {
+            "yes"
+        } else {
+            "no"
+        },
+        if result.xcode_running { "yes" } else { "no" },
+        if result.xcode_probe_ok { "yes" } else { "no" },
+        if result.prompt_opened { "yes" } else { "no" },
     )
 }
 

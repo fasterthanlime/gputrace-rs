@@ -19,6 +19,9 @@ pub struct XcodeProfileRun {
     pub trace_path: PathBuf,
     pub output_path: Option<PathBuf>,
     pub timeout_seconds: u64,
+    pub prompt_for_permissions: bool,
+    pub wait_for_running_profile_seconds: u64,
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,9 +149,58 @@ pub struct XcodeExportResult {
     pub output_path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XcodePermissionReport {
+    pub accessibility_granted: bool,
+    pub xcode_running: bool,
+    pub xcode_probe_ok: bool,
+    pub prompt_opened: bool,
+}
+
+pub fn check_accessibility_permissions(prompt: bool) -> Result<XcodePermissionReport> {
+    let xcode_running = is_xcode_running()?;
+    match run_osascript(&build_accessibility_probe_script()) {
+        Ok(_) => Ok(XcodePermissionReport {
+            accessibility_granted: true,
+            xcode_running,
+            xcode_probe_ok: true,
+            prompt_opened: false,
+        }),
+        Err(error) if is_accessibility_permission_error(&error) => {
+            let mut prompt_opened = false;
+            if prompt {
+                open_accessibility_preferences()?;
+                prompt_opened = true;
+            }
+            Ok(XcodePermissionReport {
+                accessibility_granted: false,
+                xcode_running,
+                xcode_probe_ok: false,
+                prompt_opened,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn activate_xcode() -> Result<()> {
     run_osascript(r#"tell application "Xcode" to activate"#)?;
     Ok(())
+}
+
+pub fn open_accessibility_preferences() -> Result<()> {
+    let output = Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility")
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_output_error(
+            "open",
+            &["Accessibility settings"],
+            &output,
+        ))
+    }
 }
 
 pub fn list_windows() -> Result<Vec<XcodeWindowInfo>> {
@@ -289,6 +341,17 @@ pub fn export_memory(trace_path: Option<&Path>, output_path: &Path) -> Result<Xc
 }
 
 pub fn run_profile(request: &XcodeProfileRun) -> Result<XcodeExportResult> {
+    let permissions = check_accessibility_permissions(request.prompt_for_permissions)?;
+    if !permissions.accessibility_granted {
+        return Err(Error::InvalidInput(
+            "Accessibility permission is required for Xcode automation. Grant access in System Settings > Privacy & Security > Accessibility and retry.".to_owned(),
+        ));
+    }
+    wait_for_running_profile(
+        Duration::from_secs(request.wait_for_running_profile_seconds),
+        request.force,
+    )?;
+
     validate_trace_path(&request.trace_path)?;
     let output_path = request
         .output_path
@@ -355,6 +418,36 @@ pub fn run_profile(request: &XcodeProfileRun) -> Result<XcodeExportResult> {
     let export = export_profile_trace(trace_path, &output_path)?;
     let _ = close_window(trace_path);
     Ok(export)
+}
+
+pub fn wait_for_running_profile(timeout: Duration, force: bool) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut first_attempt = true;
+    loop {
+        let Some(window_title) = running_profile_window()? else {
+            return Ok(());
+        };
+
+        if force {
+            return Ok(());
+        }
+
+        if timeout.is_zero() || Instant::now() >= deadline {
+            if timeout.is_zero() {
+                return Err(Error::InvalidInput(format!(
+                    "profiling is running in \"{window_title}\". Use --wait-seconds to wait or --force to proceed anyway"
+                )));
+            }
+            return Err(Error::InvalidInput(format!(
+                "timed out waiting for profiling to complete in \"{window_title}\""
+            )));
+        }
+
+        if first_attempt {
+            first_attempt = false;
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
 }
 
 pub fn run_osascript(script: &str) -> Result<String> {
@@ -513,6 +606,21 @@ fn xcode_window_count() -> Result<u32> {
     parse_window_count(&raw)
 }
 
+fn running_profile_window() -> Result<Option<String>> {
+    let raw = run_osascript(&build_running_profile_script())?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("not-running") {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_owned()))
+    }
+}
+
+fn is_xcode_running() -> Result<bool> {
+    let output = Command::new("pgrep").arg("-x").arg("Xcode").output()?;
+    Ok(output.status.success())
+}
+
 fn build_status_script(trace_path: Option<&Path>) -> String {
     let target_window = build_target_window_clause(trace_path, "unknown", true);
 
@@ -587,6 +695,54 @@ return "unknown"
     )
 }
 
+fn build_running_profile_script() -> String {
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        repeat with candidateWindow in windows
+            try
+                set windowTitle to my element_name(candidateWindow)
+                set allElements to entire contents of candidateWindow
+                set hasShowPerformance to false
+                set runningStop to false
+
+                repeat with elem in allElements
+                    try
+                        if my role_text(elem) is "AXButton" then
+                            set buttonName to my element_name(elem)
+                            if buttonName is "Show Performance" then
+                                set hasShowPerformance to true
+                            else if (buttonName is "Stop" or buttonName is "Stop GPU workload") and my attribute_bool(elem, "AXEnabled") then
+                                set runningStop to true
+                            end if
+                        end if
+                    end try
+                end repeat
+
+                if runningStop and not hasShowPerformance then
+                    if windowTitle is "" then
+                        set windowTitle to "(untitled Xcode window)"
+                    end if
+                    return windowTitle
+                end if
+            end try
+        end repeat
+    end tell
+end tell
+
+return ""
+"#,
+        app = XCODE_APP_NAME,
+    )
+}
+
 fn build_window_count_script() -> String {
     r#"
 tell application "System Events"
@@ -604,6 +760,22 @@ tell application "Xcode"
 end tell
 "#
     .to_owned()
+}
+
+fn build_accessibility_probe_script() -> String {
+    format!(
+        r#"
+tell application "System Events"
+    if not (exists process "Finder") then
+        return "finder-missing"
+    end if
+
+    tell process "Finder"
+        return count of windows
+    end tell
+end tell
+"#
+    )
 }
 
 fn build_windows_script() -> String {
@@ -1898,6 +2070,19 @@ fn command_output_error(program: &str, args: &[&str], output: &Output) -> Error 
     Error::InvalidInput(detail)
 }
 
+fn is_accessibility_permission_error(error: &Error) -> bool {
+    let detail = error.to_string().to_ascii_lowercase();
+    detail.contains("not allowed assistive access")
+        || detail.contains("not authorised to send keystrokes")
+        || detail.contains("not authorized to send keystrokes")
+        || detail.contains("access for assistive devices")
+        || detail.contains("(-25211)")
+        || detail.contains("osascript")
+            && (detail.contains("(-1719)")
+                || detail.contains("(-25211)")
+                || detail.contains("accessibility"))
+}
+
 fn parse_window_count(raw: &str) -> Result<u32> {
     let trimmed = raw.trim();
     if trimmed.eq_ignore_ascii_case("not-running") {
@@ -2459,5 +2644,35 @@ mod tests {
             std::fs::read(destination.join("nested").join("leaf.txt")).unwrap(),
             b"leaf"
         );
+    }
+
+    #[test]
+    fn accessibility_probe_script_targets_finder_ui() {
+        let script = build_accessibility_probe_script();
+        assert!(script.contains("System Events"));
+        assert!(script.contains("process \"Finder\""));
+        assert!(script.contains("count of windows"));
+    }
+
+    #[test]
+    fn accessibility_error_detection_matches_known_signatures() {
+        assert!(is_accessibility_permission_error(&Error::InvalidInput(
+            "osascript failed: Not allowed assistive access (-1719)".to_owned()
+        )));
+        assert!(is_accessibility_permission_error(&Error::InvalidInput(
+            "AX API disabled (-25211)".to_owned()
+        )));
+        assert!(!is_accessibility_permission_error(&Error::InvalidInput(
+            "some unrelated failure".to_owned()
+        )));
+    }
+
+    #[test]
+    fn running_profile_script_detects_active_profile_controls() {
+        let script = build_running_profile_script();
+        assert!(script.contains("Stop"));
+        assert!(script.contains("Stop GPU workload"));
+        assert!(script.contains("Show Performance"));
+        assert!(script.contains("exists process"));
     }
 }

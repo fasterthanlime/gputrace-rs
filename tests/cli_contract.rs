@@ -84,6 +84,13 @@ fn xcode_wait_help_mentions_status_and_timeout() {
 }
 
 #[test]
+fn xcode_check_permissions_help_mentions_no_prompt() {
+    let help = render_help(&["xcode-check-permissions"]);
+    assert!(help.contains("--no-prompt"));
+    assert!(help.contains("--format"));
+}
+
+#[test]
 fn xcode_click_button_help_mentions_target() {
     let help = render_help(&["xcode-click-button"]);
     assert!(help.contains("<TARGET>"));
@@ -161,6 +168,32 @@ fn xcode_export_memory_help_mentions_output() {
     let help = render_help(&["xcode-export-memory"]);
     assert!(help.contains("<OUTPUT>"));
     assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_profile_help_mentions_no_prompt() {
+    let help = render_help(&["xcode-profile"]);
+    assert!(help.contains("--no-prompt"));
+    assert!(help.contains("--timeout-seconds"));
+    assert!(help.contains("--wait-seconds"));
+    assert!(help.contains("--force"));
+}
+
+#[test]
+fn shaders_help_mentions_format_and_search_path() {
+    let help = render_help(&["shaders"]);
+    assert!(help.contains("<TRACE>"));
+    assert!(help.contains("--format <FORMAT>"));
+    assert!(help.contains("--search-path <SEARCH_PATHS>"));
+}
+
+#[test]
+fn shader_hotspots_help_mentions_shader_and_format() {
+    let help = render_help(&["shader-hotspots"]);
+    assert!(help.contains("<TRACE>"));
+    assert!(help.contains("<SHADER>"));
+    assert!(help.contains("--format <FORMAT>"));
+    assert!(help.contains("--search-path <SEARCH_PATHS>"));
 }
 
 #[test]
