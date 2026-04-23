@@ -280,6 +280,60 @@ fn xcode_profile_help_mentions_no_prompt() {
     assert!(help.contains("--timeout-seconds"));
     assert!(help.contains("--wait-seconds"));
     assert!(help.contains("--force"));
+    for subcommand in [
+        "open",
+        "check-status",
+        "check-permissions",
+        "run",
+        "run-profile",
+        "wait-profile",
+        "export",
+        "xcode-export-counters",
+        "xcode-export-memory",
+        "list-windows",
+        "list-buttons",
+        "show-performance",
+    ] {
+        assert!(
+            help.contains(subcommand),
+            "xcode-profile help should mention {subcommand}\n{help}"
+        );
+    }
+}
+
+#[test]
+fn xcode_profile_aliases_and_nested_workflow_parse() {
+    for args in [
+        vec!["gputrace", "xp", "run", "trace.gputrace", "--no-prompt"],
+        vec![
+            "gputrace",
+            "collect-xcode-profile",
+            "check-status",
+            "trace.gputrace",
+            "--format",
+            "json",
+        ],
+        vec!["gputrace", "xcode-profile", "run-profile", "trace.gputrace"],
+        vec![
+            "gputrace",
+            "xcode-profile",
+            "wait-profile",
+            "trace.gputrace",
+            "--timeout-seconds",
+            "1",
+        ],
+        vec![
+            "gputrace",
+            "xcode-profile",
+            "xcode-export-counters",
+            "Counters.csv",
+            "--trace",
+            "trace.gputrace",
+        ],
+    ] {
+        let cli = Cli::try_parse_from(args.clone());
+        assert!(cli.is_ok(), "failed to parse {args:?}: {cli:?}");
+    }
 }
 
 #[test]

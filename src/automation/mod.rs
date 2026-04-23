@@ -342,6 +342,10 @@ pub fn export_memory(trace_path: Option<&Path>, output_path: &Path) -> Result<Xc
     })
 }
 
+pub fn export_profile(trace_path: Option<&Path>, output_path: &Path) -> Result<XcodeExportResult> {
+    export_profile_trace(trace_path, output_path)
+}
+
 pub fn run_profile(request: &XcodeProfileRun) -> Result<XcodeExportResult> {
     let permissions = check_accessibility_permissions(request.prompt_for_permissions)?;
     if !permissions.accessibility_granted {

@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::analysis;
 use crate::analyze_usage;
 use crate::apicalls;
-use crate::automation::{self, XcodeProfileRun};
+use crate::automation::{self, OpenTraceOptions, XcodeLaunchMode, XcodeProfileRun};
 use crate::buffer_timeline;
 use crate::buffers;
 use crate::clear_buffers;
@@ -90,6 +90,7 @@ enum CommandSet {
     XcodeShowPerformance(XcodeTraceQueryArgs),
     XcodeShowSummary(XcodeTraceQueryArgs),
     XcodeInspect(XcodeTraceQueryArgs),
+    #[command(alias = "xp", alias = "collect-xcode-profile")]
     XcodeProfile(XcodeProfileArgs),
     XcodeSelectTab(XcodeActionArgs),
     XcodeStatus(XcodeTraceQueryArgs),
@@ -557,7 +558,9 @@ enum MarkdownCommand {
 
 #[derive(Debug, Args)]
 struct XcodeProfileArgs {
-    trace: PathBuf,
+    #[command(subcommand)]
+    command: Option<XcodeProfileCommand>,
+    trace: Option<PathBuf>,
     #[arg(short, long)]
     output: Option<PathBuf>,
     #[arg(long, default_value_t = 300)]
@@ -572,6 +575,76 @@ struct XcodeProfileArgs {
     open_only: bool,
     #[arg(long)]
     activate: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum XcodeProfileCommand {
+    Open(XcodeProfileOpenArgs),
+    Close(XcodeTraceQueryArgs),
+    CheckStatus(XcodeTraceQueryArgs),
+    CheckPermissions(XcodePermissionArgs),
+    Run(XcodeProfileRunArgs),
+    RunProfile(XcodeTraceQueryArgs),
+    WaitProfile(XcodeProfileWaitArgs),
+    Export(XcodeProfileExportArgs),
+    XcodeExportCounters(XcodeExportArgs),
+    XcodeExportMemory(XcodeExportArgs),
+    ListWindows(XcodeFormatArgs),
+    ListButtons(XcodeTraceQueryArgs),
+    ClickButton(XcodeActionArgs),
+    ListTabs(XcodeTraceQueryArgs),
+    SelectTab(XcodeActionArgs),
+    EnsureChecked(XcodeActionArgs),
+    ToggleCheckbox(XcodeActionArgs),
+    ShowPerformance(XcodeTraceQueryArgs),
+    ShowSummary(XcodeTraceQueryArgs),
+    ShowCounters(XcodeTraceQueryArgs),
+    ShowMemory(XcodeTraceQueryArgs),
+    ShowDependencies(XcodeTraceQueryArgs),
+}
+
+#[derive(Debug, Args)]
+struct XcodeProfileOpenArgs {
+    trace: PathBuf,
+    #[arg(long, default_value_t = false)]
+    foreground: bool,
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
+}
+
+#[derive(Debug, Args)]
+struct XcodeProfileRunArgs {
+    trace: PathBuf,
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    #[arg(long, default_value_t = 300)]
+    timeout_seconds: u64,
+    #[arg(long, default_value_t = 0)]
+    wait_seconds: u64,
+    #[arg(long, default_value_t = false)]
+    force: bool,
+    #[arg(long, default_value_t = false)]
+    no_prompt: bool,
+    #[arg(long)]
+    activate: bool,
+}
+
+#[derive(Debug, Args)]
+struct XcodeProfileWaitArgs {
+    trace: Option<PathBuf>,
+    #[arg(long, default_value_t = 300)]
+    timeout_seconds: u64,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct XcodeProfileExportArgs {
+    #[arg(long)]
+    trace: Option<PathBuf>,
+    output: PathBuf,
+    #[arg(short, long, default_value = "text")]
+    format: String,
 }
 
 pub fn run() -> Result<()> {
@@ -1324,22 +1397,281 @@ pub fn run() -> Result<()> {
             }
         }
         CommandSet::XcodeProfile(args) => {
+            run_xcode_profile_command(args)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_xcode_profile_command(args: XcodeProfileArgs) -> Result<()> {
+    match args.command {
+        Some(XcodeProfileCommand::Open(args)) => {
+            automation::open_trace_in_xcode_with_options(
+                &args.trace,
+                OpenTraceOptions {
+                    launch_mode: if args.foreground {
+                        XcodeLaunchMode::Foreground
+                    } else {
+                        XcodeLaunchMode::Background
+                    },
+                    wait_for_window: true,
+                    timeout: std::time::Duration::from_secs(args.timeout_seconds.max(1)),
+                },
+            )?;
+            Ok(())
+        }
+        Some(XcodeProfileCommand::Close(args)) => {
+            let report = automation::close_window(args.trace.as_deref())?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile close")
+        }
+        Some(XcodeProfileCommand::CheckStatus(args)) => {
+            let report = automation::get_window_status(args.trace.as_deref())?;
+            print_xcode_status_report(&report, &args.format, "xcode-profile check-status")
+        }
+        Some(XcodeProfileCommand::CheckPermissions(args)) => {
+            let report = automation::check_accessibility_permissions(!args.no_prompt)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_permissions(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-profile check-permissions format",
+                    ));
+                }
+            }
+            if !report.accessibility_granted {
+                return Err(crate::Error::InvalidInput(
+                    "accessibility permission required".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        Some(XcodeProfileCommand::Run(args)) => run_xcode_profile_full(
+            args.trace,
+            args.output,
+            args.timeout_seconds,
+            args.wait_seconds,
+            args.force,
+            args.no_prompt,
+            args.activate,
+        ),
+        Some(XcodeProfileCommand::RunProfile(args)) => {
+            let report = automation::click_button(args.trace.as_deref(), &["Profile", "Replay"])?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile run-profile")
+        }
+        Some(XcodeProfileCommand::WaitProfile(args)) => {
+            let report = automation::wait_for_status(
+                std::time::Duration::from_secs(args.timeout_seconds.max(1)),
+                args.trace.as_deref(),
+                &[automation::XcodeAutomationStatus::Complete],
+            )?;
+            print_xcode_status_report(&report, &args.format, "xcode-profile wait-profile")
+        }
+        Some(XcodeProfileCommand::Export(args)) => {
+            let report = automation::export_profile(args.trace.as_deref(), &args.output)?;
+            print_xcode_export_report(&report, &args.format, "xcode-profile export")
+        }
+        Some(XcodeProfileCommand::XcodeExportCounters(args)) => {
+            let report = automation::export_counters(args.trace.as_deref(), &args.output)?;
+            print_xcode_export_report(&report, &args.format, "xcode-profile xcode-export-counters")
+        }
+        Some(XcodeProfileCommand::XcodeExportMemory(args)) => {
+            let report = automation::export_memory(args.trace.as_deref(), &args.output)?;
+            print_xcode_export_report(&report, &args.format, "xcode-profile xcode-export-memory")
+        }
+        Some(XcodeProfileCommand::ListWindows(args)) => {
+            let report = automation::list_windows()?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_windows(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-profile list-windows format",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Some(XcodeProfileCommand::ListButtons(args)) => {
+            let report = automation::list_buttons(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_buttons(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-profile list-buttons format",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Some(XcodeProfileCommand::ClickButton(args)) => {
+            let report = automation::click_button(args.trace.as_deref(), &[args.target.as_str()])?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile click-button")
+        }
+        Some(XcodeProfileCommand::ListTabs(args)) => {
+            let report = automation::list_tabs(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_tabs(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-profile list-tabs format",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Some(XcodeProfileCommand::SelectTab(args)) => {
+            let report = automation::select_tab(args.trace.as_deref(), &args.target)?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile select-tab")
+        }
+        Some(XcodeProfileCommand::EnsureChecked(args)) => {
+            let report = automation::ensure_checked(args.trace.as_deref(), &args.target)?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile ensure-checked")
+        }
+        Some(XcodeProfileCommand::ToggleCheckbox(args)) => {
+            let report = automation::toggle_checkbox(args.trace.as_deref(), &args.target)?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile toggle-checkbox")
+        }
+        Some(XcodeProfileCommand::ShowPerformance(args)) => {
+            let report = automation::show_performance(args.trace.as_deref())?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile show-performance")
+        }
+        Some(XcodeProfileCommand::ShowSummary(args)) => {
+            let report = automation::show_summary(args.trace.as_deref())?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile show-summary")
+        }
+        Some(XcodeProfileCommand::ShowCounters(args)) => {
+            let report = automation::show_counters(args.trace.as_deref())?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile show-counters")
+        }
+        Some(XcodeProfileCommand::ShowMemory(args)) => {
+            let report = automation::show_memory(args.trace.as_deref())?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile show-memory")
+        }
+        Some(XcodeProfileCommand::ShowDependencies(args)) => {
+            let report = automation::show_dependencies(args.trace.as_deref())?;
+            print_xcode_action_report(&report, &args.format, "xcode-profile show-dependencies")
+        }
+        None => {
+            let trace = args.trace.ok_or_else(|| {
+                crate::Error::InvalidInput(
+                    "xcode-profile requires a trace or subcommand".to_owned(),
+                )
+            })?;
             if args.activate {
                 automation::activate_xcode()?;
             }
             if args.open_only {
-                automation::open_trace_in_xcode(&args.trace)?;
+                automation::open_trace_in_xcode(&trace)?;
+                Ok(())
             } else {
-                let report = automation::run_profile(&XcodeProfileRun {
-                    trace_path: args.trace,
-                    output_path: args.output,
-                    timeout_seconds: args.timeout_seconds,
-                    wait_for_running_profile_seconds: args.wait_seconds,
-                    force: args.force,
-                    prompt_for_permissions: !args.no_prompt,
-                })?;
-                print!("{}", format_xcode_export(&report));
+                run_xcode_profile_full(
+                    trace,
+                    args.output,
+                    args.timeout_seconds,
+                    args.wait_seconds,
+                    args.force,
+                    args.no_prompt,
+                    false,
+                )
             }
+        }
+    }
+}
+
+fn run_xcode_profile_full(
+    trace: PathBuf,
+    output: Option<PathBuf>,
+    timeout_seconds: u64,
+    wait_seconds: u64,
+    force: bool,
+    no_prompt: bool,
+    activate: bool,
+) -> Result<()> {
+    if activate {
+        automation::activate_xcode()?;
+    }
+    let report = automation::run_profile(&XcodeProfileRun {
+        trace_path: trace,
+        output_path: output,
+        timeout_seconds,
+        wait_for_running_profile_seconds: wait_seconds,
+        force,
+        prompt_for_permissions: !no_prompt,
+    })?;
+    print!("{}", format_xcode_export(&report));
+    Ok(())
+}
+
+fn print_xcode_action_report(
+    report: &automation::XcodeActionResult,
+    format: &str,
+    command_name: &'static str,
+) -> Result<()> {
+    match format {
+        "text" | "table" => print!("{}", format_xcode_action(report)),
+        "json" => println!("{}", serde_json::to_string_pretty(report)?),
+        _ => {
+            return Err(crate::Error::Unsupported(match command_name {
+                "xcode-profile run-profile" => "unknown xcode-profile run-profile format",
+                "xcode-profile click-button" => "unknown xcode-profile click-button format",
+                "xcode-profile select-tab" => "unknown xcode-profile select-tab format",
+                "xcode-profile ensure-checked" => "unknown xcode-profile ensure-checked format",
+                "xcode-profile toggle-checkbox" => "unknown xcode-profile toggle-checkbox format",
+                "xcode-profile show-performance" => "unknown xcode-profile show-performance format",
+                "xcode-profile show-summary" => "unknown xcode-profile show-summary format",
+                "xcode-profile show-counters" => "unknown xcode-profile show-counters format",
+                "xcode-profile show-memory" => "unknown xcode-profile show-memory format",
+                "xcode-profile show-dependencies" => {
+                    "unknown xcode-profile show-dependencies format"
+                }
+                _ => "unknown xcode-profile action format",
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn print_xcode_export_report(
+    report: &automation::XcodeExportResult,
+    format: &str,
+    command_name: &'static str,
+) -> Result<()> {
+    match format {
+        "text" | "table" => print!("{}", format_xcode_export(report)),
+        "json" => println!("{}", serde_json::to_string_pretty(report)?),
+        _ => {
+            return Err(crate::Error::Unsupported(match command_name {
+                "xcode-profile export" => "unknown xcode-profile export format",
+                "xcode-profile xcode-export-counters" => {
+                    "unknown xcode-profile xcode-export-counters format"
+                }
+                "xcode-profile xcode-export-memory" => {
+                    "unknown xcode-profile xcode-export-memory format"
+                }
+                _ => "unknown xcode-profile export format",
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn print_xcode_status_report(
+    report: &automation::XcodeWindowStatus,
+    format: &str,
+    command_name: &'static str,
+) -> Result<()> {
+    match format {
+        "text" | "table" => print!("{}", format_xcode_status(report)),
+        "json" => println!("{}", serde_json::to_string_pretty(report)?),
+        _ => {
+            return Err(crate::Error::Unsupported(match command_name {
+                "xcode-profile check-status" => "unknown xcode-profile check-status format",
+                "xcode-profile wait-profile" => "unknown xcode-profile wait-profile format",
+                _ => "unknown xcode-profile status format",
+            }));
         }
     }
     Ok(())
