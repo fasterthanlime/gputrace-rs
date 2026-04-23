@@ -143,6 +143,20 @@ pub struct BufferAlias {
     pub names: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TreeReport {
+    pub group_by: String,
+    pub nodes: Vec<TreeNode>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TreeNode {
+    pub kind: String,
+    pub label: String,
+    pub details: Vec<String>,
+    pub children: Vec<TreeNode>,
+}
+
 pub fn kernels(trace: &TraceBundle, filter: Option<&str>) -> Result<KernelReport> {
     let filter_lower = filter.map(|value| value.to_ascii_lowercase());
     let mut kernels: Vec<_> = trace
@@ -504,6 +518,23 @@ pub fn buffer_access(trace: &TraceBundle) -> Result<BufferAccessReport> {
     })
 }
 
+pub fn tree(trace: &TraceBundle, group_by: &str) -> Result<TreeReport> {
+    let regions = trace.command_buffer_regions()?;
+    let nodes = match group_by {
+        "encoder" => tree_by_encoder(regions),
+        "pipeline" => tree_by_pipeline(regions),
+        _ => {
+            return Err(crate::Error::InvalidInput(format!(
+                "unknown tree grouping: {group_by} (expected encoder or pipeline)"
+            )));
+        }
+    };
+    Ok(TreeReport {
+        group_by: group_by.to_owned(),
+        nodes,
+    })
+}
+
 pub fn format_encoders(report: &EncoderReport, verbose: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!("{} encoders\n", report.total_encoders));
@@ -754,6 +785,155 @@ pub fn format_buffer_access(report: &BufferAccessReport, verbose: bool) -> Strin
     out
 }
 
+pub fn format_tree(report: &TreeReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Execution tree grouped by {}\n\n",
+        report.group_by
+    ));
+    for node in &report.nodes {
+        render_tree_node(&mut out, node, 0);
+    }
+    out
+}
+
+fn tree_by_encoder(regions: Vec<crate::trace::CommandBufferRegion>) -> Vec<TreeNode> {
+    regions
+        .into_iter()
+        .map(|region| {
+            let encoder_children = region
+                .encoders
+                .iter()
+                .map(|encoder| {
+                    let dispatches: Vec<_> = region
+                        .dispatches
+                        .iter()
+                        .filter(|dispatch| dispatch.encoder_id == Some(encoder.address))
+                        .collect();
+                    let mut kernels = BTreeSet::new();
+                    let mut buffers = BTreeSet::new();
+                    for dispatch in dispatches {
+                        if let Some(kernel) = &dispatch.kernel_name {
+                            kernels.insert(kernel.clone());
+                        }
+                        for buffer in &dispatch.buffers {
+                            buffers.insert(
+                                buffer
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| format!("0x{:x}", buffer.address)),
+                            );
+                        }
+                    }
+                    TreeNode {
+                        kind: "encoder".into(),
+                        label: if encoder.label.is_empty() {
+                            format!("encoder {}", encoder.index)
+                        } else {
+                            encoder.label.clone()
+                        },
+                        details: vec![
+                            format!("index={}", encoder.index),
+                            format!("address=0x{:x}", encoder.address),
+                            format!(
+                                "dispatches={}",
+                                region
+                                    .dispatches
+                                    .iter()
+                                    .filter(|dispatch| dispatch.encoder_id == Some(encoder.address))
+                                    .count()
+                            ),
+                        ],
+                        children: kernels
+                            .into_iter()
+                            .map(|kernel| TreeNode {
+                                kind: "kernel".into(),
+                                label: kernel,
+                                details: vec![],
+                                children: buffers
+                                    .iter()
+                                    .cloned()
+                                    .map(|buffer| TreeNode {
+                                        kind: "buffer".into(),
+                                        label: buffer,
+                                        details: vec![],
+                                        children: vec![],
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+
+            TreeNode {
+                kind: "command_buffer".into(),
+                label: format!("Command Buffer {}", region.command_buffer.index),
+                details: vec![
+                    format!("offset=0x{:x}", region.command_buffer.offset),
+                    format!("timestamp={}", region.command_buffer.timestamp),
+                    format!("dispatches={}", region.dispatches.len()),
+                ],
+                children: encoder_children,
+            }
+        })
+        .collect()
+}
+
+fn tree_by_pipeline(regions: Vec<crate::trace::CommandBufferRegion>) -> Vec<TreeNode> {
+    let mut kernels: BTreeMap<String, (BTreeSet<usize>, BTreeSet<String>)> = BTreeMap::new();
+    for region in regions {
+        for dispatch in region.dispatches {
+            let kernel = dispatch
+                .kernel_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
+            let entry = kernels
+                .entry(kernel)
+                .or_insert_with(|| (BTreeSet::new(), BTreeSet::new()));
+            entry.0.insert(region.command_buffer.index);
+            for buffer in dispatch.buffers {
+                entry.1.insert(
+                    buffer
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("0x{:x}", buffer.address)),
+                );
+            }
+        }
+    }
+
+    kernels
+        .into_iter()
+        .map(|(kernel, (command_buffers, buffers))| TreeNode {
+            kind: "kernel".into(),
+            label: kernel,
+            details: vec![format!("command_buffers={}", command_buffers.len())],
+            children: buffers
+                .into_iter()
+                .map(|buffer| TreeNode {
+                    kind: "buffer".into(),
+                    label: buffer,
+                    details: vec![],
+                    children: vec![],
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn render_tree_node(out: &mut String, node: &TreeNode, depth: usize) {
+    let indent = "  ".repeat(depth);
+    out.push_str(&format!("{indent}- {}: {}", node.kind, node.label));
+    if !node.details.is_empty() {
+        out.push_str(&format!(" [{}]", node.details.join(", ")));
+    }
+    out.push('\n');
+    for child in &node.children {
+        render_tree_node(out, child, depth + 1);
+    }
+}
+
 fn truncate(value: &str, width: usize) -> String {
     if value.len() <= width {
         return value.to_owned();
@@ -933,5 +1113,34 @@ mod tests {
         assert!(rendered.contains("Top Shared Buffers"));
         assert!(rendered.contains("buf - 2 encoders, 4 uses"));
         assert!(rendered.contains("enc: 2 unique buffers, 5 total accesses"));
+    }
+
+    #[test]
+    fn formats_tree_report() {
+        let report = TreeReport {
+            group_by: "encoder".into(),
+            nodes: vec![TreeNode {
+                kind: "command_buffer".into(),
+                label: "Command Buffer 0".into(),
+                details: vec!["dispatches=1".into()],
+                children: vec![TreeNode {
+                    kind: "encoder".into(),
+                    label: "enc".into(),
+                    details: vec![],
+                    children: vec![TreeNode {
+                        kind: "kernel".into(),
+                        label: "kernel".into(),
+                        details: vec![],
+                        children: vec![],
+                    }],
+                }],
+            }],
+        };
+
+        let rendered = format_tree(&report);
+        assert!(rendered.contains("Execution tree grouped by encoder"));
+        assert!(rendered.contains("- command_buffer: Command Buffer 0"));
+        assert!(rendered.contains("- encoder: enc"));
+        assert!(rendered.contains("- kernel: kernel"));
     }
 }

@@ -34,6 +34,7 @@ enum CommandSet {
     Timing(TimingArgs),
     CommandBuffers(CommandBuffersArgs),
     BufferAccess(BufferAccessArgs),
+    Tree(TreeArgs),
     Buffers(BuffersArgs),
     BufferTimeline(BufferTimelineArgs),
     Diff(DiffArgs),
@@ -132,6 +133,15 @@ struct BufferAccessArgs {
     trace: PathBuf,
     #[arg(short, long)]
     verbose: bool,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct TreeArgs {
+    trace: PathBuf,
+    #[arg(long, default_value = "encoder")]
+    group_by: String,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -298,6 +308,15 @@ pub fn run() -> Result<()> {
                 }
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown buffer-access format")),
+            }
+        }
+        CommandSet::Tree(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = commands::tree(&trace, &args.group_by)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", commands::format_tree(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown tree format")),
             }
         }
         CommandSet::Buffers(args) => match args.command {
