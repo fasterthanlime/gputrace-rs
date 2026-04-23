@@ -112,10 +112,22 @@ struct TracePath {
 struct DiffArgs {
     left: Option<PathBuf>,
     right: Option<PathBuf>,
+    #[arg(long = "left")]
+    left_flag: Option<PathBuf>,
+    #[arg(long = "right")]
+    right_flag: Option<PathBuf>,
     #[arg(long)]
     markdown: bool,
     #[arg(long)]
     json: bool,
+    #[arg(long)]
+    csv: bool,
+    #[arg(long)]
+    by: Option<String>,
+    #[arg(long)]
+    quick: bool,
+    #[arg(long)]
+    by_encoder: bool,
     #[arg(long)]
     md_out: Option<PathBuf>,
     #[arg(short, long)]
@@ -1111,10 +1123,20 @@ pub fn run() -> Result<()> {
             }
         }
         CommandSet::Diff(args) => {
-            let left = args.left.ok_or_else(|| {
+            if args.left.is_some() && args.left_flag.is_some() {
+                return Err(crate::Error::InvalidInput(
+                    "diff positional left cannot be combined with --left".to_owned(),
+                ));
+            }
+            if args.right.is_some() && args.right_flag.is_some() {
+                return Err(crate::Error::InvalidInput(
+                    "diff positional right cannot be combined with --right".to_owned(),
+                ));
+            }
+            let left = args.left_flag.or(args.left).ok_or_else(|| {
                 crate::Error::InvalidInput("diff requires a left trace path".to_owned())
             })?;
-            let right = args.right.ok_or_else(|| {
+            let right = args.right_flag.or(args.right).ok_or_else(|| {
                 crate::Error::InvalidInput("diff requires a right trace path".to_owned())
             })?;
             let report = diff::diff_paths_with_options(
@@ -1133,10 +1155,13 @@ pub fn run() -> Result<()> {
                 fs::write(path, markdown::diff_report_with_limit(&report, args.limit))?;
             }
 
-            let format =
-                args.format
-                    .as_deref()
-                    .unwrap_or(if args.markdown { "markdown" } else { "json" });
+            let format = args.format.as_deref().unwrap_or(if args.csv {
+                "csv"
+            } else if args.markdown || args.quick || args.by_encoder {
+                "markdown"
+            } else {
+                "json"
+            });
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1144,6 +1169,10 @@ pub fn run() -> Result<()> {
                     "markdown" | "md" | "text" => {
                         print!("{}", markdown::diff_report_with_limit(&report, args.limit));
                     }
+                    "csv" => print!(
+                        "{}",
+                        diff::format_profile_csv(&report, args.by.as_deref(), args.limit)?
+                    ),
                     "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                     _ => return Err(crate::Error::Unsupported("unknown diff format")),
                 }

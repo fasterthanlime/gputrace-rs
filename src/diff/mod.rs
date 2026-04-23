@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::analysis::{AnalysisReport, analyze};
 use crate::counter_export;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::profiler;
 use crate::trace::TraceBundle;
 
@@ -280,6 +280,129 @@ pub fn diff_paths_with_options(
 
 pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
     diff_with_options(left, right, &DiffOptions::default())
+}
+
+pub fn format_profile_csv(report: &DiffReport, view: Option<&str>, limit: usize) -> Result<String> {
+    let Some(profile) = &report.profile_diff else {
+        return Ok(String::new());
+    };
+    let view = view.unwrap_or("function").trim();
+    let limit = limit.max(1);
+    let mut out = String::new();
+    match view {
+        "" | "function" => {
+            out.push_str("function,dispatch_count_left,dispatch_count_right,dispatch_count_delta,matched_pairs,left_total_us,right_total_us,total_delta_us,first_occurrence_delta_us,max_occurrence_delta_us\n");
+            for row in profile.top_function_deltas.iter().take(limit) {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{}\n",
+                    csv_string(&row.function_name),
+                    row.left_dispatch_count,
+                    row.right_dispatch_count,
+                    row.dispatch_count_delta,
+                    row.matched_pairs,
+                    row.left_total_us,
+                    row.right_total_us,
+                    row.total_delta_us,
+                    row.first_occurrence_delta_us,
+                    row.max_occurrence_delta_us
+                ));
+            }
+        }
+        "encoder" => {
+            out.push_str("encoder_index,dispatch_count_left,dispatch_count_right,dispatch_count_delta,left_total_us,right_total_us,total_delta_us\n");
+            for row in profile.encoder_deltas.iter().take(limit) {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{}\n",
+                    row.encoder_index,
+                    row.left_dispatch_count,
+                    row.right_dispatch_count,
+                    row.dispatch_count_delta,
+                    row.left_total_us,
+                    row.right_total_us,
+                    row.total_delta_us
+                ));
+            }
+        }
+        "pipeline" => {
+            out.push_str("pipeline_id,function,dispatch_count_left,dispatch_count_right,dispatch_count_delta,left_total_us,right_total_us,total_delta_us\n");
+            for row in profile.pipeline_deltas.iter().take(limit) {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{}\n",
+                    option_csv(row.pipeline_id),
+                    csv_string(&row.function_name),
+                    row.left_dispatch_count,
+                    row.right_dispatch_count,
+                    row.dispatch_count_delta,
+                    row.left_total_us,
+                    row.right_total_us,
+                    row.total_delta_us
+                ));
+            }
+        }
+        "timeline-windows" => {
+            out.push_str("encoder_index,left_start,left_end,right_start,right_end,match_count,total_delta_us,max_abs_delta_us\n");
+            for row in profile.timeline_spike_windows.iter().take(limit) {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{}\n",
+                    row.encoder_index,
+                    row.left_start_source_index,
+                    row.left_end_source_index,
+                    row.right_start_source_index,
+                    row.right_end_source_index,
+                    row.match_count,
+                    row.total_delta_us,
+                    row.max_abs_delta_us
+                ));
+            }
+        }
+        "dispatch" | "matches" | "occurrences" => {
+            out.push_str("left_index,right_index,encoder_index,left_pipeline_id,right_pipeline_id,function,left_us,right_us,delta_us,match_method,confidence\n");
+            let rows = if view == "dispatch" {
+                &profile.top_dispatch_outliers
+            } else {
+                &profile.matched_pairs
+            };
+            for row in rows.iter().take(limit) {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{},{},{},{:.3}\n",
+                    row.left_source_index,
+                    row.right_source_index,
+                    row.encoder_index,
+                    option_csv(row.left_pipeline_id),
+                    option_csv(row.right_pipeline_id),
+                    csv_string(&row.function_name),
+                    row.left_duration_us,
+                    row.right_duration_us,
+                    row.delta_us,
+                    csv_string(&row.match_method),
+                    row.confidence
+                ));
+            }
+        }
+        "unmatched" => {
+            out.push_str(
+                "trace,source_index,encoder_index,pipeline_id,function,kernel_id,duration_us\n",
+            );
+            for row in profile.unmatched.iter().take(limit) {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{}\n",
+                    csv_string(&row.trace),
+                    row.source_index,
+                    row.encoder_index,
+                    option_csv(row.pipeline_id),
+                    csv_string(&row.function_name),
+                    csv_string(&row.kernel_id),
+                    row.duration_us
+                ));
+            }
+        }
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "invalid diff csv --by view: {other}"
+            )));
+        }
+    }
+    Ok(out)
 }
 
 pub fn diff_with_options(
@@ -1729,6 +1852,18 @@ struct CounterAggregate {
 
 fn average_option(sum: f64, count: usize) -> Option<f64> {
     (count > 0).then(|| sum / count as f64)
+}
+
+fn csv_string(value: &str) -> String {
+    if value.contains([',', '"', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn option_csv<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
 }
 
 fn metrics_equal(left: CounterAggregate, right: CounterAggregate) -> bool {
