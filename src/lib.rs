@@ -6,6 +6,7 @@ pub mod cli;
 pub mod commands;
 pub mod diff;
 pub mod error;
+pub mod graphing;
 pub mod markdown;
 pub mod shaders;
 pub mod timing;

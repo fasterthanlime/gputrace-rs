@@ -9,6 +9,7 @@ use crate::buffers;
 use crate::commands;
 use crate::diff;
 use crate::error::Result;
+use crate::graphing;
 use crate::markdown;
 use crate::shaders;
 use crate::timing;
@@ -35,6 +36,7 @@ enum CommandSet {
     CommandBuffers(CommandBuffersArgs),
     BufferAccess(BufferAccessArgs),
     Tree(TreeArgs),
+    Graph(GraphArgs),
     Buffers(BuffersArgs),
     BufferTimeline(BufferTimelineArgs),
     Diff(DiffArgs),
@@ -144,6 +146,19 @@ struct TreeArgs {
     group_by: String,
     #[arg(short, long, default_value = "text")]
     format: String,
+}
+
+#[derive(Debug, Args)]
+struct GraphArgs {
+    trace: PathBuf,
+    #[arg(long, default_value = "dot")]
+    format: String,
+    #[arg(long = "type", default_value = "hierarchy")]
+    graph_type: String,
+    #[arg(long)]
+    show_timing: bool,
+    #[arg(long)]
+    show_memory: bool,
 }
 
 #[derive(Debug, Args)]
@@ -318,6 +333,17 @@ pub fn run() -> Result<()> {
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown tree format")),
             }
+        }
+        CommandSet::Graph(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let output = graphing::generate(
+                &trace,
+                &args.graph_type,
+                &args.format,
+                args.show_timing,
+                args.show_memory,
+            )?;
+            print!("{output}");
         }
         CommandSet::Buffers(args) => match args.command {
             BuffersCommand::List {
