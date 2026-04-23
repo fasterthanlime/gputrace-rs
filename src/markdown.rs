@@ -27,6 +27,10 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
         report.command_buffer_count
     ));
     out.push_str(&format!(
+        "* Command buffer regions: `{}`\n",
+        report.command_buffer_region_count
+    ));
+    out.push_str(&format!(
         "* Compute encoders: `{}`\n",
         report.compute_encoder_count
     ));

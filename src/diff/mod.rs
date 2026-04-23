@@ -57,6 +57,12 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
             left_report.command_buffer_count, right_report.command_buffer_count
         ));
     }
+    if left_report.command_buffer_region_count != right_report.command_buffer_region_count {
+        summary.push(format!(
+            "Command buffer region count changed: {} -> {}",
+            left_report.command_buffer_region_count, right_report.command_buffer_region_count
+        ));
+    }
     if left_report.compute_encoder_count != right_report.compute_encoder_count {
         summary.push(format!(
             "Compute encoder count changed: {} -> {}",
@@ -150,6 +156,7 @@ mod tests {
                 device_resource_bytes: 0,
             },
             command_buffer_count: 0,
+            command_buffer_region_count: 0,
             compute_encoder_count: 0,
             dispatch_count: 0,
             pipeline_function_count: 0,

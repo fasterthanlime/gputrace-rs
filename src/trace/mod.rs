@@ -92,6 +92,14 @@ pub struct KernelStat {
     pub encoder_labels: BTreeMap<String, usize>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandBufferRegion {
+    pub command_buffer: CommandBuffer,
+    pub end_offset: usize,
+    pub encoders: Vec<ComputeEncoder>,
+    pub dispatches: Vec<DispatchCall>,
+}
+
 impl TraceBundle {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -207,10 +215,22 @@ impl TraceBundle {
         Ok(dispatches)
     }
 
+    pub fn command_buffer_regions(&self) -> Result<Vec<CommandBufferRegion>> {
+        let capture = self.capture_data()?;
+        let command_buffers = parse_command_buffers(&capture);
+        let encoders = dedupe_encoders(parse_compute_encoders(&capture))?;
+        let dispatches = self.dispatch_calls()?;
+        Ok(build_command_buffer_regions(
+            &capture,
+            command_buffers,
+            encoders,
+            dispatches,
+        ))
+    }
+
     pub fn analyze_kernels(&self) -> Result<BTreeMap<String, KernelStat>> {
         let pipeline_map = self.pipeline_function_map()?;
-        let encoders = self.compute_encoders()?;
-        let dispatches = self.dispatch_calls()?;
+        let regions = self.command_buffer_regions()?;
         let mut stats = BTreeMap::new();
 
         for (addr, name) in &pipeline_map {
@@ -222,55 +242,53 @@ impl TraceBundle {
             });
         }
 
-        let encoder_by_addr: BTreeMap<u64, &ComputeEncoder> = encoders
-            .iter()
-            .map(|encoder| (encoder.address, encoder))
-            .collect();
-        let encoder_pipeline_map =
-            collect_encoder_pipeline_map(&self.capture_data()?, &pipeline_map)?;
+        for region in regions {
+            let encoder_by_addr: BTreeMap<u64, &ComputeEncoder> = region
+                .encoders
+                .iter()
+                .map(|encoder| (encoder.address, encoder))
+                .collect();
 
-        for dispatch in dispatches {
-            let encoder = dispatch
-                .encoder_id
-                .and_then(|encoder_id| encoder_by_addr.get(&encoder_id).copied());
+            for dispatch in region.dispatches {
+                let encoder = dispatch
+                    .encoder_id
+                    .and_then(|encoder_id| encoder_by_addr.get(&encoder_id).copied())
+                    .or_else(|| {
+                        region
+                            .encoders
+                            .iter()
+                            .rev()
+                            .find(|encoder| encoder.offset <= dispatch.offset)
+                    });
 
-            let name = dispatch
-                .encoder_id
-                .and_then(|encoder_id| encoder_pipeline_map.get(&encoder_id))
-                .cloned()
-                .or_else(|| encoder.map(|encoder| encoder.label.clone()))
-                .unwrap_or_else(|| "unknown".to_owned());
+                let name = encoder
+                    .map(|encoder| encoder.label.clone())
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or_else(|| "unknown".to_owned());
 
-            let pipeline_addr = dispatch
-                .encoder_id
-                .and_then(|encoder_id| {
-                    encoder_pipeline_map
-                        .iter()
-                        .find_map(|(candidate, kernel_name)| {
-                            (*candidate == encoder_id).then_some(kernel_name)
+                let pipeline_addr = encoder
+                    .and_then(|encoder| {
+                        pipeline_map.iter().find_map(|(addr, candidate)| {
+                            (candidate == &encoder.label).then_some(*addr)
                         })
-                })
-                .and_then(|kernel_name| {
-                    pipeline_map
-                        .iter()
-                        .find_map(|(addr, candidate)| (candidate == kernel_name).then_some(*addr))
-                })
-                .unwrap_or_default();
+                    })
+                    .unwrap_or_default();
 
-            let stat = stats.entry(name.clone()).or_insert_with(|| KernelStat {
-                name: name.clone(),
-                pipeline_addr,
-                dispatch_count: 0,
-                encoder_labels: BTreeMap::new(),
-            });
-            stat.dispatch_count += 1;
-            if let Some(encoder) = encoder
-                && !encoder.label.is_empty()
-            {
-                *stat
-                    .encoder_labels
-                    .entry(encoder.label.clone())
-                    .or_default() += 1;
+                let stat = stats.entry(name.clone()).or_insert_with(|| KernelStat {
+                    name: name.clone(),
+                    pipeline_addr,
+                    dispatch_count: 0,
+                    encoder_labels: BTreeMap::new(),
+                });
+                stat.dispatch_count += 1;
+                if let Some(encoder) = encoder
+                    && !encoder.label.is_empty()
+                {
+                    *stat
+                        .encoder_labels
+                        .entry(encoder.label.clone())
+                        .or_default() += 1;
+                }
             }
         }
 
@@ -474,22 +492,53 @@ fn dedupe_encoders(mut encoders: Vec<ComputeEncoder>) -> Result<Vec<ComputeEncod
     Ok(encoders)
 }
 
-fn collect_encoder_pipeline_map(
-    data: &[u8],
-    pipeline_map: &PipelineFunctionMap,
-) -> Result<BTreeMap<u64, String>> {
-    let records = MTSPRecord::parse_stream(data)?;
-    let mut result = BTreeMap::new();
-    for record in records {
-        if record.record_type != RecordType::Ct {
-            continue;
-        }
-        let ct = record.parse_ct_record()?;
-        if let Some(name) = pipeline_map.get(&ct.pipeline_addr) {
-            result.insert(ct.function_addr, name.clone());
-        }
+fn build_command_buffer_regions(
+    capture: &[u8],
+    command_buffers: Vec<CommandBuffer>,
+    encoders: Vec<ComputeEncoder>,
+    dispatches: Vec<DispatchCall>,
+) -> Vec<CommandBufferRegion> {
+    if command_buffers.is_empty() {
+        return vec![CommandBufferRegion {
+            command_buffer: CommandBuffer {
+                index: 0,
+                timestamp: 0,
+                offset: 0,
+            },
+            end_offset: capture.len(),
+            encoders,
+            dispatches,
+        }];
     }
-    Ok(result)
+
+    let mut regions = Vec::new();
+    for (index, command_buffer) in command_buffers.iter().cloned().enumerate() {
+        let end_offset = command_buffers
+            .get(index + 1)
+            .map(|next| next.offset)
+            .unwrap_or(capture.len());
+        let region_encoders = encoders
+            .iter()
+            .filter(|encoder| {
+                encoder.offset >= command_buffer.offset && encoder.offset < end_offset
+            })
+            .cloned()
+            .collect();
+        let region_dispatches = dispatches
+            .iter()
+            .filter(|dispatch| {
+                dispatch.offset >= command_buffer.offset && dispatch.offset < end_offset
+            })
+            .cloned()
+            .collect();
+        regions.push(CommandBufferRegion {
+            command_buffer,
+            end_offset,
+            encoders: region_encoders,
+            dispatches: region_dispatches,
+        });
+    }
+    regions
 }
 
 fn find_bytes_from(data: &[u8], needle: &[u8], offset: usize) -> Option<usize> {
@@ -548,5 +597,59 @@ mod tests {
         assert_eq!(encoders.len(), 1);
         assert_eq!(encoders[0].address, 0x1234);
         assert_eq!(encoders[0].label, "Kernel");
+    }
+
+    #[test]
+    fn builds_command_buffer_regions() {
+        let command_buffers = vec![
+            CommandBuffer {
+                index: 0,
+                timestamp: 1,
+                offset: 10,
+            },
+            CommandBuffer {
+                index: 1,
+                timestamp: 2,
+                offset: 50,
+            },
+        ];
+        let encoders = vec![
+            ComputeEncoder {
+                index: 0,
+                address: 1,
+                label: "a".into(),
+                offset: 20,
+            },
+            ComputeEncoder {
+                index: 1,
+                address: 2,
+                label: "b".into(),
+                offset: 60,
+            },
+        ];
+        let dispatches = vec![
+            DispatchCall {
+                index: 0,
+                offset: 30,
+                encoder_id: Some(1),
+                grid_size: [1, 1, 1],
+                group_size: [1, 1, 1],
+            },
+            DispatchCall {
+                index: 1,
+                offset: 70,
+                encoder_id: Some(2),
+                grid_size: [1, 1, 1],
+                group_size: [1, 1, 1],
+            },
+        ];
+
+        let regions =
+            build_command_buffer_regions(&vec![0; 100], command_buffers, encoders, dispatches);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].encoders.len(), 1);
+        assert_eq!(regions[0].dispatches.len(), 1);
+        assert_eq!(regions[1].encoders.len(), 1);
+        assert_eq!(regions[1].dispatches.len(), 1);
     }
 }
