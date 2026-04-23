@@ -6,6 +6,7 @@ use crate::analysis;
 use crate::automation::{self, XcodeProfileRun};
 use crate::buffer_timeline;
 use crate::buffers;
+use crate::commands;
 use crate::diff;
 use crate::error::Result;
 use crate::markdown;
@@ -23,6 +24,8 @@ pub struct Cli {
 enum CommandSet {
     Stats(TracePath),
     Analyze(TracePath),
+    Kernels(KernelsArgs),
+    Encoders(EncodersArgs),
     Buffers(BuffersArgs),
     BufferTimeline(BufferTimelineArgs),
     Diff(DiffArgs),
@@ -50,6 +53,26 @@ struct BufferTimelineArgs {
     format: String,
     #[arg(short, long, default_value_t = 100)]
     width: usize,
+}
+
+#[derive(Debug, Args)]
+struct KernelsArgs {
+    trace: PathBuf,
+    #[arg(short, long)]
+    filter: Option<String>,
+    #[arg(short, long)]
+    verbose: bool,
+    #[arg(long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct EncodersArgs {
+    trace: PathBuf,
+    #[arg(short, long)]
+    verbose: bool,
+    #[arg(long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Debug, Args)]
@@ -126,6 +149,24 @@ pub fn run() -> Result<()> {
             let trace = TraceBundle::open(args.trace)?;
             let report = analysis::analyze(&trace);
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        CommandSet::Kernels(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = commands::kernels(&trace, args.filter.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", commands::format_kernels(&report, args.verbose)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown kernels format")),
+            }
+        }
+        CommandSet::Encoders(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = commands::encoders(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", commands::format_encoders(&report, args.verbose)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown encoders format")),
+            }
         }
         CommandSet::Buffers(args) => match args.command {
             BuffersCommand::List {
