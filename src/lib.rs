@@ -8,6 +8,7 @@ pub mod correlate;
 pub mod diff;
 pub mod error;
 pub mod graphing;
+pub mod insights;
 pub mod markdown;
 pub mod shaders;
 pub mod timing;

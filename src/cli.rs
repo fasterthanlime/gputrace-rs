@@ -11,6 +11,7 @@ use crate::correlate;
 use crate::diff;
 use crate::error::Result;
 use crate::graphing;
+use crate::insights;
 use crate::markdown;
 use crate::shaders;
 use crate::timing;
@@ -41,6 +42,7 @@ enum CommandSet {
     Graph(GraphArgs),
     Buffers(BuffersArgs),
     BufferTimeline(BufferTimelineArgs),
+    Insights(InsightsArgs),
     Diff(DiffArgs),
     Markdown(MarkdownArgs),
     XcodeProfile(XcodeProfileArgs),
@@ -66,6 +68,15 @@ struct BufferTimelineArgs {
     format: String,
     #[arg(short, long, default_value_t = 100)]
     width: usize,
+}
+
+#[derive(Debug, Args)]
+struct InsightsArgs {
+    trace: PathBuf,
+    #[arg(long)]
+    min_level: Option<String>,
+    #[arg(short, long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Debug, Args)]
@@ -438,6 +449,15 @@ pub fn run() -> Result<()> {
                 "summary" => print!("{}", buffer_timeline::format_summary(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown buffer timeline format")),
+            }
+        }
+        CommandSet::Insights(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = insights::report(&trace, args.min_level.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", insights::format_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown insights format")),
             }
         }
         CommandSet::Diff(args) => {
