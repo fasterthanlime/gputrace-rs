@@ -436,7 +436,8 @@ pub fn build(
     });
     dispatches.sort_by(|left, right| left.index.cmp(&right.index));
 
-    let counter_tracks = build_counter_tracks(&encoders, counter_limiters);
+    let counter_tracks =
+        build_counter_tracks(&encoders, &dispatches, profiler_summary, counter_limiters);
     append_counter_track_events(&mut events, &counter_tracks);
     events.sort_by(|left, right| {
         left.timestamp_us
@@ -1008,12 +1009,11 @@ fn bound_buffer_to_timeline(buffer: &BoundBuffer) -> TimelineBufferBinding {
 
 fn build_counter_tracks(
     encoders: &[TimelineEncoder],
+    dispatches: &[TimelineDispatch],
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
     counter_limiters: Option<&[counter::CounterLimiter]>,
 ) -> Vec<TimelineCounterTrack> {
-    let Some(counter_limiters) = counter_limiters else {
-        return Vec::new();
-    };
-    if encoders.is_empty() || counter_limiters.is_empty() {
+    if encoders.is_empty() {
         return Vec::new();
     }
 
@@ -1021,69 +1021,142 @@ fn build_counter_tracks(
         .iter()
         .map(|encoder| (encoder.index, encoder))
         .collect::<BTreeMap<_, _>>();
-    let mut tracks = vec![
-        CounterTrackBuilder::new("Occupancy Manager", "%"),
-        CounterTrackBuilder::new("ALU Utilization", "%"),
-        CounterTrackBuilder::new("Shader Launch Limiter", "%"),
-        CounterTrackBuilder::new("Instruction Throughput", "%"),
-        CounterTrackBuilder::new("Integer Complex", "%"),
-        CounterTrackBuilder::new("F32 Limiter", "%"),
-        CounterTrackBuilder::new("L1 Cache", "%"),
-        CounterTrackBuilder::new("Last Level Cache", "%"),
-        CounterTrackBuilder::new("Control Flow", "%"),
-        CounterTrackBuilder::new("Device Memory Bandwidth", "GB/s"),
-        CounterTrackBuilder::new("Buffer L1 Read Bandwidth", "GB/s"),
-        CounterTrackBuilder::new("Buffer L1 Write Bandwidth", "GB/s"),
-    ];
+    let mut tracks = Vec::new();
 
-    for limiter in counter_limiters {
-        let Some(encoder) = encoder_by_index.get(&limiter.encoder_index) else {
-            continue;
-        };
-        let start = encoder.start_time_ns;
-        let end = encoder.end_time_ns.max(start);
-        if let Some(value) = limiter.occupancy_manager {
-            tracks[0].push(start, end, value);
+    if let Some(counter_limiters) = counter_limiters
+        && !counter_limiters.is_empty()
+    {
+        let mut limiter_tracks = vec![
+            CounterTrackBuilder::new("Occupancy Manager", "%"),
+            CounterTrackBuilder::new("ALU Utilization", "%"),
+            CounterTrackBuilder::new("Shader Launch Limiter", "%"),
+            CounterTrackBuilder::new("Instruction Throughput", "%"),
+            CounterTrackBuilder::new("Integer Complex", "%"),
+            CounterTrackBuilder::new("F32 Limiter", "%"),
+            CounterTrackBuilder::new("L1 Cache", "%"),
+            CounterTrackBuilder::new("Last Level Cache", "%"),
+            CounterTrackBuilder::new("Control Flow", "%"),
+            CounterTrackBuilder::new("Device Memory Bandwidth", "GB/s"),
+            CounterTrackBuilder::new("Buffer L1 Read Bandwidth", "GB/s"),
+            CounterTrackBuilder::new("Buffer L1 Write Bandwidth", "GB/s"),
+        ];
+
+        for limiter in counter_limiters {
+            let Some(encoder) = encoder_by_index.get(&limiter.encoder_index) else {
+                continue;
+            };
+            let start = encoder.start_time_ns;
+            let end = encoder.end_time_ns.max(start);
+            if let Some(value) = limiter.occupancy_manager {
+                limiter_tracks[0].push(start, end, value);
+            }
+            if let Some(value) = limiter.alu_utilization {
+                limiter_tracks[1].push(start, end, value);
+            }
+            if let Some(value) = limiter.compute_shader_launch {
+                limiter_tracks[2].push(start, end, value * 100.0);
+            }
+            if let Some(value) = limiter.instruction_throughput {
+                limiter_tracks[3].push(start, end, value);
+            }
+            if let Some(value) = limiter.integer_complex {
+                limiter_tracks[4].push(start, end, value * 100.0);
+            }
+            if let Some(value) = limiter.f32_limiter {
+                limiter_tracks[5].push(start, end, value * 100.0);
+            }
+            if let Some(value) = limiter.l1_cache {
+                limiter_tracks[6].push(start, end, value * 100.0);
+            }
+            if let Some(value) = limiter.last_level_cache {
+                limiter_tracks[7].push(start, end, value * 100.0);
+            }
+            if let Some(value) = limiter.control_flow {
+                limiter_tracks[8].push(start, end, value * 100.0);
+            }
+            if let Some(value) = limiter.device_memory_bandwidth_gbps {
+                limiter_tracks[9].push(start, end, value);
+            }
+            if let Some(value) = limiter.buffer_l1_read_bandwidth_gbps {
+                limiter_tracks[10].push(start, end, value);
+            }
+            if let Some(value) = limiter.buffer_l1_write_bandwidth_gbps {
+                limiter_tracks[11].push(start, end, value);
+            }
         }
-        if let Some(value) = limiter.alu_utilization {
-            tracks[1].push(start, end, value);
-        }
-        if let Some(value) = limiter.compute_shader_launch {
-            tracks[2].push(start, end, value * 100.0);
-        }
-        if let Some(value) = limiter.instruction_throughput {
-            tracks[3].push(start, end, value);
-        }
-        if let Some(value) = limiter.integer_complex {
-            tracks[4].push(start, end, value * 100.0);
-        }
-        if let Some(value) = limiter.f32_limiter {
-            tracks[5].push(start, end, value * 100.0);
-        }
-        if let Some(value) = limiter.l1_cache {
-            tracks[6].push(start, end, value * 100.0);
-        }
-        if let Some(value) = limiter.last_level_cache {
-            tracks[7].push(start, end, value * 100.0);
-        }
-        if let Some(value) = limiter.control_flow {
-            tracks[8].push(start, end, value * 100.0);
-        }
-        if let Some(value) = limiter.device_memory_bandwidth_gbps {
-            tracks[9].push(start, end, value);
-        }
-        if let Some(value) = limiter.buffer_l1_read_bandwidth_gbps {
-            tracks[10].push(start, end, value);
-        }
-        if let Some(value) = limiter.buffer_l1_write_bandwidth_gbps {
-            tracks[11].push(start, end, value);
-        }
+        tracks.extend(
+            limiter_tracks
+                .into_iter()
+                .filter_map(CounterTrackBuilder::build),
+        );
     }
 
+    if let Some(profiler_summary) = profiler_summary {
+        let mut encoder_kernel_counts = BTreeMap::<usize, BTreeMap<String, usize>>::new();
+        for dispatch in dispatches {
+            if let (Some(encoder_index), Some(kernel_name)) =
+                (dispatch.encoder_index, dispatch.kernel_name.as_ref())
+            {
+                *encoder_kernel_counts
+                    .entry(encoder_index)
+                    .or_default()
+                    .entry(kernel_name.clone())
+                    .or_default() += 1;
+            }
+        }
+
+        let pipeline_stats_by_name = profiler_summary
+            .pipelines
+            .iter()
+            .filter_map(|pipeline| {
+                Some((
+                    pipeline.function_name.clone()?,
+                    pipeline.stats.as_ref()?.clone(),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut pipeline_tracks = vec![
+            CounterTrackBuilder::new("Total Instructions", "count"),
+            CounterTrackBuilder::new("ALU Instructions", "count"),
+            CounterTrackBuilder::new("Branch Instructions", "count"),
+            CounterTrackBuilder::new("Threadgroup Memory", "bytes"),
+            CounterTrackBuilder::new("Temporary Registers", "count"),
+            CounterTrackBuilder::new("Uniform Registers", "count"),
+            CounterTrackBuilder::new("Spilled Bytes", "bytes"),
+        ];
+
+        for encoder in encoders {
+            let Some(kernel_counts) = encoder_kernel_counts.get(&encoder.index) else {
+                continue;
+            };
+            let Some((kernel_name, _)) = kernel_counts
+                .iter()
+                .max_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(right.0)))
+            else {
+                continue;
+            };
+            let Some(stats) = pipeline_stats_by_name.get(kernel_name) else {
+                continue;
+            };
+            let start = encoder.start_time_ns;
+            let end = encoder.end_time_ns.max(start);
+            pipeline_tracks[0].push(start, end, stats.instruction_count as f64);
+            pipeline_tracks[1].push(start, end, stats.alu_instruction_count as f64);
+            pipeline_tracks[2].push(start, end, stats.branch_instruction_count as f64);
+            pipeline_tracks[3].push(start, end, stats.threadgroup_memory as f64);
+            pipeline_tracks[4].push(start, end, stats.temporary_register_count as f64);
+            pipeline_tracks[5].push(start, end, stats.uniform_register_count as f64);
+            pipeline_tracks[6].push(start, end, stats.spilled_bytes as f64);
+        }
+
+        tracks.extend(
+            pipeline_tracks
+                .into_iter()
+                .filter_map(CounterTrackBuilder::build),
+        );
+    }
     tracks
-        .into_iter()
-        .filter_map(CounterTrackBuilder::build)
-        .collect()
 }
 
 fn append_counter_track_events(
@@ -1781,7 +1854,7 @@ mod tests {
             },
         ];
 
-        let tracks = build_counter_tracks(&encoders, Some(&limiters));
+        let tracks = build_counter_tracks(&encoders, &[], None, Some(&limiters));
         assert!(!tracks.is_empty());
         assert_eq!(tracks[0].name, "Occupancy Manager");
         assert_eq!(tracks[0].samples.len(), 4);
@@ -1796,6 +1869,97 @@ mod tests {
                 .any(|event| event.category.as_deref() == Some("counter"))
         );
         assert!(events.iter().any(|event| event.phase == "C"));
+    }
+
+    #[test]
+    fn builds_pipeline_stat_tracks_from_profiler_summary() {
+        let encoders = vec![TimelineEncoder {
+            index: 0,
+            command_buffer_index: 0,
+            label: "main".into(),
+            address: 0x10,
+            dispatch_count: 2,
+            start_time_ns: 1_000,
+            end_time_ns: 5_000,
+            duration_ns: Some(4_000),
+            synthetic: false,
+        }];
+        let dispatches = vec![
+            TimelineDispatch {
+                index: 0,
+                command_buffer_index: 0,
+                encoder_index: Some(0),
+                encoder_address: Some(0x10),
+                encoder_label: Some("main".into()),
+                kernel_name: Some("blur".into()),
+                start_time_ns: 1_000,
+                end_time_ns: 3_000,
+                duration_ns: Some(2_000),
+                grid_size: [1, 1, 1],
+                group_size: [1, 1, 1],
+                buffers: vec![],
+                synthetic: false,
+            },
+            TimelineDispatch {
+                index: 1,
+                command_buffer_index: 0,
+                encoder_index: Some(0),
+                encoder_address: Some(0x10),
+                encoder_label: Some("main".into()),
+                kernel_name: Some("blur".into()),
+                start_time_ns: 3_000,
+                end_time_ns: 5_000,
+                duration_ns: Some(2_000),
+                grid_size: [1, 1, 1],
+                group_size: [1, 1, 1],
+                buffers: vec![],
+                synthetic: false,
+            },
+        ];
+        let summary = profiler::ProfilerStreamDataSummary {
+            function_names: vec!["blur".into()],
+            pipelines: vec![profiler::ProfilerPipeline {
+                pipeline_id: 1,
+                pipeline_address: 0xaaa,
+                function_name: Some("blur".into()),
+                stats: Some(profiler::ProfilerPipelineStats {
+                    temporary_register_count: 24,
+                    uniform_register_count: 12,
+                    spilled_bytes: 64,
+                    threadgroup_memory: 128,
+                    instruction_count: 1024,
+                    alu_instruction_count: 700,
+                    branch_instruction_count: 20,
+                    compilation_time_ms: 1.2,
+                }),
+            }],
+            execution_costs: vec![],
+            occupancies: vec![],
+            dispatches: vec![],
+            encoder_timings: vec![],
+            timeline: None,
+            num_pipelines: 1,
+            num_gpu_commands: 0,
+            num_encoders: 1,
+            total_time_us: 0,
+        };
+
+        let tracks = build_counter_tracks(&encoders, &dispatches, Some(&summary), None);
+        assert!(
+            tracks
+                .iter()
+                .any(|track| track.name == "Total Instructions")
+        );
+        assert!(
+            tracks
+                .iter()
+                .any(|track| track.name == "Threadgroup Memory")
+        );
+        let total_instructions = tracks
+            .iter()
+            .find(|track| track.name == "Total Instructions")
+            .unwrap();
+        assert_eq!(total_instructions.max_value, 1024.0);
     }
 
     #[test]
