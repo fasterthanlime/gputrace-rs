@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -77,52 +78,55 @@ pub fn validate(
 
     let mut row_results = Vec::new();
     let mut mismatches = 0usize;
+    let mut matched_reference_indices = BTreeSet::new();
 
-    for (exported_row, reference_row) in exported.rows.iter().zip(imported.encoders.iter()) {
+    for exported_row in &exported.rows {
+        let reference_row = match_reference_encoder(
+            exported_row.encoder_index,
+            &exported_row.encoder_label,
+            &imported,
+            &matched_reference_indices,
+        );
+        if let Some(reference_row) = reference_row {
+            matched_reference_indices.insert(reference_row.index);
+        }
+
         let metrics = vec![
             compare_metric(
                 "Kernel Invocations",
                 Some(exported_row.kernel_invocations as f64),
-                reference_row.counters.get("Kernel Invocations").copied(),
+                reference_row.and_then(|row| row.counters.get("Kernel Invocations").copied()),
                 tolerance,
             ),
             compare_metric(
                 "ALU Utilization",
                 exported_row.alu_utilization_percent,
-                reference_row.counters.get("ALU Utilization").copied(),
+                reference_row.and_then(|row| row.counters.get("ALU Utilization").copied()),
                 tolerance,
             ),
             compare_metric(
                 "Kernel Occupancy",
                 exported_row.occupancy_percent,
-                reference_row.counters.get("Kernel Occupancy").copied(),
+                reference_row.and_then(|row| row.counters.get("Kernel Occupancy").copied()),
                 tolerance,
             ),
             compare_metric(
                 "Device Memory Bandwidth",
                 exported_row.device_memory_bandwidth_gbps,
-                reference_row
-                    .counters
-                    .get("Device Memory Bandwidth")
-                    .copied(),
+                reference_row.and_then(|row| row.counters.get("Device Memory Bandwidth").copied()),
                 tolerance,
             ),
             compare_metric(
                 "Buffer L1 Read Bandwidth",
                 exported_row.buffer_l1_read_bandwidth_gbps,
-                reference_row
-                    .counters
-                    .get("Buffer L1 Read Bandwidth")
-                    .copied(),
+                reference_row.and_then(|row| row.counters.get("Buffer L1 Read Bandwidth").copied()),
                 tolerance,
             ),
             compare_metric(
                 "Buffer L1 Write Bandwidth",
                 exported_row.buffer_l1_write_bandwidth_gbps,
                 reference_row
-                    .counters
-                    .get("Buffer L1 Write Bandwidth")
-                    .copied(),
+                    .and_then(|row| row.counters.get("Buffer L1 Write Bandwidth").copied()),
                 tolerance,
             ),
         ];
@@ -132,11 +136,33 @@ pub fn validate(
             .count();
         row_results.push(CounterValidationRow {
             encoder_index: exported_row.encoder_index,
-            encoder_label: if exported_row.encoder_label.is_empty() {
-                reference_row.encoder_label.clone()
-            } else {
-                exported_row.encoder_label.clone()
-            },
+            encoder_label: choose_encoder_label(&exported_row.encoder_label, reference_row),
+            metrics,
+        });
+    }
+
+    for reference_row in &imported.encoders {
+        if matched_reference_indices.contains(&reference_row.index) {
+            continue;
+        }
+        let metrics = compared_metrics
+            .iter()
+            .map(|metric| {
+                compare_metric(
+                    metric,
+                    None,
+                    reference_row.counters.get(metric).copied(),
+                    tolerance,
+                )
+            })
+            .collect::<Vec<_>>();
+        mismatches += metrics
+            .iter()
+            .filter(|metric| !metric.within_tolerance)
+            .count();
+        row_results.push(CounterValidationRow {
+            encoder_index: reference_row.index,
+            encoder_label: reference_row.encoder_label.clone(),
             metrics,
         });
     }
@@ -319,6 +345,56 @@ fn filtered_encoders<'a>(
     encoders
 }
 
+fn match_reference_encoder<'a>(
+    exported_index: usize,
+    exported_label: &str,
+    imported: &'a XcodeCounterData,
+    used_reference_indices: &BTreeSet<usize>,
+) -> Option<&'a XcodeEncoderCounters> {
+    if let Some(exact) = imported
+        .encoders
+        .iter()
+        .find(|row| row.index == exported_index && !used_reference_indices.contains(&row.index))
+    {
+        return Some(exact);
+    }
+
+    let normalized_label = normalize_for_matching(exported_label);
+    if normalized_label.is_empty() {
+        return None;
+    }
+
+    if let Some(exact) = imported.encoders.iter().find(|row| {
+        !used_reference_indices.contains(&row.index)
+            && normalize_for_matching(&row.encoder_label) == normalized_label
+    }) {
+        return Some(exact);
+    }
+
+    imported.encoders.iter().find(|row| {
+        if used_reference_indices.contains(&row.index) {
+            return false;
+        }
+        let normalized_row = normalize_for_matching(&row.encoder_label);
+        !normalized_row.is_empty()
+            && (normalized_row.contains(&normalized_label)
+                || normalized_label.contains(&normalized_row))
+    })
+}
+
+fn choose_encoder_label(
+    exported_label: &str,
+    reference_row: Option<&XcodeEncoderCounters>,
+) -> String {
+    if !exported_label.is_empty() {
+        exported_label.to_owned()
+    } else {
+        reference_row
+            .map(|row| row.encoder_label.clone())
+            .unwrap_or_default()
+    }
+}
+
 fn parse_csv_path(path: &Path) -> Result<XcodeCounterData> {
     let mut reader = csv::Reader::from_path(path)?;
     let headers = reader.headers()?.clone();
@@ -445,6 +521,18 @@ fn truncate(value: &str, width: usize) -> String {
     }
 }
 
+fn normalize_for_matching(name: &str) -> String {
+    name.chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                Some(ch.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +632,39 @@ mod tests {
         let text = format_summary(&data, Some("ALU Utilization"), Some(1));
         assert!(text.contains("fast"));
         assert!(!text.contains("slow"));
+    }
+
+    #[test]
+    fn matches_reference_encoder_by_index_then_label() {
+        let data = XcodeCounterData {
+            source: PathBuf::from("/tmp/example.csv"),
+            metrics: vec![],
+            encoders: vec![
+                XcodeEncoderCounters {
+                    index: 7,
+                    function_index: 0,
+                    command_buffer_label: "cb0".into(),
+                    encoder_label: "Compute Encoder 7 0x1234".into(),
+                    counters: BTreeMap::new(),
+                },
+                XcodeEncoderCounters {
+                    index: 99,
+                    function_index: 1,
+                    command_buffer_label: "cb1".into(),
+                    encoder_label: "main_encoder".into(),
+                    counters: BTreeMap::new(),
+                },
+            ],
+        };
+
+        let used = BTreeSet::new();
+        assert_eq!(
+            match_reference_encoder(7, "ignored", &data, &used).map(|row| row.index),
+            Some(7)
+        );
+        assert_eq!(
+            match_reference_encoder(1, "Main Encoder", &data, &used).map(|row| row.index),
+            Some(99)
+        );
     }
 }
