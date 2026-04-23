@@ -256,7 +256,8 @@ pub fn export_counters(trace_path: Option<&Path>, output_path: &Path) -> Result<
     let _ = click_menu_item(&["Editor", "Export GPU Counters…"])
         .or_else(|_| click_menu_item(&["Editor", "Export GPU Counters..."]))
         .or_else(|_| click_menu_item(&["Editor", "Export GPU Counters"]))?;
-    let window_title = finish_export_sheet(output_path.as_path(), "gpu-counters")?;
+    let window_title =
+        finish_export_sheet(output_path.as_path(), trace_path.as_deref(), "gpu-counters")?;
 
     Ok(XcodeExportResult {
         window_title,
@@ -274,7 +275,11 @@ pub fn export_memory(trace_path: Option<&Path>, output_path: &Path) -> Result<Xc
     let _ = click_menu_item(&["Editor", "Export Memory Report…"])
         .or_else(|_| click_menu_item(&["Editor", "Export Memory Report..."]))
         .or_else(|_| click_menu_item(&["Editor", "Export Memory Report"]))?;
-    let window_title = finish_export_sheet(output_path.as_path(), "memory-report")?;
+    let window_title = finish_export_sheet(
+        output_path.as_path(),
+        trace_path.as_deref(),
+        "memory-report",
+    )?;
 
     Ok(XcodeExportResult {
         window_title,
@@ -1330,7 +1335,11 @@ fn prepare_export_output_path(output_path: &Path) -> Result<PathBuf> {
     Ok(output_path)
 }
 
-fn finish_export_sheet(output_path: &Path, export_kind: &str) -> Result<String> {
+fn finish_export_sheet(
+    output_path: &Path,
+    trace_path: Option<&Path>,
+    export_kind: &str,
+) -> Result<String> {
     let parent = output_path.parent().ok_or_else(|| {
         Error::InvalidInput(format!(
             "export path has no parent directory: {}",
@@ -1345,7 +1354,10 @@ fn finish_export_sheet(output_path: &Path, export_kind: &str) -> Result<String> 
     })?;
     let raw = run_osascript(&build_save_export_script(parent, file_name))?;
     let action = parse_action_output(&raw)?;
-    wait_for_export_path(output_path, Duration::from_secs(30))?;
+    let actual_output = wait_for_export_path(output_path, trace_path, Duration::from_secs(30))?;
+    if actual_output != output_path {
+        copy_path(&actual_output, output_path)?;
+    }
     if action.target != file_name.to_string_lossy() {
         return Err(Error::InvalidInput(format!(
             "unexpected {export_kind} export target: {}",
@@ -1363,7 +1375,7 @@ fn export_profile_trace(
     let _ = click_menu_item(&["File", "Export…"])
         .or_else(|_| click_menu_item(&["File", "Export..."]))
         .or_else(|_| click_menu_item(&["File", "Export"]))?;
-    let window_title = finish_export_sheet(output_path.as_path(), "profile-trace")?;
+    let window_title = finish_export_sheet(output_path.as_path(), trace_path, "profile-trace")?;
     Ok(XcodeExportResult {
         window_title,
         export_kind: trace_path
@@ -1375,7 +1387,54 @@ fn export_profile_trace(
     })
 }
 
-fn wait_for_export_path(output_path: &Path, timeout: Duration) -> Result<()> {
+fn wait_for_export_path(
+    output_path: &Path,
+    trace_path: Option<&Path>,
+    timeout: Duration,
+) -> Result<PathBuf> {
+    let candidates = export_output_candidates(output_path, trace_path)?;
+    let mut found_path = None;
+    let found = wait_for_condition(timeout, Duration::from_millis(500), || {
+        found_path = candidates
+            .iter()
+            .find(|candidate| candidate.exists())
+            .cloned();
+        Ok(found_path.is_some())
+    })?;
+
+    if found {
+        found_path.ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "export output was reported present but no path was captured: {}",
+                output_path.display()
+            ))
+        })
+    } else {
+        Err(Error::InvalidInput(format!(
+            "timed out waiting for export output: {} (also checked {})",
+            output_path.display(),
+            candidates
+                .iter()
+                .map(|candidate| candidate.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+}
+
+fn export_output_candidates(output_path: &Path, trace_path: Option<&Path>) -> Result<Vec<PathBuf>> {
+    export_output_candidates_with_home(
+        output_path,
+        trace_path,
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn export_output_candidates_with_home(
+    output_path: &Path,
+    trace_path: Option<&Path>,
+    home: Option<PathBuf>,
+) -> Result<Vec<PathBuf>> {
     let file_name = output_path
         .file_name()
         .ok_or_else(|| {
@@ -1383,27 +1442,58 @@ fn wait_for_export_path(output_path: &Path, timeout: Duration) -> Result<()> {
         })?
         .to_owned();
     let mut candidates = vec![output_path.to_path_buf()];
-    if let Some(parent) = output_path.parent() {
-        if let Ok(resolved_parent) = std::fs::canonicalize(parent) {
-            let resolved = resolved_parent.join(&file_name);
-            if resolved != output_path {
+    if let Some(parent) = output_path.parent()
+        && let Ok(resolved_parent) = std::fs::canonicalize(parent)
+    {
+        let resolved = resolved_parent.join(&file_name);
+        if !candidates.contains(&resolved) {
+            candidates.push(resolved);
+        }
+    }
+    if let Some(trace_path) = trace_path
+        && let Some(input_dir) = trace_path.parent()
+    {
+        let sibling = input_dir.join(&file_name);
+        if !candidates.contains(&sibling) {
+            candidates.push(sibling.clone());
+        }
+        if let Ok(resolved_input_dir) = std::fs::canonicalize(input_dir) {
+            let resolved = resolved_input_dir.join(&file_name);
+            if !candidates.contains(&resolved) {
                 candidates.push(resolved);
             }
         }
     }
-
-    let found = wait_for_condition(timeout, Duration::from_millis(500), || {
-        Ok(candidates.iter().any(|candidate| candidate.exists()))
-    })?;
-
-    if found {
-        Ok(())
-    } else {
-        Err(Error::InvalidInput(format!(
-            "timed out waiting for export output: {}",
-            output_path.display()
-        )))
+    if let Some(home) = home {
+        for candidate in [
+            home.join("Downloads").join(&file_name),
+            home.join("Desktop").join(&file_name),
+        ] {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
     }
+    Ok(candidates)
+}
+
+fn copy_path(source: &Path, destination: &Path) -> Result<()> {
+    if source.is_dir() {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let source_path = entry.path();
+            let dest_path = destination.join(entry.file_name());
+            copy_path(&source_path, &dest_path)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(source, destination)?;
+    Ok(())
 }
 
 fn build_select_tab_script(trace_path: Option<&Path>, tab_name: &str) -> String {
@@ -2330,5 +2420,44 @@ mod tests {
     fn default_profile_output_path_appends_perfdata_suffix() {
         let output = default_profile_output_path(Path::new("/tmp/My Trace.gputrace"));
         assert_eq!(output, Path::new("/tmp/My Trace-perfdata.gputrace"));
+    }
+
+    #[test]
+    fn export_output_candidates_include_trace_dir_and_home_fallbacks() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let output = Path::new("/tmp/out/trace.gputrace");
+        let trace = Path::new("/captures/input/trace.gputrace");
+        let candidates = export_output_candidates_with_home(
+            output,
+            Some(trace),
+            Some(temp_home.path().to_path_buf()),
+        )
+        .unwrap();
+        assert!(candidates.contains(&PathBuf::from("/tmp/out/trace.gputrace")));
+        assert!(candidates.contains(&PathBuf::from("/captures/input/trace.gputrace")));
+        assert!(candidates.contains(&temp_home.path().join("Downloads").join("trace.gputrace")));
+        assert!(candidates.contains(&temp_home.path().join("Desktop").join("trace.gputrace")));
+    }
+
+    #[test]
+    fn copy_path_copies_directories_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.gputrace");
+        let nested = source.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(source.join("root.txt"), b"root").unwrap();
+        std::fs::write(nested.join("leaf.txt"), b"leaf").unwrap();
+
+        let destination = dir.path().join("dest.gputrace");
+        copy_path(&source, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("root.txt")).unwrap(),
+            b"root"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("nested").join("leaf.txt")).unwrap(),
+            b"leaf"
+        );
     }
 }
