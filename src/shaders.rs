@@ -1,0 +1,322 @@
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use regex::Regex;
+use serde::Serialize;
+use walkdir::WalkDir;
+
+use crate::error::{Error, Result};
+use crate::trace::TraceBundle;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShaderReport {
+    pub total_shaders: usize,
+    pub indexed_files: usize,
+    pub indexed_symbols: usize,
+    pub shaders: Vec<ShaderEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShaderEntry {
+    pub name: String,
+    pub pipeline_addr: u64,
+    pub dispatch_count: usize,
+    pub source_file: Option<PathBuf>,
+    pub source_line: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ShaderSourceReport {
+    pub shader_name: String,
+    pub pipeline_addr: u64,
+    pub dispatch_count: usize,
+    pub source_file: PathBuf,
+    pub source_line: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub excerpt: Vec<SourceLine>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceLine {
+    pub number: usize,
+    pub text: String,
+    pub highlight: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ShaderSourceIndex {
+    kernel_to_file: BTreeMap<String, PathBuf>,
+    kernel_to_line: BTreeMap<String, usize>,
+}
+
+pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderReport> {
+    let index = ShaderSourceIndex::build(search_paths)?;
+    let mut shaders: Vec<_> = trace
+        .analyze_kernels()?
+        .into_values()
+        .map(|kernel| {
+            let (source_file, source_line) = match index.lookup(&kernel.name) {
+                Some((file, line)) => (Some(file), Some(line)),
+                None => (None, None),
+            };
+            ShaderEntry {
+                name: kernel.name,
+                pipeline_addr: kernel.pipeline_addr,
+                dispatch_count: kernel.dispatch_count,
+                source_file,
+                source_line,
+            }
+        })
+        .collect();
+    shaders.sort_by(|left, right| {
+        right
+            .dispatch_count
+            .cmp(&left.dispatch_count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let (indexed_files, indexed_symbols) = index.stats();
+    Ok(ShaderReport {
+        total_shaders: shaders.len(),
+        indexed_files,
+        indexed_symbols,
+        shaders,
+    })
+}
+
+pub fn source(
+    trace: &TraceBundle,
+    shader_name: &str,
+    search_paths: &[PathBuf],
+    context: usize,
+) -> Result<ShaderSourceReport> {
+    let index = ShaderSourceIndex::build(search_paths)?;
+    let kernels = trace.analyze_kernels()?;
+    let kernel = kernels
+        .get(shader_name)
+        .cloned()
+        .or_else(|| {
+            kernels.into_values().find(|kernel| {
+                kernel.name.contains(shader_name) || shader_name.contains(&kernel.name)
+            })
+        })
+        .ok_or_else(|| Error::InvalidInput(format!("shader not found in trace: {shader_name}")))?;
+    let (source_file, source_line) = index
+        .lookup(&kernel.name)
+        .map(|(file, line)| (file, line))
+        .ok_or_else(|| {
+            Error::InvalidInput(format!("source not found for shader: {}", kernel.name))
+        })?;
+    let contents = fs::read_to_string(&source_file)?;
+    let lines: Vec<_> = contents.lines().map(ToOwned::to_owned).collect();
+    let start_line = source_line.saturating_sub(context).max(1);
+    let end_line = (source_line + context).min(lines.len());
+    let excerpt = (start_line..=end_line)
+        .map(|number| SourceLine {
+            number,
+            text: lines[number - 1].clone(),
+            highlight: number == source_line,
+        })
+        .collect();
+
+    Ok(ShaderSourceReport {
+        shader_name: kernel.name,
+        pipeline_addr: kernel.pipeline_addr,
+        dispatch_count: kernel.dispatch_count,
+        source_file,
+        source_line,
+        start_line,
+        end_line,
+        excerpt,
+    })
+}
+
+pub fn format_report(report: &ShaderReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} shaders, {} indexed files, {} indexed symbols\n\n",
+        report.total_shaders, report.indexed_files, report.indexed_symbols
+    ));
+    out.push_str(&format!(
+        "{:<36} {:<18} {:>10}  {}\n",
+        "Name", "Pipeline State", "Dispatches", "Source"
+    ));
+    for shader in &report.shaders {
+        let source = match (&shader.source_file, shader.source_line) {
+            (Some(file), Some(line)) => format!("{}:{}", file.display(), line),
+            _ => "-".to_owned(),
+        };
+        out.push_str(&format!(
+            "{:<36} 0x{:<16x} {:>10}  {}\n",
+            truncate(&shader.name, 36),
+            shader.pipeline_addr,
+            shader.dispatch_count,
+            source
+        ));
+    }
+    out
+}
+
+pub fn format_source(report: &ShaderSourceReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Shader: {}\n", report.shader_name));
+    out.push_str(&format!("Pipeline: 0x{:x}\n", report.pipeline_addr));
+    out.push_str(&format!("Dispatches: {}\n", report.dispatch_count));
+    out.push_str(&format!(
+        "Source: {}:{}\n\n",
+        report.source_file.display(),
+        report.source_line
+    ));
+    for line in &report.excerpt {
+        let marker = if line.highlight { ">" } else { " " };
+        out.push_str(&format!("{marker} {:>5} | {}\n", line.number, line.text));
+    }
+    out
+}
+
+pub fn default_search_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(env_paths) = env::var_os("GPUTRACE_SHADER_SEARCH_PATHS") {
+        paths.extend(env::split_paths(&env_paths));
+    }
+    for candidate in [
+        "/opt/homebrew/Cellar/mlx-c",
+        "./mlx/backend/metal",
+        "../mlx/backend/metal",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+impl ShaderSourceIndex {
+    fn build(search_paths: &[PathBuf]) -> Result<Self> {
+        let mut index = Self {
+            kernel_to_file: BTreeMap::new(),
+            kernel_to_line: BTreeMap::new(),
+        };
+        let kernel_regex = Regex::new(r"kernel\s+void\s+(\w+)\s*\(")
+            .map_err(|error| Error::InvalidInput(format!("invalid kernel regex: {error}")))?;
+        let func_regex = Regex::new(
+            r"^\s*(?:inline\s+)?(?:device\s+|constant\s+)?(?:void|float|int|half|uint)\s+(\w+)\s*\(",
+        )
+        .map_err(|error| Error::InvalidInput(format!("invalid function regex: {error}")))?;
+
+        for root in search_paths {
+            if !root.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(root)
+                .into_iter()
+                .filter_map(|entry| entry.ok())
+            {
+                if entry.file_type().is_dir() {
+                    continue;
+                }
+                if entry.path().extension().and_then(|ext| ext.to_str()) != Some("metal") {
+                    continue;
+                }
+                index.index_file(entry.path(), &kernel_regex, &func_regex)?;
+            }
+        }
+        Ok(index)
+    }
+
+    fn index_file(&mut self, path: &Path, kernel_regex: &Regex, func_regex: &Regex) -> Result<()> {
+        let contents = fs::read_to_string(path)?;
+        for (line_idx, line) in contents.lines().enumerate() {
+            if let Some(captures) = kernel_regex.captures(line)
+                && let Some(name) = captures.get(1)
+            {
+                self.kernel_to_file
+                    .insert(name.as_str().to_owned(), path.to_path_buf());
+                self.kernel_to_line
+                    .insert(name.as_str().to_owned(), line_idx + 1);
+                continue;
+            }
+            if let Some(captures) = func_regex.captures(line)
+                && let Some(name) = captures.get(1)
+            {
+                self.kernel_to_file
+                    .entry(name.as_str().to_owned())
+                    .or_insert_with(|| path.to_path_buf());
+                self.kernel_to_line
+                    .entry(name.as_str().to_owned())
+                    .or_insert(line_idx + 1);
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup(&self, kernel_name: &str) -> Option<(PathBuf, usize)> {
+        if let Some(file) = self.kernel_to_file.get(kernel_name) {
+            return Some((
+                file.clone(),
+                *self.kernel_to_line.get(kernel_name).unwrap_or(&1),
+            ));
+        }
+        let stripped = strip_type_suffixes(kernel_name);
+        if let Some(file) = self.kernel_to_file.get(&stripped) {
+            return Some((
+                file.clone(),
+                *self.kernel_to_line.get(&stripped).unwrap_or(&1),
+            ));
+        }
+        for (known, file) in &self.kernel_to_file {
+            if kernel_name.contains(known) || known.contains(kernel_name) {
+                return Some((file.clone(), *self.kernel_to_line.get(known).unwrap_or(&1)));
+            }
+        }
+        None
+    }
+
+    fn stats(&self) -> (usize, usize) {
+        let files: std::collections::BTreeSet<_> = self.kernel_to_file.values().collect();
+        (files.len(), self.kernel_to_file.len())
+    }
+}
+
+fn strip_type_suffixes(name: &str) -> String {
+    for suffix in [
+        "_float32",
+        "_float16",
+        "_float",
+        "_int32",
+        "_int64",
+        "_int",
+        "_uint32",
+        "_uint64",
+        "_uint",
+        "_half",
+        "_bfloat16",
+    ] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return stripped.to_owned();
+        }
+    }
+    name.to_owned()
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.len() <= width {
+        return value.to_owned();
+    }
+    let keep = width.saturating_sub(3);
+    format!("{}...", &value[..keep])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_type_suffixes() {
+        assert_eq!(strip_type_suffixes("rope_float16"), "rope");
+        assert_eq!(strip_type_suffixes("kernel"), "kernel");
+    }
+}

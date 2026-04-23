@@ -10,6 +10,7 @@ use crate::commands;
 use crate::diff;
 use crate::error::Result;
 use crate::markdown;
+use crate::shaders;
 use crate::trace::TraceBundle;
 
 #[derive(Debug, Parser)]
@@ -27,6 +28,8 @@ enum CommandSet {
     Kernels(KernelsArgs),
     Encoders(EncodersArgs),
     Dependencies(DependenciesArgs),
+    Shaders(ShadersArgs),
+    ShaderSource(ShaderSourceArgs),
     Buffers(BuffersArgs),
     BufferTimeline(BufferTimelineArgs),
     Diff(DiffArgs),
@@ -80,6 +83,27 @@ struct EncodersArgs {
 struct DependenciesArgs {
     trace: PathBuf,
     #[arg(short, long, default_value = "dot")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ShadersArgs {
+    trace: PathBuf,
+    #[arg(long = "search-path")]
+    search_paths: Vec<PathBuf>,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ShaderSourceArgs {
+    trace: PathBuf,
+    shader: String,
+    #[arg(long = "search-path")]
+    search_paths: Vec<PathBuf>,
+    #[arg(long, default_value_t = 4)]
+    context: usize,
+    #[arg(short, long, default_value = "text")]
     format: String,
 }
 
@@ -184,6 +208,34 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", commands::format_dependencies(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown dependencies format")),
+            }
+        }
+        CommandSet::Shaders(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let search_paths = if args.search_paths.is_empty() {
+                shaders::default_search_paths()
+            } else {
+                args.search_paths
+            };
+            let report = shaders::report(&trace, &search_paths)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", shaders::format_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown shaders format")),
+            }
+        }
+        CommandSet::ShaderSource(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let search_paths = if args.search_paths.is_empty() {
+                shaders::default_search_paths()
+            } else {
+                args.search_paths
+            };
+            let report = shaders::source(&trace, &args.shader, &search_paths, args.context)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", shaders::format_source(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown shader-source format")),
             }
         }
         CommandSet::Buffers(args) => match args.command {
