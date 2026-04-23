@@ -4,8 +4,8 @@ use serde::Serialize;
 
 use crate::error::Result;
 use crate::trace::{
-    CDispatchRecord, CRecord, CiRecord, CtRecord, CtURecord, CttRecord, CulRecord, CululRecord,
-    CuwRecord, MTSPRecord, RecordType,
+    CDispatchRecord, CRecord, CiRecord, CiululRecord, CtRecord, CtURecord, CttRecord, CuRecord,
+    CuiRecord, CulRecord, CululRecord, CuwRecord, MTSPRecord, RecordType,
 };
 
 pub const DEFAULT_HEX_PREVIEW_BYTES: usize = 32;
@@ -47,6 +47,41 @@ pub struct RecordTypeCount {
     pub total_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum ParsedRecordKind {
+    BufferMarker,
+    Dispatch,
+    Encoder,
+    IndirectCommandBuffer,
+    NamedAddress,
+    PipelineState,
+    ResourceHandle,
+    SharedEvent,
+}
+
+impl std::fmt::Display for ParsedRecordKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::BufferMarker => "buffer-marker",
+            Self::Dispatch => "dispatch",
+            Self::Encoder => "encoder",
+            Self::IndirectCommandBuffer => "indirect-command-buffer",
+            Self::NamedAddress => "named-address",
+            Self::PipelineState => "pipeline-state",
+            Self::ResourceHandle => "resource-handle",
+            Self::SharedEvent => "shared-event",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ParsedKindCount {
+    pub parsed_kind: ParsedRecordKind,
+    pub count: usize,
+    pub total_bytes: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordDumpSummary {
     pub total_records: usize,
@@ -54,6 +89,14 @@ pub struct RecordDumpSummary {
     pub shown_records: usize,
     pub shown_bytes: usize,
     pub counts_by_type: Vec<RecordTypeCount>,
+    pub counts_by_parsed_kind: Vec<ParsedKindCount>,
+    pub labeled_records: usize,
+    pub addressed_records: usize,
+    pub function_addressed_records: usize,
+    pub parsed_records: usize,
+    pub unique_labels: usize,
+    pub unique_addresses: usize,
+    pub unique_function_addresses: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,8 +109,28 @@ pub enum ParsedRecordFields {
     Cuw(CuwRecord),
     CtU(CtURecord),
     Culul(CululRecord),
+    Cu(CuRecord),
+    Cui(CuiRecord),
+    Ciulul(CiululRecord),
     C(CRecord),
     Dispatch(CDispatchRecord),
+}
+
+impl ParsedRecordFields {
+    pub fn kind(&self) -> ParsedRecordKind {
+        match self {
+            Self::Ct(_) | Self::Ctt(_) => ParsedRecordKind::PipelineState,
+            Self::Ci(_) | Self::Culul(_) | Self::Ciulul(_) => {
+                ParsedRecordKind::IndirectCommandBuffer
+            }
+            Self::Cul(_) | Self::Cuw(_) => ParsedRecordKind::BufferMarker,
+            Self::CtU(_) => ParsedRecordKind::NamedAddress,
+            Self::Cu(_) => ParsedRecordKind::ResourceHandle,
+            Self::Cui(_) => ParsedRecordKind::SharedEvent,
+            Self::C(_) => ParsedRecordKind::Encoder,
+            Self::Dispatch(_) => ParsedRecordKind::Dispatch,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +151,76 @@ pub struct RecordDumpReport {
     pub filter: DumpFilter,
     pub summary: RecordDumpSummary,
     pub records: Vec<RecordDumpEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DumpGrouping {
+    RecordType,
+    ParsedKind,
+    Label,
+    Address,
+    FunctionAddress,
+}
+
+impl std::fmt::Display for DumpGrouping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::RecordType => "record-type",
+            Self::ParsedKind => "parsed-kind",
+            Self::Label => "label",
+            Self::Address => "address",
+            Self::FunctionAddress => "function-address",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "value")]
+pub enum DumpGroupKey {
+    RecordType(RecordType),
+    ParsedKind(ParsedRecordKind),
+    Label(String),
+    Address(u64),
+    FunctionAddress(u64),
+    Missing,
+}
+
+impl std::fmt::Display for DumpGroupKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecordType(record_type) => write!(f, "{record_type}"),
+            Self::ParsedKind(parsed_kind) => write!(f, "{parsed_kind}"),
+            Self::Label(label) => write!(f, "{label:?}"),
+            Self::Address(address) => write!(f, "0x{address:x}"),
+            Self::FunctionAddress(address) => write!(f, "0x{address:x}"),
+            Self::Missing => f.write_str("<missing>"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordDumpGroup {
+    pub grouping: DumpGrouping,
+    pub key: DumpGroupKey,
+    pub count: usize,
+    pub total_bytes: usize,
+    pub first_index: usize,
+    pub last_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordDumpRow {
+    pub index: usize,
+    pub offset: usize,
+    pub size: usize,
+    pub record_type: RecordType,
+    pub parsed_kind: Option<ParsedRecordKind>,
+    pub label: Option<String>,
+    pub address: Option<u64>,
+    pub function_address: Option<u64>,
+    pub parsed_summary: Option<String>,
+    pub hex_preview: Option<String>,
 }
 
 pub fn summarize_records(records: &[MTSPRecord]) -> RecordDumpSummary {
@@ -145,6 +278,27 @@ pub fn format_record_counts(summary: &RecordDumpSummary) -> String {
         "bytes:   {} shown / {} total",
         summary.shown_bytes, summary.total_bytes
     );
+    let _ = writeln!(
+        output,
+        "parsed:  {} shown records, {} typed groups",
+        summary.parsed_records,
+        summary.counts_by_parsed_kind.len()
+    );
+    let _ = writeln!(
+        output,
+        "labels:  {} records, {} unique",
+        summary.labeled_records, summary.unique_labels
+    );
+    let _ = writeln!(
+        output,
+        "addr:    {} records, {} unique",
+        summary.addressed_records, summary.unique_addresses
+    );
+    let _ = writeln!(
+        output,
+        "func:    {} records, {} unique",
+        summary.function_addressed_records, summary.unique_function_addresses
+    );
     let _ = writeln!(output);
     let _ = writeln!(output, "type         count   bytes");
     let _ = writeln!(output, "--------------------------");
@@ -155,6 +309,52 @@ pub fn format_record_counts(summary: &RecordDumpSummary) -> String {
             count.record_type, count.count, count.total_bytes
         );
     }
+    if !summary.counts_by_parsed_kind.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "parsed kind              count   bytes");
+        let _ = writeln!(output, "--------------------------------------");
+        for count in &summary.counts_by_parsed_kind {
+            let _ = writeln!(
+                output,
+                "{:<24} {:>5} {:>7}",
+                count.parsed_kind, count.count, count.total_bytes
+            );
+        }
+    }
+    output
+}
+
+pub fn format_record_summary(report: &RecordDumpReport) -> String {
+    let mut output = format_record_counts(&report.summary);
+
+    let type_groups = group_record_dump(report, DumpGrouping::RecordType);
+    if !type_groups.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "top record groups");
+        let _ = writeln!(output, "-----------------");
+        for group in type_groups.iter().take(5) {
+            let _ = writeln!(
+                output,
+                "{}: {} records, {} bytes, indices {}..={}",
+                group.key, group.count, group.total_bytes, group.first_index, group.last_index
+            );
+        }
+    }
+
+    let parsed_groups = group_record_dump(report, DumpGrouping::ParsedKind);
+    if !parsed_groups.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "top parsed groups");
+        let _ = writeln!(output, "-----------------");
+        for group in parsed_groups.iter().take(5) {
+            let _ = writeln!(
+                output,
+                "{}: {} records, {} bytes, indices {}..={}",
+                group.key, group.count, group.total_bytes, group.first_index, group.last_index
+            );
+        }
+    }
+
     output
 }
 
@@ -207,12 +407,178 @@ pub fn format_record_listing(report: &RecordDumpReport) -> String {
     output
 }
 
+pub fn group_record_dump(
+    report: &RecordDumpReport,
+    grouping: DumpGrouping,
+) -> Vec<RecordDumpGroup> {
+    let mut groups = Vec::<RecordDumpGroup>::new();
+
+    for entry in &report.records {
+        let key = match grouping {
+            DumpGrouping::RecordType => DumpGroupKey::RecordType(entry.record_type),
+            DumpGrouping::ParsedKind => entry
+                .parsed
+                .as_ref()
+                .map(|parsed| DumpGroupKey::ParsedKind(parsed.kind()))
+                .unwrap_or(DumpGroupKey::Missing),
+            DumpGrouping::Label => entry
+                .label
+                .clone()
+                .map(DumpGroupKey::Label)
+                .unwrap_or(DumpGroupKey::Missing),
+            DumpGrouping::Address => entry
+                .address
+                .map(DumpGroupKey::Address)
+                .unwrap_or(DumpGroupKey::Missing),
+            DumpGrouping::FunctionAddress => entry
+                .function_address
+                .map(DumpGroupKey::FunctionAddress)
+                .unwrap_or(DumpGroupKey::Missing),
+        };
+
+        if let Some(existing) = groups.iter_mut().find(|group| group.key == key) {
+            existing.count += 1;
+            existing.total_bytes += entry.size;
+            existing.first_index = existing.first_index.min(entry.index);
+            existing.last_index = existing.last_index.max(entry.index);
+        } else {
+            groups.push(RecordDumpGroup {
+                grouping,
+                key,
+                count: 1,
+                total_bytes: entry.size,
+                first_index: entry.index,
+                last_index: entry.index,
+            });
+        }
+    }
+
+    groups.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| right.total_bytes.cmp(&left.total_bytes))
+            .then_with(|| left.first_index.cmp(&right.first_index))
+    });
+    groups
+}
+
+pub fn format_record_groups(groups: &[RecordDumpGroup]) -> String {
+    let mut output = String::new();
+    if groups.is_empty() {
+        output.push_str("no groups\n");
+        return output;
+    }
+
+    let grouping = groups[0].grouping;
+    let _ = writeln!(output, "grouped by {grouping}");
+    let _ = writeln!(output, "group                      count   bytes   indices");
+    let _ = writeln!(output, "--------------------------------------------------");
+    for group in groups {
+        let _ = writeln!(
+            output,
+            "{:<26} {:>5} {:>7}   {}..={}",
+            group.key, group.count, group.total_bytes, group.first_index, group.last_index
+        );
+    }
+    output
+}
+
+pub fn export_record_rows(report: &RecordDumpReport) -> Vec<RecordDumpRow> {
+    report
+        .records
+        .iter()
+        .map(|entry| RecordDumpRow {
+            index: entry.index,
+            offset: entry.offset,
+            size: entry.size,
+            record_type: entry.record_type,
+            parsed_kind: entry.parsed.as_ref().map(ParsedRecordFields::kind),
+            label: entry.label.clone(),
+            address: entry.address,
+            function_address: entry.function_address,
+            parsed_summary: entry.parsed.as_ref().map(format_parsed_fields),
+            hex_preview: entry.hex_preview.clone(),
+        })
+        .collect()
+}
+
+pub fn export_record_rows_csv(report: &RecordDumpReport) -> String {
+    let mut output = String::from(
+        "index,offset,size,record_type,parsed_kind,label,address,function_address,parsed_summary,hex_preview\n",
+    );
+    for row in export_record_rows(report) {
+        let _ = writeln!(
+            output,
+            "{},{},{},{},{},{},{},{},{},{}",
+            row.index,
+            row.offset,
+            row.size,
+            csv_escape(&row.record_type.to_string()),
+            csv_escape(
+                &row.parsed_kind
+                    .map(|kind| kind.to_string())
+                    .unwrap_or_default()
+            ),
+            csv_escape(row.label.as_deref().unwrap_or("")),
+            csv_escape(
+                &row.address
+                    .map(|value| format!("0x{value:x}"))
+                    .unwrap_or_default()
+            ),
+            csv_escape(
+                &row.function_address
+                    .map(|value| format!("0x{value:x}"))
+                    .unwrap_or_default()
+            ),
+            csv_escape(row.parsed_summary.as_deref().unwrap_or("")),
+            csv_escape(row.hex_preview.as_deref().unwrap_or("")),
+        );
+    }
+    output
+}
+
+pub fn export_record_groups_json(groups: &[RecordDumpGroup]) -> String {
+    serde_json::to_string_pretty(groups).expect("record groups should serialize")
+}
+
 fn summarize_with_entries(
     all_records: &[MTSPRecord],
     shown_records: &[RecordDumpEntry],
 ) -> RecordDumpSummary {
     let total_bytes = all_records.iter().map(|record| record.size).sum();
     let shown_bytes = shown_records.iter().map(|record| record.size).sum();
+    let parsed_records = shown_records
+        .iter()
+        .filter(|entry| entry.parsed.is_some())
+        .count();
+    let labeled_records = shown_records
+        .iter()
+        .filter(|entry| entry.label.is_some())
+        .count();
+    let addressed_records = shown_records
+        .iter()
+        .filter(|entry| entry.address.is_some())
+        .count();
+    let function_addressed_records = shown_records
+        .iter()
+        .filter(|entry| entry.function_address.is_some())
+        .count();
+    let unique_labels = shown_records
+        .iter()
+        .filter_map(|entry| entry.label.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let unique_addresses = shown_records
+        .iter()
+        .filter_map(|entry| entry.address)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let unique_function_addresses = shown_records
+        .iter()
+        .filter_map(|entry| entry.function_address)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
 
     let mut counts =
         shown_records
@@ -235,12 +601,43 @@ fn summarize_with_entries(
             });
     counts.sort_by_key(|count| count.record_type.to_string());
 
+    let mut parsed_kind_counts = shown_records
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .parsed
+                .as_ref()
+                .map(|parsed| (parsed.kind(), entry.size))
+        })
+        .fold(Vec::<ParsedKindCount>::new(), |mut counts, (kind, size)| {
+            if let Some(existing) = counts.iter_mut().find(|count| count.parsed_kind == kind) {
+                existing.count += 1;
+                existing.total_bytes += size;
+            } else {
+                counts.push(ParsedKindCount {
+                    parsed_kind: kind,
+                    count: 1,
+                    total_bytes: size,
+                });
+            }
+            counts
+        });
+    parsed_kind_counts.sort_by_key(|count| count.parsed_kind);
+
     RecordDumpSummary {
         total_records: all_records.len(),
         total_bytes,
         shown_records: shown_records.len(),
         shown_bytes,
         counts_by_type: counts,
+        counts_by_parsed_kind: parsed_kind_counts,
+        labeled_records,
+        addressed_records,
+        function_addressed_records,
+        parsed_records,
+        unique_labels,
+        unique_addresses,
+        unique_function_addresses,
     }
 }
 
@@ -259,7 +656,7 @@ fn summarize_with_slice(
             label: record.label.clone(),
             address: record.address,
             function_address: record.function_address,
-            parsed: None,
+            parsed: parse_record_fields(record),
             hex_preview: None,
         })
         .collect::<Vec<_>>();
@@ -307,6 +704,15 @@ fn parse_record_fields(record: &MTSPRecord) -> Option<ParsedRecordFields> {
             .parse_culul_structured()
             .ok()
             .map(ParsedRecordFields::Culul),
+        RecordType::CU | RecordType::Cut => record
+            .parse_cu_structured()
+            .ok()
+            .map(ParsedRecordFields::Cu),
+        RecordType::Cui => record.parse_cui_record().ok().map(ParsedRecordFields::Cui),
+        RecordType::Ciulul => record
+            .parse_ciulul_record()
+            .ok()
+            .map(ParsedRecordFields::Ciulul),
         RecordType::C => record.parse_c_record().ok().map(ParsedRecordFields::C),
         RecordType::C3ul => record
             .parse_dispatch_record()
@@ -358,6 +764,24 @@ fn format_parsed_fields(parsed: &ParsedRecordFields) -> String {
             "Culul icb=0x{:x} payload=0x{:x} array_count={}",
             record.icb_addr, record.payload_addr, record.array_count
         ),
+        ParsedRecordFields::Cu(record) => format!(
+            "CU device=0x{:x} heap=0x{:x} id={:?}",
+            record.device_addr, record.heap_addr, record.identifier
+        ),
+        ParsedRecordFields::Cui(record) => {
+            format!("Cui shared_event=0x{:x}", record.shared_event_addr)
+        }
+        ParsedRecordFields::Ciulul(record) => format!(
+            "Ciulul icb={} count={}",
+            record
+                .icb_addr
+                .map(|value| format!("0x{value:x}"))
+                .unwrap_or_else(|| "<missing>".into()),
+            record
+                .count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<missing>".into())
+        ),
         ParsedRecordFields::C(record) => {
             format!(
                 "C encoder=0x{:x} flags=0x{:x}",
@@ -369,6 +793,14 @@ fn format_parsed_fields(parsed: &ParsedRecordFields) -> String {
             record.encoder_id, record.grid_size, record.group_size
         ),
     }
+}
+
+fn csv_escape(value: &str) -> String {
+    let needs_quotes = value.contains([',', '"', '\n']);
+    if !needs_quotes {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -441,6 +873,9 @@ mod tests {
         assert_eq!(summary.total_bytes, 32 + 64 + 0x68);
         assert_eq!(summary.counts_by_type.len(), 3);
         assert_eq!(summary.counts_by_type[0].record_type, RecordType::C3ul);
+        assert_eq!(summary.counts_by_parsed_kind.len(), 2);
+        assert_eq!(summary.labeled_records, 1);
+        assert_eq!(summary.unique_labels, 1);
     }
 
     #[test]
@@ -502,12 +937,72 @@ mod tests {
         let counts = format_record_counts(&report.summary);
         assert!(counts.contains("records: 1 shown / 3 total"));
         assert!(counts.contains("Ct"));
+        assert!(counts.contains("pipeline-state"));
 
         let listing = format_record_listing(&report);
         assert!(listing.contains("filter: type=Ct"));
         assert!(listing.contains("filter: start index=1"));
         assert!(listing.contains("[1] offset=0x20 type=Ct size=64"));
         assert!(listing.contains("parsed: Ct pipeline=0x1111 function=0x2222 bindings=1"));
+    }
+
+    #[test]
+    fn groups_records_by_type_and_parsed_kind() {
+        let report = build_record_dump(&sample_records(), DumpFilter::default());
+
+        let type_groups = group_record_dump(&report, DumpGrouping::RecordType);
+        assert_eq!(type_groups.len(), 3);
+        assert_eq!(
+            type_groups[0].key,
+            DumpGroupKey::RecordType(RecordType::C3ul)
+        );
+
+        let parsed_groups = group_record_dump(&report, DumpGrouping::ParsedKind);
+        assert_eq!(parsed_groups.len(), 3);
+        assert_eq!(
+            parsed_groups[0].key,
+            DumpGroupKey::ParsedKind(ParsedRecordKind::Dispatch)
+        );
+        assert_eq!(
+            parsed_groups[1].key,
+            DumpGroupKey::ParsedKind(ParsedRecordKind::PipelineState)
+        );
+    }
+
+    #[test]
+    fn exports_rows_as_csv() {
+        let report = build_record_dump(
+            &sample_records(),
+            DumpFilter {
+                include_hex_preview: true,
+                max_preview_bytes: 4,
+                ..DumpFilter::default()
+            },
+        );
+
+        let csv = export_record_rows_csv(&report);
+        assert!(csv.contains("index,offset,size,record_type,parsed_kind,label,address,function_address,parsed_summary,hex_preview"));
+        assert!(csv.contains("0,0,32,CS,,Kernel,0x1234,,,20 00 00 00 ... (+28 bytes)"));
+        assert!(csv.contains(
+            "1,32,64,Ct,pipeline-state,,,,Ct pipeline=0x1111 function=0x2222 bindings=1,40 00 00 00 ... (+60 bytes)"
+        ));
+    }
+
+    #[test]
+    fn formats_richer_summary_and_group_output() {
+        let report = build_record_dump(&sample_records(), DumpFilter::default());
+
+        let summary = format_record_summary(&report);
+        assert!(summary.contains("top record groups"));
+        assert!(summary.contains("top parsed groups"));
+
+        let groups = group_record_dump(&report, DumpGrouping::RecordType);
+        let grouped = format_record_groups(&groups);
+        assert!(grouped.contains("grouped by record-type"));
+        assert!(grouped.contains("CS"));
+
+        let json = export_record_groups_json(&groups);
+        assert!(json.contains("\"grouping\": \"RecordType\""));
     }
 
     #[test]
