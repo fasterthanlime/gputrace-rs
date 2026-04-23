@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod analyze_usage;
 pub mod apicalls;
 pub mod automation;
 pub mod buffer_timeline;
