@@ -111,5 +111,20 @@ pub fn diff_report(report: &DiffReport) -> String {
             ));
         }
     }
+    if !report.buffer_lifecycle_changes.is_empty() {
+        out.push_str("\n## Buffer Lifetime Changes\n\n");
+        for change in report.buffer_lifecycle_changes.iter().take(10) {
+            out.push_str(&format!(
+                "- `{}`: command buffers {} -> {} ({:+}), dispatches {} -> {} ({:+})\n",
+                change.name,
+                change.left_command_buffer_span,
+                change.right_command_buffer_span,
+                change.command_buffer_span_delta,
+                change.left_dispatch_span,
+                change.right_dispatch_span,
+                change.dispatch_span_delta
+            ));
+        }
+    }
     out
 }

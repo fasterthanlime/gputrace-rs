@@ -10,6 +10,7 @@ pub struct DiffReport {
     pub left: AnalysisReport,
     pub right: AnalysisReport,
     pub buffer_changes: Vec<BufferChange>,
+    pub buffer_lifecycle_changes: Vec<BufferLifecycleChange>,
     pub kernel_changes: Vec<KernelChange>,
     pub summary: Vec<String>,
 }
@@ -30,6 +31,17 @@ pub struct BufferChange {
     pub delta: isize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferLifecycleChange {
+    pub name: String,
+    pub left_command_buffer_span: usize,
+    pub right_command_buffer_span: usize,
+    pub command_buffer_span_delta: isize,
+    pub left_dispatch_span: usize,
+    pub right_dispatch_span: usize,
+    pub dispatch_span_delta: isize,
+}
+
 pub fn diff_paths(left: impl AsRef<Path>, right: impl AsRef<Path>) -> Result<DiffReport> {
     let left = TraceBundle::open(left)?;
     let right = TraceBundle::open(right)?;
@@ -40,6 +52,7 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
     let left_report = analyze(left);
     let right_report = analyze(right);
     let buffer_changes = diff_buffer_stats(&left_report, &right_report);
+    let buffer_lifecycle_changes = diff_buffer_lifecycles(&left_report, &right_report);
     let kernel_changes = diff_kernel_stats(&left_report, &right_report);
     let mut summary = Vec::new();
 
@@ -97,6 +110,16 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
             change.name, change.left_uses, change.right_uses, change.delta
         ));
     }
+    if let Some(change) = buffer_lifecycle_changes.first() {
+        summary.push(format!(
+            "Largest buffer lifetime delta: {} (command buffers {} -> {}, dispatches {} -> {})",
+            change.name,
+            change.left_command_buffer_span,
+            change.right_command_buffer_span,
+            change.left_dispatch_span,
+            change.right_dispatch_span
+        ));
+    }
     if let Some(change) = kernel_changes.first() {
         summary.push(format!(
             "Largest kernel dispatch delta: {} ({} -> {}, delta {:+})",
@@ -111,6 +134,7 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
         left: left_report,
         right: right_report,
         buffer_changes,
+        buffer_lifecycle_changes,
         kernel_changes,
         summary,
     }
@@ -204,9 +228,83 @@ fn diff_kernel_stats(left: &AnalysisReport, right: &AnalysisReport) -> Vec<Kerne
     changes
 }
 
+fn diff_buffer_lifecycles(
+    left: &AnalysisReport,
+    right: &AnalysisReport,
+) -> Vec<BufferLifecycleChange> {
+    let mut names = std::collections::BTreeSet::new();
+    for stat in &left.buffer_lifecycles {
+        names.insert(stat.name.clone());
+    }
+    for stat in &right.buffer_lifecycles {
+        names.insert(stat.name.clone());
+    }
+
+    let left_map: std::collections::BTreeMap<_, _> = left
+        .buffer_lifecycles
+        .iter()
+        .map(|stat| {
+            (
+                stat.name.as_str(),
+                (stat.command_buffer_span, stat.dispatch_span),
+            )
+        })
+        .collect();
+    let right_map: std::collections::BTreeMap<_, _> = right
+        .buffer_lifecycles
+        .iter()
+        .map(|stat| {
+            (
+                stat.name.as_str(),
+                (stat.command_buffer_span, stat.dispatch_span),
+            )
+        })
+        .collect();
+
+    let mut changes = Vec::new();
+    for name in names {
+        let (left_command_buffer_span, left_dispatch_span) =
+            left_map.get(name.as_str()).copied().unwrap_or_default();
+        let (right_command_buffer_span, right_dispatch_span) =
+            right_map.get(name.as_str()).copied().unwrap_or_default();
+        if left_command_buffer_span == right_command_buffer_span
+            && left_dispatch_span == right_dispatch_span
+        {
+            continue;
+        }
+        let command_buffer_span_delta =
+            right_command_buffer_span as isize - left_command_buffer_span as isize;
+        let dispatch_span_delta = right_dispatch_span as isize - left_dispatch_span as isize;
+        changes.push(BufferLifecycleChange {
+            name,
+            left_command_buffer_span,
+            right_command_buffer_span,
+            command_buffer_span_delta,
+            left_dispatch_span,
+            right_dispatch_span,
+            dispatch_span_delta,
+        });
+    }
+    changes.sort_by(|left, right| {
+        right
+            .command_buffer_span_delta
+            .abs()
+            .cmp(&left.command_buffer_span_delta.abs())
+            .then_with(|| {
+                right
+                    .dispatch_span_delta
+                    .abs()
+                    .cmp(&left.dispatch_span_delta.abs())
+            })
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::BufferLifecycle;
     use crate::trace::{KernelStat, TraceSummary};
 
     #[test]
@@ -274,5 +372,92 @@ mod tests {
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0].name, "c");
         assert_eq!(changes[0].delta, 4);
+    }
+
+    #[test]
+    fn computes_buffer_lifecycle_deltas() {
+        let left = AnalysisReport {
+            trace: TraceSummary {
+                trace_name: "left".into(),
+                uuid: None,
+                capture_version: None,
+                graphics_api: None,
+                device_id: None,
+                capture_len: 0,
+                device_resource_count: 0,
+                device_resource_bytes: 0,
+            },
+            command_buffer_count: 0,
+            command_buffer_region_count: 0,
+            compute_encoder_count: 0,
+            dispatch_count: 0,
+            pipeline_function_count: 0,
+            kernel_count: 0,
+            buffer_count: 0,
+            kernel_stats: vec![],
+            buffer_stats: vec![],
+            buffer_lifecycles: vec![
+                BufferLifecycle {
+                    name: "a".into(),
+                    address: Some(1),
+                    first_command_buffer_index: 0,
+                    last_command_buffer_index: 0,
+                    first_dispatch_index: 0,
+                    last_dispatch_index: 1,
+                    command_buffer_span: 1,
+                    dispatch_span: 2,
+                    use_count: 2,
+                    kernel_count: 1,
+                },
+                BufferLifecycle {
+                    name: "b".into(),
+                    address: Some(2),
+                    first_command_buffer_index: 0,
+                    last_command_buffer_index: 1,
+                    first_dispatch_index: 0,
+                    last_dispatch_index: 3,
+                    command_buffer_span: 2,
+                    dispatch_span: 4,
+                    use_count: 3,
+                    kernel_count: 2,
+                },
+            ],
+            findings: vec![],
+        };
+        let right = AnalysisReport {
+            buffer_lifecycles: vec![
+                BufferLifecycle {
+                    name: "a".into(),
+                    address: Some(1),
+                    first_command_buffer_index: 0,
+                    last_command_buffer_index: 2,
+                    first_dispatch_index: 0,
+                    last_dispatch_index: 5,
+                    command_buffer_span: 3,
+                    dispatch_span: 6,
+                    use_count: 4,
+                    kernel_count: 2,
+                },
+                BufferLifecycle {
+                    name: "c".into(),
+                    address: Some(3),
+                    first_command_buffer_index: 1,
+                    last_command_buffer_index: 1,
+                    first_dispatch_index: 7,
+                    last_dispatch_index: 7,
+                    command_buffer_span: 1,
+                    dispatch_span: 1,
+                    use_count: 1,
+                    kernel_count: 1,
+                },
+            ],
+            ..left.clone()
+        };
+
+        let changes = diff_buffer_lifecycles(&left, &right);
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].name, "a");
+        assert_eq!(changes[0].command_buffer_span_delta, 2);
+        assert_eq!(changes[0].dispatch_span_delta, 4);
     }
 }
