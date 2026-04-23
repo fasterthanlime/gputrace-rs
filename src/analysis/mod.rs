@@ -1,11 +1,14 @@
 use serde::Serialize;
 
 use crate::buffers;
+use crate::timing;
 use crate::trace::{BufferAccessStat, BufferLifecycleStat, KernelStat, TraceBundle, TraceSummary};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnalysisReport {
     pub trace: TraceSummary,
+    pub timing_synthetic: bool,
+    pub total_duration_ns: u64,
     pub command_buffer_count: usize,
     pub command_buffer_region_count: usize,
     pub compute_encoder_count: usize,
@@ -21,10 +24,19 @@ pub struct AnalysisReport {
     pub buffer_inventory_bytes: u64,
     pub buffer_inventory_aliases: usize,
     pub kernel_stats: Vec<KernelStat>,
+    pub timed_kernel_stats: Vec<TimedKernelStat>,
     pub buffer_stats: Vec<BufferStat>,
     pub buffer_lifecycles: Vec<BufferLifecycle>,
     pub largest_buffers: Vec<InventoryBuffer>,
     pub findings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimedKernelStat {
+    pub name: String,
+    pub dispatch_count: usize,
+    pub duration_ns: u64,
+    pub percent_of_total: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +77,7 @@ pub struct InventoryBuffer {
 
 pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
     let summary = trace.summary();
+    let timing = timing::report(trace).ok();
     let command_buffers = trace.command_buffers().unwrap_or_default();
     let command_buffer_regions = trace.command_buffer_regions().unwrap_or_default();
     let compute_encoders = trace.compute_encoders().unwrap_or_default();
@@ -137,6 +150,21 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
         })
         .count();
     let inventory = buffers::analyze(trace).ok();
+    let timed_kernel_stats = timing
+        .as_ref()
+        .map(|report| {
+            report
+                .kernels
+                .iter()
+                .map(|kernel| TimedKernelStat {
+                    name: kernel.name.clone(),
+                    dispatch_count: kernel.dispatch_count,
+                    duration_ns: kernel.synthetic_duration_ns,
+                    percent_of_total: kernel.percent_of_total,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let largest_buffers = inventory
         .as_ref()
         .map(|inventory| {
@@ -174,6 +202,17 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
     ));
     findings.push(format!("Compute encoders: {}", compute_encoders.len()));
     findings.push(format!("Dispatch calls: {}", dispatches.len()));
+    if let Some(timing) = &timing {
+        findings.push(format!(
+            "Timing source: {} ({} ns total)",
+            if timing.synthetic {
+                "synthetic"
+            } else {
+                "profiler"
+            },
+            timing.total_duration_ns
+        ));
+    }
     if !pipeline_function_map.is_empty() {
         findings.push(format!(
             "Resolved {} pipeline-to-function mappings.",
@@ -191,6 +230,12 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
                 top_kernel.buffers.len()
             ));
         }
+    }
+    if let Some(top_timed_kernel) = timed_kernel_stats.first() {
+        findings.push(format!(
+            "Top timed kernel: {} ({} ns, {:.1}% of total)",
+            top_timed_kernel.name, top_timed_kernel.duration_ns, top_timed_kernel.percent_of_total
+        ));
     }
     if let Some(top_buffer) = buffer_stats.first() {
         findings.push(format!(
@@ -252,6 +297,14 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
 
     AnalysisReport {
         trace: summary,
+        timing_synthetic: timing
+            .as_ref()
+            .map(|report| report.synthetic)
+            .unwrap_or(true),
+        total_duration_ns: timing
+            .as_ref()
+            .map(|report| report.total_duration_ns)
+            .unwrap_or(0),
         command_buffer_count: command_buffers.len(),
         command_buffer_region_count: command_buffer_regions.len(),
         compute_encoder_count: compute_encoders.len(),
@@ -267,6 +320,7 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
         buffer_inventory_bytes: inventory.as_ref().map_or(0, |inv| inv.total_bytes),
         buffer_inventory_aliases: inventory.as_ref().map_or(0, |inv| inv.total_aliases),
         kernel_stats,
+        timed_kernel_stats,
         buffer_stats,
         buffer_lifecycles,
         largest_buffers,

@@ -20,6 +20,18 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
             ("Trace", report.trace.trace_name.clone()),
             ("Capture bytes", report.trace.capture_len.to_string()),
             (
+                "Timing source",
+                if report.timing_synthetic {
+                    "synthetic".to_owned()
+                } else {
+                    "profiler".to_owned()
+                },
+            ),
+            (
+                "Total kernel time",
+                format!("{} ns", report.total_duration_ns),
+            ),
+            (
                 "Device resources",
                 format!(
                     "{} files / {} bytes",
@@ -95,6 +107,19 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
                     stat.name,
                     stat.dispatch_count,
                     stat.buffers.len()
+                )
+            }),
+            10,
+        );
+    }
+    if !report.timed_kernel_stats.is_empty() {
+        push_section(
+            &mut out,
+            "Kernel Timing",
+            report.timed_kernel_stats.iter().map(|stat| {
+                format!(
+                    "- `{}`: {} ns, {:.1}% of total, {} dispatches\n",
+                    stat.name, stat.duration_ns, stat.percent_of_total, stat.dispatch_count
                 )
             }),
             10,
@@ -179,6 +204,24 @@ pub fn diff_report(report: &DiffReport) -> String {
                 format!(
                     "- `{}`: {} -> {} ({:+})\n",
                     change.name, change.left_dispatches, change.right_dispatches, change.delta
+                )
+            }),
+            10,
+        );
+    }
+    if !report.kernel_timing_changes.is_empty() {
+        push_section(
+            &mut out,
+            "Kernel Timing Changes",
+            report.kernel_timing_changes.iter().map(|change| {
+                format!(
+                    "- `{}`: {} -> {} ns ({:+} ns), {:.1}% -> {:.1}%\n",
+                    change.name,
+                    change.left_duration_ns,
+                    change.right_duration_ns,
+                    change.duration_delta_ns,
+                    change.left_percent_of_total,
+                    change.right_percent_of_total
                 )
             }),
             10,
@@ -272,9 +315,12 @@ fn buffer_change_status(status: crate::diff::BufferChangeStatus) -> &'static str
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::analysis::{AnalysisReport, BufferLifecycle, BufferStat, InventoryBuffer};
+    use crate::analysis::{
+        AnalysisReport, BufferLifecycle, BufferStat, InventoryBuffer, TimedKernelStat,
+    };
     use crate::diff::{
         BufferChange, BufferChangeStatus, BufferLifecycleChange, DiffReport, KernelChange,
+        KernelTimingChange,
     };
     use crate::trace::{KernelStat, TraceSummary};
 
@@ -299,6 +345,8 @@ mod tests {
                 device_resource_count: 2,
                 device_resource_bytes: 2048,
             },
+            timing_synthetic: false,
+            total_duration_ns: 12_345,
             command_buffer_count: 3,
             command_buffer_region_count: 3,
             compute_encoder_count: 4,
@@ -322,6 +370,12 @@ mod tests {
                     buffers: BTreeMap::new(),
                 })
                 .collect(),
+            timed_kernel_stats: vec![TimedKernelStat {
+                name: "kernel_0".into(),
+                dispatch_count: 1,
+                duration_ns: 500,
+                percent_of_total: 25.0,
+            }],
             buffer_stats: vec![BufferStat {
                 name: "buf".into(),
                 address: Some(1),
@@ -360,6 +414,7 @@ mod tests {
         assert!(rendered.contains("## Execution Summary"));
         assert!(rendered.contains("## Buffer Summary"));
         assert!(rendered.contains("## Findings"));
+        assert!(rendered.contains("## Kernel Timing"));
         assert!(rendered.contains("_Showing 10 of 11 entries._"));
         assert!(rendered.contains("- `kernel_0`: 1 dispatches, 0 buffers"));
     }
@@ -377,6 +432,8 @@ mod tests {
                 device_resource_count: 0,
                 device_resource_bytes: 0,
             },
+            timing_synthetic: false,
+            total_duration_ns: 1_000,
             command_buffer_count: 0,
             command_buffer_region_count: 0,
             compute_encoder_count: 0,
@@ -392,6 +449,7 @@ mod tests {
             buffer_inventory_bytes: 0,
             buffer_inventory_aliases: 0,
             kernel_stats: vec![],
+            timed_kernel_stats: vec![],
             buffer_stats: vec![],
             buffer_lifecycles: vec![],
             largest_buffers: vec![],
@@ -426,6 +484,14 @@ mod tests {
                 left_dispatch_span: 0,
                 right_dispatch_span: 4,
                 dispatch_span_delta: 4,
+            }],
+            kernel_timing_changes: vec![KernelTimingChange {
+                name: "kernel".into(),
+                left_duration_ns: 100,
+                right_duration_ns: 250,
+                duration_delta_ns: 150,
+                left_percent_of_total: 10.0,
+                right_percent_of_total: 25.0,
             }],
             kernel_changes: (0..11)
                 .map(|index| KernelChange {

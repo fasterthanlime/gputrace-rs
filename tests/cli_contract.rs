@@ -90,9 +90,77 @@ fn xcode_click_button_help_mentions_target() {
 }
 
 #[test]
+fn xcode_checkboxes_help_mentions_format() {
+    let help = render_help(&["xcode-checkboxes"]);
+    assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_close_help_mentions_format() {
+    let help = render_help(&["xcode-close"]);
+    assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_ensure_checked_help_mentions_target() {
+    let help = render_help(&["xcode-ensure-checked"]);
+    assert!(help.contains("<TARGET>"));
+}
+
+#[test]
 fn xcode_select_tab_help_mentions_target() {
     let help = render_help(&["xcode-select-tab"]);
     assert!(help.contains("<TARGET>"));
+}
+
+#[test]
+fn xcode_toggle_checkbox_help_mentions_target() {
+    let help = render_help(&["xcode-toggle-checkbox"]);
+    assert!(help.contains("<TARGET>"));
+}
+
+#[test]
+fn xcode_show_performance_help_mentions_format() {
+    let help = render_help(&["xcode-show-performance"]);
+    assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_show_summary_help_mentions_format() {
+    let help = render_help(&["xcode-show-summary"]);
+    assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_show_counters_help_mentions_format() {
+    let help = render_help(&["xcode-show-counters"]);
+    assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_show_memory_help_mentions_format() {
+    let help = render_help(&["xcode-show-memory"]);
+    assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_show_dependencies_help_mentions_format() {
+    let help = render_help(&["xcode-show-dependencies"]);
+    assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_export_counters_help_mentions_output() {
+    let help = render_help(&["xcode-export-counters"]);
+    assert!(help.contains("<OUTPUT>"));
+    assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_export_memory_help_mentions_output() {
+    let help = render_help(&["xcode-export-memory"]);
+    assert!(help.contains("<OUTPUT>"));
+    assert!(help.contains("--format"));
 }
 
 #[test]

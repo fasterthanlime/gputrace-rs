@@ -12,6 +12,7 @@ pub struct DiffReport {
     pub buffer_changes: Vec<BufferChange>,
     pub buffer_lifecycle_changes: Vec<BufferLifecycleChange>,
     pub kernel_changes: Vec<KernelChange>,
+    pub kernel_timing_changes: Vec<KernelTimingChange>,
     pub summary: Vec<String>,
 }
 
@@ -21,6 +22,16 @@ pub struct KernelChange {
     pub left_dispatches: usize,
     pub right_dispatches: usize,
     pub delta: isize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KernelTimingChange {
+    pub name: String,
+    pub left_duration_ns: u64,
+    pub right_duration_ns: u64,
+    pub duration_delta_ns: i64,
+    pub left_percent_of_total: f64,
+    pub right_percent_of_total: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +78,7 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
     let buffer_changes = diff_buffer_stats(&left_report, &right_report);
     let buffer_lifecycle_changes = diff_buffer_lifecycles(&left_report, &right_report);
     let kernel_changes = diff_kernel_stats(&left_report, &right_report);
+    let kernel_timing_changes = diff_kernel_timing_stats(&left_report, &right_report);
     let mut summary = Vec::new();
     let added_buffers = buffer_changes
         .iter()
@@ -117,6 +129,12 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
         summary.push(format!(
             "Dispatch count changed: {} -> {}",
             left_report.dispatch_count, right_report.dispatch_count
+        ));
+    }
+    if left_report.total_duration_ns != right_report.total_duration_ns {
+        summary.push(format!(
+            "Total kernel time changed: {} -> {} ns",
+            left_report.total_duration_ns, right_report.total_duration_ns
         ));
     }
     if left_report.buffer_count != right_report.buffer_count {
@@ -184,6 +202,15 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
             change.name, change.left_dispatches, change.right_dispatches, change.delta
         ));
     }
+    if let Some(change) = kernel_timing_changes.first() {
+        summary.push(format!(
+            "Largest kernel timing delta: {} ({} -> {} ns, delta {:+} ns)",
+            change.name,
+            change.left_duration_ns,
+            change.right_duration_ns,
+            change.duration_delta_ns
+        ));
+    }
     if summary.is_empty() {
         summary.push("No high-level differences detected yet.".to_owned());
     }
@@ -194,6 +221,7 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
         buffer_changes,
         buffer_lifecycle_changes,
         kernel_changes,
+        kernel_timing_changes,
         summary,
     }
 }
@@ -376,11 +404,65 @@ fn diff_buffer_lifecycles(
     changes
 }
 
+fn diff_kernel_timing_stats(
+    left: &AnalysisReport,
+    right: &AnalysisReport,
+) -> Vec<KernelTimingChange> {
+    let mut names = std::collections::BTreeSet::new();
+    for stat in &left.timed_kernel_stats {
+        names.insert(stat.name.clone());
+    }
+    for stat in &right.timed_kernel_stats {
+        names.insert(stat.name.clone());
+    }
+
+    let left_map: std::collections::BTreeMap<_, _> = left
+        .timed_kernel_stats
+        .iter()
+        .map(|stat| (stat.name.as_str(), stat))
+        .collect();
+    let right_map: std::collections::BTreeMap<_, _> = right
+        .timed_kernel_stats
+        .iter()
+        .map(|stat| (stat.name.as_str(), stat))
+        .collect();
+
+    let mut changes = Vec::new();
+    for name in names {
+        let left_stat = left_map.get(name.as_str()).copied();
+        let right_stat = right_map.get(name.as_str()).copied();
+        let left_duration_ns = left_stat.map_or(0, |stat| stat.duration_ns);
+        let right_duration_ns = right_stat.map_or(0, |stat| stat.duration_ns);
+        let left_percent_of_total = left_stat.map_or(0.0, |stat| stat.percent_of_total);
+        let right_percent_of_total = right_stat.map_or(0.0, |stat| stat.percent_of_total);
+        if left_duration_ns == right_duration_ns
+            && (left_percent_of_total - right_percent_of_total).abs() < f64::EPSILON
+        {
+            continue;
+        }
+        changes.push(KernelTimingChange {
+            name,
+            left_duration_ns,
+            right_duration_ns,
+            duration_delta_ns: right_duration_ns as i64 - left_duration_ns as i64,
+            left_percent_of_total,
+            right_percent_of_total,
+        });
+    }
+    changes.sort_by(|left, right| {
+        right
+            .duration_delta_ns
+            .abs()
+            .cmp(&left.duration_delta_ns.abs())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::BufferLifecycle;
-    use crate::analysis::BufferStat;
+    use crate::analysis::{BufferLifecycle, BufferStat, TimedKernelStat};
     use crate::trace::{KernelStat, TraceSummary};
 
     #[test]
@@ -396,6 +478,8 @@ mod tests {
                 device_resource_count: 0,
                 device_resource_bytes: 0,
             },
+            timing_synthetic: false,
+            total_duration_ns: 100,
             command_buffer_count: 0,
             command_buffer_region_count: 0,
             compute_encoder_count: 0,
@@ -426,6 +510,20 @@ mod tests {
                     buffers: Default::default(),
                 },
             ],
+            timed_kernel_stats: vec![
+                TimedKernelStat {
+                    name: "a".into(),
+                    dispatch_count: 2,
+                    duration_ns: 50,
+                    percent_of_total: 50.0,
+                },
+                TimedKernelStat {
+                    name: "b".into(),
+                    dispatch_count: 1,
+                    duration_ns: 20,
+                    percent_of_total: 20.0,
+                },
+            ],
             buffer_stats: vec![],
             buffer_lifecycles: vec![],
             largest_buffers: vec![],
@@ -448,6 +546,20 @@ mod tests {
                     buffers: Default::default(),
                 },
             ],
+            timed_kernel_stats: vec![
+                TimedKernelStat {
+                    name: "a".into(),
+                    dispatch_count: 5,
+                    duration_ns: 80,
+                    percent_of_total: 40.0,
+                },
+                TimedKernelStat {
+                    name: "c".into(),
+                    dispatch_count: 4,
+                    duration_ns: 90,
+                    percent_of_total: 45.0,
+                },
+            ],
             kernel_count: 2,
             ..left.clone()
         };
@@ -456,6 +568,11 @@ mod tests {
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0].name, "c");
         assert_eq!(changes[0].delta, 4);
+
+        let timing_changes = diff_kernel_timing_stats(&left, &right);
+        assert_eq!(timing_changes.len(), 3);
+        assert_eq!(timing_changes[0].name, "c");
+        assert_eq!(timing_changes[0].duration_delta_ns, 90);
     }
 
     #[test]
@@ -471,6 +588,8 @@ mod tests {
                 device_resource_count: 0,
                 device_resource_bytes: 0,
             },
+            timing_synthetic: true,
+            total_duration_ns: 0,
             command_buffer_count: 0,
             command_buffer_region_count: 0,
             compute_encoder_count: 0,
@@ -486,6 +605,7 @@ mod tests {
             buffer_inventory_bytes: 0,
             buffer_inventory_aliases: 0,
             kernel_stats: vec![],
+            timed_kernel_stats: vec![],
             buffer_stats: vec![BufferStat {
                 name: "a".into(),
                 address: Some(1),

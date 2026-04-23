@@ -67,12 +67,23 @@ enum CommandSet {
     Markdown(MarkdownArgs),
     Version(VersionArgs),
     XcodeButtons(XcodeTraceQueryArgs),
+    XcodeCheckboxes(XcodeTraceQueryArgs),
     XcodeClickButton(XcodeActionArgs),
+    XcodeClose(XcodeTraceQueryArgs),
+    XcodeEnsureChecked(XcodeActionArgs),
+    XcodeExportCounters(XcodeExportArgs),
+    XcodeExportMemory(XcodeExportArgs),
+    XcodeShowCounters(XcodeTraceQueryArgs),
+    XcodeShowDependencies(XcodeTraceQueryArgs),
+    XcodeShowMemory(XcodeTraceQueryArgs),
+    XcodeShowPerformance(XcodeTraceQueryArgs),
+    XcodeShowSummary(XcodeTraceQueryArgs),
     XcodeInspect(XcodeTraceQueryArgs),
     XcodeProfile(XcodeProfileArgs),
     XcodeSelectTab(XcodeActionArgs),
     XcodeStatus(XcodeTraceQueryArgs),
     XcodeTabs(XcodeTraceQueryArgs),
+    XcodeToggleCheckbox(XcodeActionArgs),
     XcodeUiElements(XcodeTraceQueryArgs),
     XcodeWait(XcodeWaitArgs),
     XcodeWindows(XcodeFormatArgs),
@@ -221,6 +232,15 @@ struct XcodeWaitArgs {
 #[derive(Debug, Args)]
 struct XcodeMenuItemsArgs {
     menu_path: Vec<String>,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct XcodeExportArgs {
+    #[arg(long)]
+    trace: Option<PathBuf>,
+    output: PathBuf,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -869,6 +889,14 @@ pub fn run() -> Result<()> {
                 _ => return Err(crate::Error::Unsupported("unknown xcode-buttons format")),
             }
         }
+        CommandSet::XcodeCheckboxes(args) => {
+            let report = automation::list_checkboxes(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_checkboxes(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-checkboxes format")),
+            }
+        }
         CommandSet::XcodeClickButton(args) => {
             let report = automation::click_button(args.trace.as_deref(), &[args.target.as_str()])?;
             match args.format.as_str() {
@@ -881,12 +909,128 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+        CommandSet::XcodeEnsureChecked(args) => {
+            let report = automation::ensure_checked(args.trace.as_deref(), &args.target)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_action(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-ensure-checked format",
+                    ));
+                }
+            }
+        }
+        CommandSet::XcodeClose(args) => {
+            let report = automation::close_window(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_action(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-close format")),
+            }
+        }
+        CommandSet::XcodeExportCounters(args) => {
+            let report = automation::export_counters(args.trace.as_deref(), &args.output)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_export(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-export-counters format",
+                    ));
+                }
+            }
+        }
+        CommandSet::XcodeExportMemory(args) => {
+            let report = automation::export_memory(args.trace.as_deref(), &args.output)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_export(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-export-memory format",
+                    ));
+                }
+            }
+        }
+        CommandSet::XcodeShowPerformance(args) => {
+            let report = automation::show_performance(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_action(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-show-performance format",
+                    ));
+                }
+            }
+        }
+        CommandSet::XcodeShowSummary(args) => {
+            let report = automation::show_summary(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_action(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-show-summary format",
+                    ));
+                }
+            }
+        }
+        CommandSet::XcodeShowCounters(args) => {
+            let report = automation::show_counters(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_action(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-show-counters format",
+                    ));
+                }
+            }
+        }
+        CommandSet::XcodeShowMemory(args) => {
+            let report = automation::show_memory(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_action(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-show-memory format",
+                    ));
+                }
+            }
+        }
+        CommandSet::XcodeShowDependencies(args) => {
+            let report = automation::show_dependencies(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_action(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-show-dependencies format",
+                    ));
+                }
+            }
+        }
         CommandSet::XcodeTabs(args) => {
             let report = automation::list_tabs(args.trace.as_deref())?;
             match args.format.as_str() {
                 "text" | "table" => print!("{}", format_xcode_tabs(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown xcode-tabs format")),
+            }
+        }
+        CommandSet::XcodeToggleCheckbox(args) => {
+            let report = automation::toggle_checkbox(args.trace.as_deref(), &args.target)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_action(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-toggle-checkbox format",
+                    ));
+                }
             }
         }
         CommandSet::XcodeSelectTab(args) => {
@@ -952,11 +1096,12 @@ pub fn run() -> Result<()> {
             if args.open_only {
                 automation::open_trace_in_xcode(&args.trace)?;
             } else {
-                automation::run_profile(&XcodeProfileRun {
+                let report = automation::run_profile(&XcodeProfileRun {
                     trace_path: args.trace,
                     output_path: args.output,
                     timeout_seconds: args.timeout_seconds,
                 })?;
+                print!("{}", format_xcode_export(&report));
             }
         }
     }
@@ -1047,10 +1192,49 @@ fn format_xcode_buttons(buttons: &[automation::XcodeButtonInfo]) -> String {
     out
 }
 
+fn format_xcode_checkboxes(checkboxes: &[automation::XcodeCheckboxInfo]) -> String {
+    if checkboxes.is_empty() {
+        return "No checkboxes found\n".to_owned();
+    }
+
+    let mut out = String::new();
+    for checkbox in checkboxes {
+        out.push_str(&format!(
+            "{} [{}; {}]{}\n",
+            checkbox.name,
+            if checkbox.checked {
+                "checked"
+            } else {
+                "unchecked"
+            },
+            if checkbox.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            checkbox
+                .description
+                .as_ref()
+                .map(|description| format!(" - {description}"))
+                .unwrap_or_default()
+        ));
+    }
+    out
+}
+
 fn format_xcode_action(result: &automation::XcodeActionResult) -> String {
     format!(
         "{}\n  action: {}\n  target: {}\n",
         result.window_title, result.action, result.target
+    )
+}
+
+fn format_xcode_export(result: &automation::XcodeExportResult) -> String {
+    format!(
+        "{}\n  export: {}\n  output: {}\n",
+        result.window_title,
+        result.export_kind,
+        result.output_path.display()
     )
 }
 

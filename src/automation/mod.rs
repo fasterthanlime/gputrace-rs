@@ -96,6 +96,15 @@ pub struct XcodeButtonInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XcodeCheckboxInfo {
+    pub window_title: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub checked: bool,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct XcodeTabInfo {
     pub window_title: String,
     pub role: String,
@@ -130,6 +139,13 @@ pub struct XcodeActionResult {
     pub target: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XcodeExportResult {
+    pub window_title: String,
+    pub export_kind: String,
+    pub output_path: PathBuf,
+}
+
 pub fn activate_xcode() -> Result<()> {
     run_osascript(r#"tell application "Xcode" to activate"#)?;
     Ok(())
@@ -148,6 +164,11 @@ pub fn inspect_window(trace_path: Option<&Path>) -> Result<Option<XcodeWindowSna
 pub fn list_buttons(trace_path: Option<&Path>) -> Result<Vec<XcodeButtonInfo>> {
     let raw = run_osascript(&build_buttons_script(trace_path))?;
     parse_buttons_output(&raw)
+}
+
+pub fn list_checkboxes(trace_path: Option<&Path>) -> Result<Vec<XcodeCheckboxInfo>> {
+    let raw = run_osascript(&build_checkboxes_script(trace_path))?;
+    parse_checkboxes_output(&raw)
 }
 
 pub fn list_tabs(trace_path: Option<&Path>) -> Result<Vec<XcodeTabInfo>> {
@@ -175,8 +196,99 @@ pub fn select_tab(trace_path: Option<&Path>, tab_name: &str) -> Result<XcodeActi
     parse_action_output(&raw)
 }
 
-pub fn run_profile(request: &XcodeProfileRun) -> Result<()> {
+pub fn click_menu_item(menu_path: &[&str]) -> Result<XcodeActionResult> {
+    let raw = run_osascript(&build_click_menu_item_script(menu_path))?;
+    parse_action_output(&raw)
+}
+
+pub fn close_window(trace_path: Option<&Path>) -> Result<XcodeActionResult> {
+    let raw = run_osascript(&build_close_window_script(trace_path))?;
+    parse_action_output(&raw)
+}
+
+pub fn ensure_checked(trace_path: Option<&Path>, checkbox_name: &str) -> Result<XcodeActionResult> {
+    let raw = run_osascript(&build_checkbox_action_script(
+        trace_path,
+        checkbox_name,
+        "ensure-checked",
+    ))?;
+    parse_action_output(&raw)
+}
+
+pub fn toggle_checkbox(
+    trace_path: Option<&Path>,
+    checkbox_name: &str,
+) -> Result<XcodeActionResult> {
+    let raw = run_osascript(&build_checkbox_action_script(
+        trace_path,
+        checkbox_name,
+        "toggle-checkbox",
+    ))?;
+    parse_action_output(&raw)
+}
+
+pub fn show_performance(trace_path: Option<&Path>) -> Result<XcodeActionResult> {
+    click_button(trace_path, &["Show Performance"])
+}
+
+pub fn show_dependencies(trace_path: Option<&Path>) -> Result<XcodeActionResult> {
+    click_button(trace_path, &["Show Dependencies"])
+}
+
+pub fn show_summary(trace_path: Option<&Path>) -> Result<XcodeActionResult> {
+    select_tab(trace_path, "Summary")
+}
+
+pub fn show_counters(trace_path: Option<&Path>) -> Result<XcodeActionResult> {
+    select_tab(trace_path, "Counters")
+}
+
+pub fn show_memory(trace_path: Option<&Path>) -> Result<XcodeActionResult> {
+    select_tab(trace_path, "Memory")
+}
+
+pub fn export_counters(trace_path: Option<&Path>, output_path: &Path) -> Result<XcodeExportResult> {
+    let output_path = prepare_export_output_path(output_path)?;
+    let trace_path = trace_path.map(validate_trace_path).transpose()?;
+
+    let _ = show_performance(trace_path.as_deref());
+    let _ = show_counters(trace_path.as_deref());
+    let _ = click_menu_item(&["Editor", "Export GPU Counters…"])
+        .or_else(|_| click_menu_item(&["Editor", "Export GPU Counters..."]))
+        .or_else(|_| click_menu_item(&["Editor", "Export GPU Counters"]))?;
+    let window_title = finish_export_sheet(output_path.as_path(), "gpu-counters")?;
+
+    Ok(XcodeExportResult {
+        window_title,
+        export_kind: "gpu-counters".to_owned(),
+        output_path,
+    })
+}
+
+pub fn export_memory(trace_path: Option<&Path>, output_path: &Path) -> Result<XcodeExportResult> {
+    let output_path = prepare_export_output_path(output_path)?;
+    let trace_path = trace_path.map(validate_trace_path).transpose()?;
+
+    let _ = show_performance(trace_path.as_deref());
+    let _ = show_memory(trace_path.as_deref());
+    let _ = click_menu_item(&["Editor", "Export Memory Report…"])
+        .or_else(|_| click_menu_item(&["Editor", "Export Memory Report..."]))
+        .or_else(|_| click_menu_item(&["Editor", "Export Memory Report"]))?;
+    let window_title = finish_export_sheet(output_path.as_path(), "memory-report")?;
+
+    Ok(XcodeExportResult {
+        window_title,
+        export_kind: "memory-report".to_owned(),
+        output_path,
+    })
+}
+
+pub fn run_profile(request: &XcodeProfileRun) -> Result<XcodeExportResult> {
     validate_trace_path(&request.trace_path)?;
+    let output_path = request
+        .output_path
+        .clone()
+        .unwrap_or_else(|| default_profile_output_path(&request.trace_path));
 
     open_trace_in_xcode_with_options(
         &request.trace_path,
@@ -233,13 +345,11 @@ pub fn run_profile(request: &XcodeProfileRun) -> Result<()> {
         }
     }
 
-    if request.output_path.is_some() {
-        return Err(Error::Unsupported(
-            "xcode-profile export/output automation is not implemented yet",
-        ));
-    }
+    let _ = show_performance(trace_path);
 
-    Ok(())
+    let export = export_profile_trace(trace_path, &output_path)?;
+    let _ = close_window(trace_path);
+    Ok(export)
 }
 
 pub fn run_osascript(script: &str) -> Result<String> {
@@ -382,6 +492,15 @@ fn run_open_command(path: &Path, launch_mode: XcodeLaunchMode) -> Result<Output>
     }
     command.arg(path);
     Ok(command.output()?)
+}
+
+fn default_profile_output_path(trace_path: &Path) -> PathBuf {
+    let parent = trace_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = trace_path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("trace");
+    parent.join(format!("{stem}-perfdata.gputrace"))
 }
 
 fn xcode_window_count() -> Result<u32> {
@@ -642,6 +761,51 @@ end tell
     )
 }
 
+fn build_checkboxes_script(trace_path: Option<&Path>) -> String {
+    let target_window = build_target_window_clause(trace_path, "not-running", false);
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+set recordSeparator to ASCII character 30
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        {target_window}
+
+        if targetWindow is missing value then
+            return ""
+        end if
+
+        set windowTitle to my element_name(targetWindow)
+        set outputLines to {{}}
+        set allElements to entire contents of targetWindow
+        repeat with elem in allElements
+            try
+                if my role_text(elem) is "AXCheckBox" then
+                    set checkboxName to my element_name(elem)
+                    set checkboxDescription to my optional_text(my attribute_text(elem, "AXDescription"))
+                    set checkedText to my boolean_text(my attribute_bool(elem, "AXValue"))
+                    set enabledText to my boolean_text(my attribute_bool(elem, "AXEnabled"))
+                    set end of outputLines to windowTitle & fieldSeparator & checkboxName & fieldSeparator & checkboxDescription & fieldSeparator & checkedText & fieldSeparator & enabledText
+                end if
+            end try
+        end repeat
+        return my join_records(outputLines, recordSeparator)
+    end tell
+end tell
+
+{helpers}
+"#,
+        app = XCODE_APP_NAME,
+        target_window = target_window,
+        helpers = common_applescript_helpers()
+    )
+}
+
 fn build_tabs_script(trace_path: Option<&Path>) -> String {
     let target_window = build_target_window_clause(trace_path, "not-running", false);
     format!(
@@ -772,6 +936,58 @@ end tell
     )
 }
 
+fn build_click_menu_item_script(menu_path: &[&str]) -> String {
+    if menu_path.len() < 2 {
+        return r#"error "menu path requires at least a menu bar item and one menu item""#
+            .to_owned();
+    }
+
+    let segments = menu_path
+        .iter()
+        .map(|segment| applescript_string_literal(OsStr::new(segment)))
+        .collect::<Vec<_>>();
+
+    let root = &segments[0];
+    let path_joined = segments.join(" & \">\" & ");
+    let mut traversal =
+        format!("        set currentMenu to menu 1 of menu bar item {root} of menu bar 1\n");
+    for segment in &segments[1..segments.len() - 1] {
+        traversal.push_str(&format!(
+            "        set currentMenu to menu 1 of menu item {segment} of currentMenu\n"
+        ));
+    }
+    let target = &segments[segments.len() - 1];
+
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+{traversal}
+        set targetItem to menu item {target} of currentMenu
+        if not my attribute_bool(targetItem, "AXEnabled") then
+            return "missing-action"
+        end if
+        click targetItem
+        return "{app}" & fieldSeparator & "click-menu-item" & fieldSeparator & ({path_joined})
+    end tell
+end tell
+
+{helpers}
+"#,
+        app = XCODE_APP_NAME,
+        traversal = traversal,
+        target = target,
+        path_joined = path_joined,
+        helpers = common_applescript_helpers()
+    )
+}
+
 fn build_ui_elements_script(trace_path: Option<&Path>) -> String {
     let target_window = build_target_window_clause(trace_path, "not-running", false);
     format!(
@@ -885,6 +1101,309 @@ return "missing-action"
         target_window = target_window,
         button_names = button_names
     )
+}
+
+fn build_close_window_script(trace_path: Option<&Path>) -> String {
+    let target_window = build_target_window_clause(trace_path, "missing-window", false);
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        {target_window}
+
+        if targetWindow is missing value then
+            return "missing-window"
+        end if
+
+        set windowTitle to my element_name(targetWindow)
+        try
+            click button 1 of targetWindow
+            return windowTitle & fieldSeparator & "close-window" & fieldSeparator & windowTitle
+        on error
+        end try
+
+        try
+            perform action "AXClose" of targetWindow
+            return windowTitle & fieldSeparator & "close-window" & fieldSeparator & windowTitle
+        on error
+            return "missing-action"
+        end try
+    end tell
+end tell
+"#,
+        app = XCODE_APP_NAME,
+        target_window = target_window
+    )
+}
+
+fn build_checkbox_action_script(
+    trace_path: Option<&Path>,
+    checkbox_name: &str,
+    mode: &str,
+) -> String {
+    let target_window = build_target_window_clause(trace_path, "missing-window", false);
+    let checkbox_name = applescript_string_literal(OsStr::new(checkbox_name));
+    let action = if mode == "ensure-checked" {
+        r#"
+                        if my attribute_bool(elem, "AXValue") then
+                            return windowTitle & fieldSeparator & "ensure-checked" & fieldSeparator & requestedName
+                        end if
+                        click elem
+                        delay 0.2
+                        if my attribute_bool(elem, "AXValue") then
+                            return windowTitle & fieldSeparator & "ensure-checked" & fieldSeparator & requestedName
+                        end if
+"#
+    } else {
+        r#"
+                        click elem
+                        delay 0.2
+                        return windowTitle & fieldSeparator & "toggle-checkbox" & fieldSeparator & requestedName
+"#
+    };
+
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        {target_window}
+
+        if targetWindow is missing value then
+            return "missing-window"
+        end if
+
+        set windowTitle to my element_name(targetWindow)
+        set requestedName to {checkbox_name}
+        set allElements to {{}}
+        try
+            set allElements to entire contents of targetWindow
+        end try
+
+        repeat with elem in allElements
+            try
+                if my role_text(elem) is "AXCheckBox" and my attribute_bool(elem, "AXEnabled") then
+                    set itemName to my element_name(elem)
+                    set itemDescription to my optional_text(my attribute_text(elem, "AXDescription"))
+                    if itemName contains requestedName or requestedName contains itemName or itemDescription contains requestedName then
+{action}                    end if
+                end if
+            end try
+        end repeat
+    end tell
+end tell
+
+return "missing-action"
+
+{helpers}
+"#,
+        app = XCODE_APP_NAME,
+        target_window = target_window,
+        checkbox_name = checkbox_name,
+        action = action,
+        helpers = common_applescript_helpers()
+    )
+}
+
+fn build_save_export_script(output_dir: &Path, output_name: &OsStr) -> String {
+    let output_dir = applescript_string_literal(output_dir.as_os_str());
+    let output_name = applescript_string_literal(output_name);
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+
+tell application "{app}"
+    activate
+end tell
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        set frontmost to true
+
+        set saveSheet to missing value
+        repeat with attempt from 1 to 40
+            try
+                if exists sheet 1 of window 1 then
+                    set saveSheet to sheet 1 of window 1
+                    exit repeat
+                end if
+            end try
+            delay 0.25
+        end repeat
+
+        if saveSheet is missing value then
+            return "missing-window"
+        end if
+
+        set windowTitle to my element_name(window 1)
+
+        keystroke "g" using {{command down, shift down}}
+        delay 0.4
+        keystroke {output_dir}
+        delay 0.2
+        key code 36
+        delay 0.8
+
+        keystroke "a" using {{command down}}
+        delay 0.2
+        keystroke {output_name}
+        delay 0.3
+
+        repeat with elem in entire contents of saveSheet
+            try
+                if my role_text(elem) is "AXCheckBox" then
+                    set checkName to my element_name(elem)
+                    if checkName contains "performance" or checkName contains "Embed" then
+                        if not (my attribute_bool(elem, "AXValue")) then
+                            click elem
+                        end if
+                    end if
+                end if
+            end try
+        end repeat
+
+        repeat with requestedName in {{"Save", "Export"}}
+            repeat with elem in entire contents of saveSheet
+                try
+                    if my role_text(elem) is "AXButton" and my element_name(elem) is requestedName and my attribute_bool(elem, "AXEnabled") then
+                        click elem
+                        delay 0.5
+                        repeat with replaceElem in entire contents of window 1
+                            try
+                                if my role_text(replaceElem) is "AXButton" and my element_name(replaceElem) is "Replace" and my attribute_bool(replaceElem, "AXEnabled") then
+                                    click replaceElem
+                                    exit repeat
+                                end if
+                            end try
+                        end repeat
+                        return windowTitle & fieldSeparator & "save-export" & fieldSeparator & {output_name}
+                    end if
+                end try
+            end repeat
+        end repeat
+    end tell
+end tell
+
+return "missing-action"
+
+{helpers}
+"#,
+        app = XCODE_APP_NAME,
+        output_dir = output_dir,
+        output_name = output_name,
+        helpers = common_applescript_helpers()
+    )
+}
+
+fn prepare_export_output_path(output_path: &Path) -> Result<PathBuf> {
+    let output_path = output_path.to_path_buf();
+    let parent = output_path.parent().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "export path has no parent directory: {}",
+            output_path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    if output_path.exists() {
+        let metadata = output_path.metadata()?;
+        if metadata.is_dir() {
+            std::fs::remove_dir_all(&output_path)?;
+        } else {
+            std::fs::remove_file(&output_path)?;
+        }
+    }
+    Ok(output_path)
+}
+
+fn finish_export_sheet(output_path: &Path, export_kind: &str) -> Result<String> {
+    let parent = output_path.parent().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "export path has no parent directory: {}",
+            output_path.display()
+        ))
+    })?;
+    let file_name = output_path.file_name().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "export path has no file name: {}",
+            output_path.display()
+        ))
+    })?;
+    let raw = run_osascript(&build_save_export_script(parent, file_name))?;
+    let action = parse_action_output(&raw)?;
+    wait_for_export_path(output_path, Duration::from_secs(30))?;
+    if action.target != file_name.to_string_lossy() {
+        return Err(Error::InvalidInput(format!(
+            "unexpected {export_kind} export target: {}",
+            action.target
+        )));
+    }
+    Ok(action.window_title)
+}
+
+fn export_profile_trace(
+    trace_path: Option<&Path>,
+    output_path: &Path,
+) -> Result<XcodeExportResult> {
+    let output_path = prepare_export_output_path(output_path)?;
+    let _ = click_menu_item(&["File", "Export…"])
+        .or_else(|_| click_menu_item(&["File", "Export..."]))
+        .or_else(|_| click_menu_item(&["File", "Export"]))?;
+    let window_title = finish_export_sheet(output_path.as_path(), "profile-trace")?;
+    Ok(XcodeExportResult {
+        window_title,
+        export_kind: trace_path
+            .and_then(Path::file_name)
+            .map(|_| "profile-trace")
+            .unwrap_or("profile-trace")
+            .to_owned(),
+        output_path,
+    })
+}
+
+fn wait_for_export_path(output_path: &Path, timeout: Duration) -> Result<()> {
+    let file_name = output_path
+        .file_name()
+        .ok_or_else(|| {
+            Error::InvalidInput(format!("missing file name: {}", output_path.display()))
+        })?
+        .to_owned();
+    let mut candidates = vec![output_path.to_path_buf()];
+    if let Some(parent) = output_path.parent() {
+        if let Ok(resolved_parent) = std::fs::canonicalize(parent) {
+            let resolved = resolved_parent.join(&file_name);
+            if resolved != output_path {
+                candidates.push(resolved);
+            }
+        }
+    }
+
+    let found = wait_for_condition(timeout, Duration::from_millis(500), || {
+        Ok(candidates.iter().any(|candidate| candidate.exists()))
+    })?;
+
+    if found {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "timed out waiting for export output: {}",
+            output_path.display()
+        )))
+    }
 }
 
 fn build_select_tab_script(trace_path: Option<&Path>, tab_name: &str) -> String {
@@ -1256,6 +1775,21 @@ fn parse_buttons_output(raw: &str) -> Result<Vec<XcodeButtonInfo>> {
         .collect()
 }
 
+fn parse_checkboxes_output(raw: &str) -> Result<Vec<XcodeCheckboxInfo>> {
+    parse_records(raw, 5)?
+        .into_iter()
+        .map(|columns| {
+            Ok(XcodeCheckboxInfo {
+                window_title: columns[0].clone(),
+                name: columns[1].clone(),
+                description: optional_string(&columns[2]),
+                checked: parse_bool(&columns[3])?,
+                enabled: parse_bool(&columns[4])?,
+            })
+        })
+        .collect()
+}
+
 fn parse_tabs_output(raw: &str) -> Result<Vec<XcodeTabInfo>> {
     parse_records(raw, 6)?
         .into_iter()
@@ -1481,6 +2015,14 @@ mod tests {
     }
 
     #[test]
+    fn build_checkboxes_script_targets_named_trace() {
+        let script = build_checkboxes_script(Some(Path::new("/tmp/Profile Trace.gputrace")));
+        assert!(script.contains("Profile Trace.gputrace"));
+        assert!(script.contains("AXCheckBox"));
+        assert!(script.contains("AXDescription"));
+    }
+
+    #[test]
     fn build_menu_items_script_supports_nested_paths() {
         let script = build_menu_items_script(&["Editor", "Performance"]);
         assert!(script.contains("menu bar item \"Editor\" of menu bar 1"));
@@ -1534,6 +2076,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_checkboxes_output_decodes_checked_state() {
+        let raw = record(&["Trace A", "Profile after replay", "", "true", "true"]);
+        let checkboxes = parse_checkboxes_output(&raw).unwrap();
+        assert_eq!(checkboxes.len(), 1);
+        assert_eq!(checkboxes[0].name, "Profile after replay");
+        assert!(checkboxes[0].checked);
+        assert!(checkboxes[0].enabled);
+    }
+
+    #[test]
     fn parse_tabs_output_decodes_selection() {
         let raw = record(&[
             "Trace A",
@@ -1566,6 +2118,41 @@ mod tests {
         assert!(script.contains("Profile Trace.gputrace"));
         assert!(script.contains("\"Counters\""));
         assert!(script.contains("select-tab"));
+    }
+
+    #[test]
+    fn build_click_menu_item_script_traverses_nested_menus() {
+        let script = build_click_menu_item_script(&["Editor", "Export GPU Counters..."]);
+        assert!(script.contains("menu bar item \"Editor\" of menu bar 1"));
+        assert!(script.contains("menu item \"Export GPU Counters...\" of currentMenu"));
+        assert!(script.contains("click-menu-item"));
+    }
+
+    #[test]
+    fn build_close_window_script_targets_named_trace() {
+        let script = build_close_window_script(Some(Path::new("/tmp/Profile Trace.gputrace")));
+        assert!(script.contains("Profile Trace.gputrace"));
+        assert!(script.contains("close-window"));
+    }
+
+    #[test]
+    fn build_checkbox_action_script_targets_requested_checkbox() {
+        let script = build_checkbox_action_script(
+            Some(Path::new("/tmp/Profile Trace.gputrace")),
+            "Profile after replay",
+            "ensure-checked",
+        );
+        assert!(script.contains("Profile Trace.gputrace"));
+        assert!(script.contains("Profile after replay"));
+        assert!(script.contains("ensure-checked"));
+    }
+
+    #[test]
+    fn build_save_export_script_includes_output_location() {
+        let script = build_save_export_script(Path::new("/tmp/out"), OsStr::new("trace.gputrace"));
+        assert!(script.contains("/tmp/out"));
+        assert!(script.contains("trace.gputrace"));
+        assert!(script.contains("save-export"));
     }
 
     #[test]
@@ -1621,5 +2208,11 @@ mod tests {
             None
         );
         assert_eq!(parse_window_snapshot_output("not-running").unwrap(), None);
+    }
+
+    #[test]
+    fn default_profile_output_path_appends_perfdata_suffix() {
+        let output = default_profile_output_path(Path::new("/tmp/My Trace.gputrace"));
+        assert_eq!(output, Path::new("/tmp/My Trace-perfdata.gputrace"));
     }
 }
