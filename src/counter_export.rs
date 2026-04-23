@@ -34,6 +34,8 @@ pub struct CounterExportRow {
     pub execution_cost_samples: usize,
     pub sample_count: usize,
     pub avg_sampling_density: Option<f64>,
+    pub occupancy_percent: Option<f64>,
+    pub occupancy_confidence: Option<f64>,
     pub occupancy_manager_percent: Option<f64>,
     pub alu_utilization_percent: Option<f64>,
     pub shader_launch_limiter_percent: Option<f64>,
@@ -69,6 +71,7 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
     let mut execution_cost_by_name = BTreeMap::<String, (f64, usize)>::new();
     let mut sample_stats_by_name = BTreeMap::<String, (usize, f64, usize)>::new();
     let mut pipeline_stats_by_name = BTreeMap::<String, profiler::ProfilerPipelineStats>::new();
+    let mut occupancy_by_encoder = BTreeMap::<usize, (f64, f64)>::new();
     if let Some(summary) = &profiler_summary {
         for cost in &summary.execution_costs {
             let name = cost
@@ -95,6 +98,12 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
                     .entry(name.clone())
                     .or_insert_with(|| stats.clone());
             }
+        }
+        for occupancy in &summary.occupancies {
+            occupancy_by_encoder.insert(
+                occupancy.encoder_index,
+                (occupancy.occupancy_percent, occupancy.confidence),
+            );
         }
     }
 
@@ -149,6 +158,7 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             .as_ref()
             .and_then(|name| pipeline_stats_by_name.get(name));
         let limiter = limiters_by_encoder.get(&encoder.index);
+        let occupancy = occupancy_by_encoder.get(&encoder.index).copied();
 
         rows.push(CounterExportRow {
             row_index: rows.len(),
@@ -174,6 +184,8 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             execution_cost_samples,
             sample_count,
             avg_sampling_density,
+            occupancy_percent: occupancy.map(|(percent, _)| percent),
+            occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
             occupancy_manager_percent: limiter.and_then(|limiter| limiter.occupancy_manager),
             alu_utilization_percent: limiter.and_then(|limiter| limiter.alu_utilization),
             shader_launch_limiter_percent: limiter
@@ -225,11 +237,11 @@ pub fn format_report(report: &CounterExportReport) -> String {
         report.total_rows
     ));
     out.push_str(
-        "row cb enc label kernel source duration_ns dispatches exec% samples occ_mgr alu llc dev_bw regs spills inst\n",
+        "row cb enc label kernel source duration_ns dispatches exec% samples occ occ_mgr alu llc dev_bw regs spills inst\n",
     );
     for row in &report.rows {
         out.push_str(&format!(
-            "{:>3} {:>2} {:>3} {:<16} {:<20} {:<14} {:>12} {:>10} {:>6} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6} {:>6} {:>6}\n",
+            "{:>3} {:>2} {:>3} {:<16} {:<20} {:<14} {:>12} {:>10} {:>6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {:>6} {:>6} {:>6}\n",
             row.row_index,
             row.command_buffer_index,
             row.encoder_index,
@@ -244,6 +256,9 @@ pub fn format_report(report: &CounterExportReport) -> String {
                 .map(|value| format!("{value:.2}"))
                 .unwrap_or_else(|| "-".to_owned()),
             row.sample_count,
+            row.occupancy_percent
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "-".to_owned()),
             row.occupancy_manager_percent
                 .map(|value| format!("{value:.1}"))
                 .unwrap_or_else(|| "-".to_owned()),
@@ -272,7 +287,7 @@ pub fn format_report(report: &CounterExportReport) -> String {
 
 pub fn format_csv(report: &CounterExportReport) -> String {
     let mut out = String::new();
-    out.push_str("row_index,command_buffer_index,encoder_index,encoder_label,kernel_name,pipeline_addr,start_time_ns,end_time_ns,duration_ns,dispatch_count,metric_source,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_manager_percent,alu_utilization_percent,shader_launch_limiter_percent,instruction_throughput_percent,integer_complex_percent,f32_limiter_percent,l1_cache_percent,last_level_cache_percent,control_flow_percent,device_memory_bandwidth_gbps,buffer_l1_read_bandwidth_gbps,buffer_l1_write_bandwidth_gbps,temporary_register_count,uniform_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms\n");
+    out.push_str("row_index,command_buffer_index,encoder_index,encoder_label,kernel_name,pipeline_addr,start_time_ns,end_time_ns,duration_ns,dispatch_count,metric_source,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,occupancy_manager_percent,alu_utilization_percent,shader_launch_limiter_percent,instruction_throughput_percent,integer_complex_percent,f32_limiter_percent,l1_cache_percent,last_level_cache_percent,control_flow_percent,device_memory_bandwidth_gbps,buffer_l1_read_bandwidth_gbps,buffer_l1_write_bandwidth_gbps,temporary_register_count,uniform_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms\n");
     for row in &report.rows {
         let columns = vec![
             row.row_index.to_string(),
@@ -292,6 +307,8 @@ pub fn format_csv(report: &CounterExportReport) -> String {
             row.execution_cost_samples.to_string(),
             row.sample_count.to_string(),
             option_csv(row.avg_sampling_density),
+            option_csv(row.occupancy_percent),
+            option_csv(row.occupancy_confidence),
             option_csv(row.occupancy_manager_percent),
             option_csv(row.alu_utilization_percent),
             option_csv(row.shader_launch_limiter_percent),
@@ -365,6 +382,8 @@ mod tests {
                 execution_cost_samples: 4,
                 sample_count: 6,
                 avg_sampling_density: Some(0.3),
+                occupancy_percent: Some(37.5),
+                occupancy_confidence: Some(0.8),
                 occupancy_manager_percent: Some(80.0),
                 alu_utilization_percent: Some(60.0),
                 shader_launch_limiter_percent: Some(12.0),

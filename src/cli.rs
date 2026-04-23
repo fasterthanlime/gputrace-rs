@@ -26,6 +26,7 @@ use crate::shaders;
 use crate::timeline;
 use crate::timing;
 use crate::trace::{RecordType, TraceBundle};
+use crate::xcode_counters;
 
 #[derive(Debug, Parser)]
 #[command(name = "gputrace")]
@@ -44,6 +45,7 @@ enum CommandSet {
     ClearBuffers(ClearBuffersArgs),
     DumpRecords(DumpRecordsArgs),
     ExportCounters(ExportCountersArgs),
+    ValidateCounters(ValidateCountersArgs),
     Fences(FencesArgs),
     Mtlb(MtlbArgs),
     MtlbInventory(MtlbPathArgs),
@@ -70,6 +72,7 @@ enum CommandSet {
     Markdown(MarkdownArgs),
     Version(VersionArgs),
     XcodeButtons(XcodeTraceQueryArgs),
+    XcodeCounters(XcodeCountersArgs),
     XcodeCheckPermissions(XcodePermissionArgs),
     XcodeCheckboxes(XcodeTraceQueryArgs),
     XcodeClickButton(XcodeActionArgs),
@@ -174,6 +177,17 @@ struct ExportCountersArgs {
 }
 
 #[derive(Debug, Args)]
+struct ValidateCountersArgs {
+    trace: PathBuf,
+    #[arg(long)]
+    csv: Option<PathBuf>,
+    #[arg(long, default_value_t = 0.5)]
+    tolerance: f64,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
 struct MtlbArgs {
     path: PathBuf,
     #[arg(short, long, default_value = "text")]
@@ -218,6 +232,19 @@ struct XcodeTraceQueryArgs {
     trace: Option<PathBuf>,
     #[arg(short, long, default_value = "text")]
     format: String,
+}
+
+#[derive(Debug, Args)]
+struct XcodeCountersArgs {
+    trace: PathBuf,
+    #[arg(long)]
+    csv: Option<PathBuf>,
+    #[arg(short, long, default_value = "summary")]
+    format: String,
+    #[arg(long)]
+    metric: Option<String>,
+    #[arg(long)]
+    top: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -573,6 +600,25 @@ pub fn run() -> Result<()> {
                 "csv" => print!("{}", counter_export::format_csv(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown export-counters format")),
+            }
+        }
+        CommandSet::ValidateCounters(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = xcode_counters::validate(&trace, args.csv, args.tolerance)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", xcode_counters::format_validation(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown validate-counters format",
+                    ));
+                }
+            }
+            if report.mismatches > 0 {
+                return Err(crate::Error::InvalidInput(format!(
+                    "counter validation found {} mismatches",
+                    report.mismatches
+                )));
             }
         }
         CommandSet::Mtlb(args) => {
@@ -947,6 +993,23 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", format_xcode_buttons(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown xcode-buttons format")),
+            }
+        }
+        CommandSet::XcodeCounters(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = xcode_counters::parse(&trace, args.csv)?;
+            match args.format.as_str() {
+                "summary" | "text" | "table" => print!(
+                    "{}",
+                    xcode_counters::format_summary(&report, args.metric.as_deref(), args.top)
+                ),
+                "detailed" => print!(
+                    "{}",
+                    xcode_counters::format_detailed(&report, args.metric.as_deref(), args.top)
+                ),
+                "metrics" => print!("{}", xcode_counters::format_metric_inventory(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-counters format")),
             }
         }
         CommandSet::XcodeCheckPermissions(args) => {

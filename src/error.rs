@@ -22,6 +22,8 @@ pub enum Error {
     Plist(#[from] plist::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Csv(#[from] csv::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

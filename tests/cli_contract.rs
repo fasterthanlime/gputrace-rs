@@ -27,8 +27,10 @@ fn top_level_help_lists_current_analysis_commands() {
         "api-calls",
         "dump-records",
         "export-counters",
+        "validate-counters",
         "profiler",
         "mtlb-functions",
+        "xcode-counters",
         "xcode-windows",
         "buffers",
     ] {
@@ -81,10 +83,28 @@ fn export_counters_help_mentions_trace_and_formats() {
 }
 
 #[test]
+fn validate_counters_help_mentions_csv_and_tolerance() {
+    let help = render_help(&["validate-counters"]);
+
+    assert!(help.contains("<TRACE>"));
+    assert!(help.contains("--csv <CSV>"));
+    assert!(help.contains("--tolerance <TOLERANCE>"));
+}
+
+#[test]
 fn xcode_status_help_keeps_trace_and_format_flags() {
     let help = render_help(&["xcode-status"]);
     assert!(help.contains("xcode-status"));
     assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_counters_help_mentions_metric_and_top() {
+    let help = render_help(&["xcode-counters"]);
+    assert!(help.contains("<TRACE>"));
+    assert!(help.contains("--metric <METRIC>"));
+    assert!(help.contains("--top <TOP>"));
+    assert!(help.contains("[default: summary]"));
 }
 
 #[test]
