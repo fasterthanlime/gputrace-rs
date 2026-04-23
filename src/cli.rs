@@ -67,10 +67,14 @@ enum CommandSet {
     Markdown(MarkdownArgs),
     Version(VersionArgs),
     XcodeButtons(XcodeTraceQueryArgs),
+    XcodeClickButton(XcodeActionArgs),
     XcodeInspect(XcodeTraceQueryArgs),
     XcodeProfile(XcodeProfileArgs),
+    XcodeSelectTab(XcodeActionArgs),
+    XcodeStatus(XcodeTraceQueryArgs),
     XcodeTabs(XcodeTraceQueryArgs),
     XcodeUiElements(XcodeTraceQueryArgs),
+    XcodeWait(XcodeWaitArgs),
     XcodeWindows(XcodeFormatArgs),
     XcodeMenuItems(XcodeMenuItemsArgs),
 }
@@ -190,6 +194,26 @@ struct XcodeFormatArgs {
 #[derive(Debug, Args)]
 struct XcodeTraceQueryArgs {
     trace: Option<PathBuf>,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct XcodeActionArgs {
+    #[arg(long)]
+    trace: Option<PathBuf>,
+    target: String,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct XcodeWaitArgs {
+    trace: Option<PathBuf>,
+    #[arg(long, default_value_t = 300)]
+    timeout_seconds: u64,
+    #[arg(long, default_value = "complete")]
+    status: String,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -845,12 +869,34 @@ pub fn run() -> Result<()> {
                 _ => return Err(crate::Error::Unsupported("unknown xcode-buttons format")),
             }
         }
+        CommandSet::XcodeClickButton(args) => {
+            let report = automation::click_button(args.trace.as_deref(), &[args.target.as_str()])?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_action(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-click-button format",
+                    ));
+                }
+            }
+        }
         CommandSet::XcodeTabs(args) => {
             let report = automation::list_tabs(args.trace.as_deref())?;
             match args.format.as_str() {
                 "text" | "table" => print!("{}", format_xcode_tabs(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown xcode-tabs format")),
+            }
+        }
+        CommandSet::XcodeSelectTab(args) => {
+            let report = automation::select_tab(args.trace.as_deref(), &args.target)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_action(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported("unknown xcode-select-tab format"));
+                }
             }
         }
         CommandSet::XcodeUiElements(args) => {
@@ -876,6 +922,27 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", format_xcode_menu_items(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown xcode-menu-items format")),
+            }
+        }
+        CommandSet::XcodeStatus(args) => {
+            let report = automation::get_window_status(args.trace.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_status(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-status format")),
+            }
+        }
+        CommandSet::XcodeWait(args) => {
+            let accepted = parse_wait_statuses(&args.status)?;
+            let report = automation::wait_for_status(
+                std::time::Duration::from_secs(args.timeout_seconds.max(1)),
+                args.trace.as_deref(),
+                &accepted,
+            )?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", format_xcode_status(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-wait format")),
             }
         }
         CommandSet::XcodeProfile(args) => {
@@ -980,6 +1047,17 @@ fn format_xcode_buttons(buttons: &[automation::XcodeButtonInfo]) -> String {
     out
 }
 
+fn format_xcode_action(result: &automation::XcodeActionResult) -> String {
+    format!(
+        "{}\n  action: {}\n  target: {}\n",
+        result.window_title, result.action, result.target
+    )
+}
+
+fn format_xcode_status(status: &automation::XcodeWindowStatus) -> String {
+    format!("status: {:?}\nraw: {}\n", status.status, status.raw)
+}
+
 fn format_xcode_tabs(tabs: &[automation::XcodeTabInfo]) -> String {
     if tabs.is_empty() {
         return "No tabs found\n".to_owned();
@@ -1000,6 +1078,36 @@ fn format_xcode_tabs(tabs: &[automation::XcodeTabInfo]) -> String {
         out.push('\n');
     }
     out
+}
+
+fn parse_wait_statuses(raw: &str) -> Result<Vec<automation::XcodeAutomationStatus>> {
+    let mut statuses = Vec::new();
+    for segment in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+    {
+        let status = match segment {
+            "not-running" => automation::XcodeAutomationStatus::NotRunning,
+            "initializing" => automation::XcodeAutomationStatus::Initializing,
+            "replay-ready" => automation::XcodeAutomationStatus::ReplayReady,
+            "running" => automation::XcodeAutomationStatus::Running,
+            "complete" => automation::XcodeAutomationStatus::Complete,
+            "unknown" => automation::XcodeAutomationStatus::Unknown,
+            other => {
+                return Err(crate::Error::InvalidInput(format!(
+                    "unknown Xcode status: {other}"
+                )));
+            }
+        };
+        statuses.push(status);
+    }
+    if statuses.is_empty() {
+        return Err(crate::Error::InvalidInput(
+            "at least one Xcode status is required".to_owned(),
+        ));
+    }
+    Ok(statuses)
 }
 
 fn format_xcode_menu_items(items: &[automation::XcodeMenuItemInfo]) -> String {

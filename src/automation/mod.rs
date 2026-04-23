@@ -61,7 +61,7 @@ impl XcodeAutomationStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct XcodeWindowStatus {
     pub status: XcodeAutomationStatus,
     pub raw: String,
@@ -123,6 +123,13 @@ pub struct XcodeUiElementInfo {
     pub enabled: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XcodeActionResult {
+    pub window_title: String,
+    pub action: String,
+    pub target: String,
+}
+
 pub fn activate_xcode() -> Result<()> {
     run_osascript(r#"tell application "Xcode" to activate"#)?;
     Ok(())
@@ -158,6 +165,16 @@ pub fn list_ui_elements(trace_path: Option<&Path>) -> Result<Vec<XcodeUiElementI
     parse_ui_elements_output(&raw)
 }
 
+pub fn click_button(trace_path: Option<&Path>, button_names: &[&str]) -> Result<XcodeActionResult> {
+    let raw = run_osascript(&build_click_button_script(trace_path, button_names))?;
+    parse_action_output(&raw)
+}
+
+pub fn select_tab(trace_path: Option<&Path>, tab_name: &str) -> Result<XcodeActionResult> {
+    let raw = run_osascript(&build_select_tab_script(trace_path, tab_name))?;
+    parse_action_output(&raw)
+}
+
 pub fn run_profile(request: &XcodeProfileRun) -> Result<()> {
     validate_trace_path(&request.trace_path)?;
 
@@ -170,9 +187,59 @@ pub fn run_profile(request: &XcodeProfileRun) -> Result<()> {
         },
     )?;
 
-    Err(Error::Unsupported(
-        "xcode-profile replay/export automation is not implemented yet; only open and wait helpers are available",
-    ))
+    let _ = dismiss_startup_dialogs();
+    let trace_path = Some(request.trace_path.as_path());
+    let status = get_window_status(trace_path)?;
+    if !matches!(
+        status.status,
+        XcodeAutomationStatus::ReplayReady
+            | XcodeAutomationStatus::Complete
+            | XcodeAutomationStatus::Running
+    ) {
+        let _ = wait_for_status(
+            Duration::from_secs(request.timeout_seconds.max(1)),
+            trace_path,
+            &[
+                XcodeAutomationStatus::ReplayReady,
+                XcodeAutomationStatus::Complete,
+                XcodeAutomationStatus::Running,
+            ],
+        )?;
+    }
+
+    let status = get_window_status(trace_path)?;
+    match status.status {
+        XcodeAutomationStatus::ReplayReady => {
+            let _ = click_button(trace_path, &["Profile", "Replay"])?;
+            let _ = wait_for_status(
+                Duration::from_secs(request.timeout_seconds.max(1)),
+                trace_path,
+                &[XcodeAutomationStatus::Complete],
+            )?;
+        }
+        XcodeAutomationStatus::Running => {
+            let _ = wait_for_status(
+                Duration::from_secs(request.timeout_seconds.max(1)),
+                trace_path,
+                &[XcodeAutomationStatus::Complete],
+            )?;
+        }
+        XcodeAutomationStatus::Complete => {}
+        _ => {
+            return Err(Error::InvalidInput(format!(
+                "Xcode trace window is not ready to profile: {}",
+                status.raw
+            )));
+        }
+    }
+
+    if request.output_path.is_some() {
+        return Err(Error::Unsupported(
+            "xcode-profile export/output automation is not implemented yet",
+        ));
+    }
+
+    Ok(())
 }
 
 pub fn run_osascript(script: &str) -> Result<String> {
@@ -767,6 +834,107 @@ end collect_children
     )
 }
 
+fn build_click_button_script(trace_path: Option<&Path>, button_names: &[&str]) -> String {
+    let target_window = build_target_window_clause(trace_path, "missing-window", false);
+    let button_names = button_names
+        .iter()
+        .map(|name| applescript_string_literal(OsStr::new(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        {target_window}
+
+        if targetWindow is missing value then
+            return "missing-window"
+        end if
+
+        set windowTitle to my element_name(targetWindow)
+        set allElements to {{}}
+        try
+            set allElements to entire contents of targetWindow
+        end try
+
+        repeat with requestedName in {{{button_names}}}
+            repeat with elem in allElements
+                try
+                    if my role_text(elem) is "AXButton" then
+                        set buttonName to my element_name(elem)
+                        if buttonName is requestedName and my attribute_bool(elem, "AXEnabled") then
+                            click elem
+                            return windowTitle & fieldSeparator & "click-button" & fieldSeparator & buttonName
+                        end if
+                    end if
+                end try
+            end repeat
+        end repeat
+    end tell
+end tell
+
+return "missing-action"
+"#,
+        app = XCODE_APP_NAME,
+        target_window = target_window,
+        button_names = button_names
+    )
+}
+
+fn build_select_tab_script(trace_path: Option<&Path>, tab_name: &str) -> String {
+    let target_window = build_target_window_clause(trace_path, "missing-window", false);
+    let tab_name = applescript_string_literal(OsStr::new(tab_name));
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        {target_window}
+
+        if targetWindow is missing value then
+            return "missing-window"
+        end if
+
+        set windowTitle to my element_name(targetWindow)
+        set allElements to {{}}
+        try
+            set allElements to entire contents of targetWindow
+        end try
+
+        repeat with elem in allElements
+            try
+                set roleName to my role_text(elem)
+                set subroleText to my optional_text(my attribute_text(elem, "AXSubrole"))
+                if (roleName is "AXRadioButton" or subroleText is "AXTabButton") and my element_name(elem) is {tab_name} then
+                    if my attribute_bool(elem, "AXEnabled") then
+                        click elem
+                        return windowTitle & fieldSeparator & "select-tab" & fieldSeparator & {tab_name}
+                    end if
+                end if
+            end try
+        end repeat
+    end tell
+end tell
+
+return "missing-action"
+"#,
+        app = XCODE_APP_NAME,
+        target_window = target_window,
+        tab_name = tab_name
+    )
+}
+
 fn build_target_window_clause(
     trace_path: Option<&Path>,
     missing_result: &str,
@@ -1134,6 +1302,22 @@ fn parse_ui_elements_output(raw: &str) -> Result<Vec<XcodeUiElementInfo>> {
         .collect()
 }
 
+fn parse_action_output(raw: &str) -> Result<XcodeActionResult> {
+    let trimmed = raw.trim();
+    if matches!(trimmed, "not-running" | "missing-window" | "missing-action") {
+        return Err(Error::InvalidInput(format!(
+            "Xcode automation action failed: {trimmed}"
+        )));
+    }
+
+    let columns = parse_single_record(raw, 3)?;
+    Ok(XcodeActionResult {
+        window_title: columns[0].clone(),
+        action: columns[1].clone(),
+        target: columns[2].clone(),
+    })
+}
+
 fn parse_records(raw: &str, expected_columns: usize) -> Result<Vec<Vec<String>>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("not-running") {
@@ -1364,6 +1548,33 @@ mod tests {
         assert_eq!(tabs[0].name, "Counters");
         assert!(tabs[0].selected);
         assert_eq!(tabs[0].subrole.as_deref(), Some("AXTabButton"));
+    }
+
+    #[test]
+    fn build_click_button_script_targets_named_trace() {
+        let script =
+            build_click_button_script(Some(Path::new("/tmp/Profile Trace.gputrace")), &["Replay"]);
+        assert!(script.contains("Profile Trace.gputrace"));
+        assert!(script.contains("\"Replay\""));
+        assert!(script.contains("click-button"));
+    }
+
+    #[test]
+    fn build_select_tab_script_targets_named_tab() {
+        let script =
+            build_select_tab_script(Some(Path::new("/tmp/Profile Trace.gputrace")), "Counters");
+        assert!(script.contains("Profile Trace.gputrace"));
+        assert!(script.contains("\"Counters\""));
+        assert!(script.contains("select-tab"));
+    }
+
+    #[test]
+    fn parse_action_output_decodes_result() {
+        let raw = record(&["Trace A", "click-button", "Replay"]);
+        let result = parse_action_output(&raw).unwrap();
+        assert_eq!(result.window_title, "Trace A");
+        assert_eq!(result.action, "click-button");
+        assert_eq!(result.target, "Replay");
     }
 
     #[test]

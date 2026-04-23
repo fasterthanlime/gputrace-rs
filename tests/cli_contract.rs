@@ -70,6 +70,32 @@ fn timeline_help_mentions_raw_and_export_formats() {
 }
 
 #[test]
+fn xcode_status_help_keeps_trace_and_format_flags() {
+    let help = render_help(&["xcode-status"]);
+    assert!(help.contains("xcode-status"));
+    assert!(help.contains("--format"));
+}
+
+#[test]
+fn xcode_wait_help_mentions_status_and_timeout() {
+    let help = render_help(&["xcode-wait"]);
+    assert!(help.contains("--status"));
+    assert!(help.contains("--timeout-seconds"));
+}
+
+#[test]
+fn xcode_click_button_help_mentions_target() {
+    let help = render_help(&["xcode-click-button"]);
+    assert!(help.contains("<TARGET>"));
+}
+
+#[test]
+fn xcode_select_tab_help_mentions_target() {
+    let help = render_help(&["xcode-select-tab"]);
+    assert!(help.contains("<TARGET>"));
+}
+
+#[test]
 fn fences_help_keeps_format_flag() {
     let help = render_help(&["fences"]);
 
