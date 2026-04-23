@@ -72,7 +72,12 @@ pub fn validate(
         "ALU Utilization".to_owned(),
         "Kernel Occupancy".to_owned(),
         "Device Memory Bandwidth".to_owned(),
+        "GPU Read Bandwidth".to_owned(),
+        "GPU Write Bandwidth".to_owned(),
+        "Buffer L1 Miss Rate".to_owned(),
+        "Buffer L1 Read Accesses".to_owned(),
         "Buffer L1 Read Bandwidth".to_owned(),
+        "Buffer L1 Write Accesses".to_owned(),
         "Buffer L1 Write Bandwidth".to_owned(),
     ];
 
@@ -117,9 +122,39 @@ pub fn validate(
                 tolerance,
             ),
             compare_metric(
+                "GPU Read Bandwidth",
+                exported_row.gpu_read_bandwidth_gbps,
+                reference_row.and_then(|row| row.counters.get("GPU Read Bandwidth").copied()),
+                tolerance,
+            ),
+            compare_metric(
+                "GPU Write Bandwidth",
+                exported_row.gpu_write_bandwidth_gbps,
+                reference_row.and_then(|row| row.counters.get("GPU Write Bandwidth").copied()),
+                tolerance,
+            ),
+            compare_metric(
+                "Buffer L1 Miss Rate",
+                exported_row.buffer_l1_miss_rate_percent,
+                reference_row.and_then(|row| row.counters.get("Buffer L1 Miss Rate").copied()),
+                tolerance,
+            ),
+            compare_metric(
+                "Buffer L1 Read Accesses",
+                exported_row.buffer_l1_read_accesses,
+                reference_row.and_then(|row| row.counters.get("Buffer L1 Read Accesses").copied()),
+                tolerance,
+            ),
+            compare_metric(
                 "Buffer L1 Read Bandwidth",
                 exported_row.buffer_l1_read_bandwidth_gbps,
                 reference_row.and_then(|row| row.counters.get("Buffer L1 Read Bandwidth").copied()),
+                tolerance,
+            ),
+            compare_metric(
+                "Buffer L1 Write Accesses",
+                exported_row.buffer_l1_write_accesses,
+                reference_row.and_then(|row| row.counters.get("Buffer L1 Write Accesses").copied()),
                 tolerance,
             ),
             compare_metric(

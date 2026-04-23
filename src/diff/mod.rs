@@ -83,6 +83,20 @@ pub struct CounterMetricChange {
     pub right_last_level_cache_percent: Option<f64>,
     pub left_device_memory_bandwidth_gbps: Option<f64>,
     pub right_device_memory_bandwidth_gbps: Option<f64>,
+    pub left_gpu_read_bandwidth_gbps: Option<f64>,
+    pub right_gpu_read_bandwidth_gbps: Option<f64>,
+    pub left_gpu_write_bandwidth_gbps: Option<f64>,
+    pub right_gpu_write_bandwidth_gbps: Option<f64>,
+    pub left_buffer_l1_miss_rate_percent: Option<f64>,
+    pub right_buffer_l1_miss_rate_percent: Option<f64>,
+    pub left_buffer_l1_read_accesses: Option<f64>,
+    pub right_buffer_l1_read_accesses: Option<f64>,
+    pub left_buffer_l1_read_bandwidth_gbps: Option<f64>,
+    pub right_buffer_l1_read_bandwidth_gbps: Option<f64>,
+    pub left_buffer_l1_write_accesses: Option<f64>,
+    pub right_buffer_l1_write_accesses: Option<f64>,
+    pub left_buffer_l1_write_bandwidth_gbps: Option<f64>,
+    pub right_buffer_l1_write_bandwidth_gbps: Option<f64>,
 }
 
 pub fn diff_paths(left: impl AsRef<Path>, right: impl AsRef<Path>) -> Result<DiffReport> {
@@ -233,7 +247,7 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
     }
     if let Some(change) = counter_metric_changes.first() {
         summary.push(format!(
-            "Largest profiler metric delta: {} (inv {} -> {}, exec {} -> {}, occ {} -> {}, alu {} -> {}, llc {} -> {}, dev_bw {} -> {})",
+            "Largest profiler metric delta: {} (inv {} -> {}, exec {} -> {}, occ {} -> {}, alu {} -> {}, llc {} -> {}, dev_bw {} -> {}, gpu_r {} -> {}, gpu_w {} -> {}, l1_miss {} -> {}, l1_racc {} -> {}, l1_rbw {} -> {}, l1_wacc {} -> {}, l1_wbw {} -> {})",
             change.name,
             format_option_f64(change.left_kernel_invocations),
             format_option_f64(change.right_kernel_invocations),
@@ -247,6 +261,20 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
             format_option_f64(change.right_last_level_cache_percent),
             format_option_f64(change.left_device_memory_bandwidth_gbps),
             format_option_f64(change.right_device_memory_bandwidth_gbps),
+            format_option_f64(change.left_gpu_read_bandwidth_gbps),
+            format_option_f64(change.right_gpu_read_bandwidth_gbps),
+            format_option_f64(change.left_gpu_write_bandwidth_gbps),
+            format_option_f64(change.right_gpu_write_bandwidth_gbps),
+            format_option_f64(change.left_buffer_l1_miss_rate_percent),
+            format_option_f64(change.right_buffer_l1_miss_rate_percent),
+            format_option_f64(change.left_buffer_l1_read_accesses),
+            format_option_f64(change.right_buffer_l1_read_accesses),
+            format_option_f64(change.left_buffer_l1_read_bandwidth_gbps),
+            format_option_f64(change.right_buffer_l1_read_bandwidth_gbps),
+            format_option_f64(change.left_buffer_l1_write_accesses),
+            format_option_f64(change.right_buffer_l1_write_accesses),
+            format_option_f64(change.left_buffer_l1_write_bandwidth_gbps),
+            format_option_f64(change.right_buffer_l1_write_bandwidth_gbps),
         ));
     }
     if summary.is_empty() {
@@ -302,6 +330,20 @@ fn diff_counter_metrics(left: &TraceBundle, right: &TraceBundle) -> Vec<CounterM
             right_last_level_cache_percent: right_metrics.last_level_cache_percent,
             left_device_memory_bandwidth_gbps: left_metrics.device_memory_bandwidth_gbps,
             right_device_memory_bandwidth_gbps: right_metrics.device_memory_bandwidth_gbps,
+            left_gpu_read_bandwidth_gbps: left_metrics.gpu_read_bandwidth_gbps,
+            right_gpu_read_bandwidth_gbps: right_metrics.gpu_read_bandwidth_gbps,
+            left_gpu_write_bandwidth_gbps: left_metrics.gpu_write_bandwidth_gbps,
+            right_gpu_write_bandwidth_gbps: right_metrics.gpu_write_bandwidth_gbps,
+            left_buffer_l1_miss_rate_percent: left_metrics.buffer_l1_miss_rate_percent,
+            right_buffer_l1_miss_rate_percent: right_metrics.buffer_l1_miss_rate_percent,
+            left_buffer_l1_read_accesses: left_metrics.buffer_l1_read_accesses,
+            right_buffer_l1_read_accesses: right_metrics.buffer_l1_read_accesses,
+            left_buffer_l1_read_bandwidth_gbps: left_metrics.buffer_l1_read_bandwidth_gbps,
+            right_buffer_l1_read_bandwidth_gbps: right_metrics.buffer_l1_read_bandwidth_gbps,
+            left_buffer_l1_write_accesses: left_metrics.buffer_l1_write_accesses,
+            right_buffer_l1_write_accesses: right_metrics.buffer_l1_write_accesses,
+            left_buffer_l1_write_bandwidth_gbps: left_metrics.buffer_l1_write_bandwidth_gbps,
+            right_buffer_l1_write_bandwidth_gbps: right_metrics.buffer_l1_write_bandwidth_gbps,
         });
     }
     changes.sort_by(|left, right| {
@@ -316,51 +358,63 @@ fn diff_counter_metrics(left: &TraceBundle, right: &TraceBundle) -> Vec<CounterM
 fn aggregate_counter_metrics(
     report: &counter_export::CounterExportReport,
 ) -> std::collections::BTreeMap<String, CounterAggregate> {
-    let mut sums = std::collections::BTreeMap::<
-        String,
-        (
-            f64,
-            usize,
-            f64,
-            usize,
-            f64,
-            usize,
-            f64,
-            usize,
-            f64,
-            usize,
-            f64,
-            usize,
-        ),
-    >::new();
+    let mut sums = std::collections::BTreeMap::<String, CounterAggregateSums>::new();
     for row in &report.rows {
         let Some(name) = row.kernel_name.clone() else {
             continue;
         };
         let entry = sums.entry(name).or_default();
         if row.kernel_invocations > 0 {
-            entry.0 += row.kernel_invocations as f64;
-            entry.1 += 1;
+            entry.kernel_invocations_sum += row.kernel_invocations as f64;
+            entry.kernel_invocations_count += 1;
         }
         if let Some(value) = row.execution_cost_percent {
-            entry.2 += value;
-            entry.3 += 1;
+            entry.execution_cost_sum += value;
+            entry.execution_cost_count += 1;
         }
         if let Some(value) = row.occupancy_percent {
-            entry.4 += value;
-            entry.5 += 1;
+            entry.occupancy_sum += value;
+            entry.occupancy_count += 1;
         }
         if let Some(value) = row.alu_utilization_percent {
-            entry.6 += value;
-            entry.7 += 1;
+            entry.alu_sum += value;
+            entry.alu_count += 1;
         }
         if let Some(value) = row.last_level_cache_percent {
-            entry.8 += value;
-            entry.9 += 1;
+            entry.llc_sum += value;
+            entry.llc_count += 1;
         }
         if let Some(value) = row.device_memory_bandwidth_gbps {
-            entry.10 += value;
-            entry.11 += 1;
+            entry.device_bw_sum += value;
+            entry.device_bw_count += 1;
+        }
+        if let Some(value) = row.gpu_read_bandwidth_gbps {
+            entry.gpu_read_bw_sum += value;
+            entry.gpu_read_bw_count += 1;
+        }
+        if let Some(value) = row.gpu_write_bandwidth_gbps {
+            entry.gpu_write_bw_sum += value;
+            entry.gpu_write_bw_count += 1;
+        }
+        if let Some(value) = row.buffer_l1_miss_rate_percent {
+            entry.buffer_l1_miss_rate_sum += value;
+            entry.buffer_l1_miss_rate_count += 1;
+        }
+        if let Some(value) = row.buffer_l1_read_accesses {
+            entry.buffer_l1_read_accesses_sum += value;
+            entry.buffer_l1_read_accesses_count += 1;
+        }
+        if let Some(value) = row.buffer_l1_read_bandwidth_gbps {
+            entry.buffer_l1_read_bw_sum += value;
+            entry.buffer_l1_read_bw_count += 1;
+        }
+        if let Some(value) = row.buffer_l1_write_accesses {
+            entry.buffer_l1_write_accesses_sum += value;
+            entry.buffer_l1_write_accesses_count += 1;
+        }
+        if let Some(value) = row.buffer_l1_write_bandwidth_gbps {
+            entry.buffer_l1_write_bw_sum += value;
+            entry.buffer_l1_write_bw_count += 1;
         }
     }
 
@@ -369,16 +423,83 @@ fn aggregate_counter_metrics(
             (
                 name,
                 CounterAggregate {
-                    kernel_invocations: average_option(sums.0, sums.1),
-                    execution_cost_percent: average_option(sums.2, sums.3),
-                    occupancy_percent: average_option(sums.4, sums.5),
-                    alu_utilization_percent: average_option(sums.6, sums.7),
-                    last_level_cache_percent: average_option(sums.8, sums.9),
-                    device_memory_bandwidth_gbps: average_option(sums.10, sums.11),
+                    kernel_invocations: average_option(
+                        sums.kernel_invocations_sum,
+                        sums.kernel_invocations_count,
+                    ),
+                    execution_cost_percent: average_option(
+                        sums.execution_cost_sum,
+                        sums.execution_cost_count,
+                    ),
+                    occupancy_percent: average_option(sums.occupancy_sum, sums.occupancy_count),
+                    alu_utilization_percent: average_option(sums.alu_sum, sums.alu_count),
+                    last_level_cache_percent: average_option(sums.llc_sum, sums.llc_count),
+                    device_memory_bandwidth_gbps: average_option(
+                        sums.device_bw_sum,
+                        sums.device_bw_count,
+                    ),
+                    gpu_read_bandwidth_gbps: average_option(
+                        sums.gpu_read_bw_sum,
+                        sums.gpu_read_bw_count,
+                    ),
+                    gpu_write_bandwidth_gbps: average_option(
+                        sums.gpu_write_bw_sum,
+                        sums.gpu_write_bw_count,
+                    ),
+                    buffer_l1_miss_rate_percent: average_option(
+                        sums.buffer_l1_miss_rate_sum,
+                        sums.buffer_l1_miss_rate_count,
+                    ),
+                    buffer_l1_read_accesses: average_option(
+                        sums.buffer_l1_read_accesses_sum,
+                        sums.buffer_l1_read_accesses_count,
+                    ),
+                    buffer_l1_read_bandwidth_gbps: average_option(
+                        sums.buffer_l1_read_bw_sum,
+                        sums.buffer_l1_read_bw_count,
+                    ),
+                    buffer_l1_write_accesses: average_option(
+                        sums.buffer_l1_write_accesses_sum,
+                        sums.buffer_l1_write_accesses_count,
+                    ),
+                    buffer_l1_write_bandwidth_gbps: average_option(
+                        sums.buffer_l1_write_bw_sum,
+                        sums.buffer_l1_write_bw_count,
+                    ),
                 },
             )
         })
         .collect()
+}
+
+#[derive(Default, Clone, Copy)]
+struct CounterAggregateSums {
+    kernel_invocations_sum: f64,
+    kernel_invocations_count: usize,
+    execution_cost_sum: f64,
+    execution_cost_count: usize,
+    occupancy_sum: f64,
+    occupancy_count: usize,
+    alu_sum: f64,
+    alu_count: usize,
+    llc_sum: f64,
+    llc_count: usize,
+    device_bw_sum: f64,
+    device_bw_count: usize,
+    gpu_read_bw_sum: f64,
+    gpu_read_bw_count: usize,
+    gpu_write_bw_sum: f64,
+    gpu_write_bw_count: usize,
+    buffer_l1_miss_rate_sum: f64,
+    buffer_l1_miss_rate_count: usize,
+    buffer_l1_read_accesses_sum: f64,
+    buffer_l1_read_accesses_count: usize,
+    buffer_l1_read_bw_sum: f64,
+    buffer_l1_read_bw_count: usize,
+    buffer_l1_write_accesses_sum: f64,
+    buffer_l1_write_accesses_count: usize,
+    buffer_l1_write_bw_sum: f64,
+    buffer_l1_write_bw_count: usize,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -389,6 +510,13 @@ struct CounterAggregate {
     alu_utilization_percent: Option<f64>,
     last_level_cache_percent: Option<f64>,
     device_memory_bandwidth_gbps: Option<f64>,
+    gpu_read_bandwidth_gbps: Option<f64>,
+    gpu_write_bandwidth_gbps: Option<f64>,
+    buffer_l1_miss_rate_percent: Option<f64>,
+    buffer_l1_read_accesses: Option<f64>,
+    buffer_l1_read_bandwidth_gbps: Option<f64>,
+    buffer_l1_write_accesses: Option<f64>,
+    buffer_l1_write_bandwidth_gbps: Option<f64>,
 }
 
 fn average_option(sum: f64, count: usize) -> Option<f64> {
@@ -407,6 +535,28 @@ fn metrics_equal(left: CounterAggregate, right: CounterAggregate) -> bool {
         && approx_option_eq(
             left.device_memory_bandwidth_gbps,
             right.device_memory_bandwidth_gbps,
+        )
+        && approx_option_eq(left.gpu_read_bandwidth_gbps, right.gpu_read_bandwidth_gbps)
+        && approx_option_eq(
+            left.gpu_write_bandwidth_gbps,
+            right.gpu_write_bandwidth_gbps,
+        )
+        && approx_option_eq(
+            left.buffer_l1_miss_rate_percent,
+            right.buffer_l1_miss_rate_percent,
+        )
+        && approx_option_eq(left.buffer_l1_read_accesses, right.buffer_l1_read_accesses)
+        && approx_option_eq(
+            left.buffer_l1_read_bandwidth_gbps,
+            right.buffer_l1_read_bandwidth_gbps,
+        )
+        && approx_option_eq(
+            left.buffer_l1_write_accesses,
+            right.buffer_l1_write_accesses,
+        )
+        && approx_option_eq(
+            left.buffer_l1_write_bandwidth_gbps,
+            right.buffer_l1_write_bandwidth_gbps,
         )
 }
 
@@ -447,6 +597,41 @@ fn aggregate_change_magnitude(change: &CounterMetricChange) -> f64 {
         + option_delta(
             change.left_device_memory_bandwidth_gbps,
             change.right_device_memory_bandwidth_gbps,
+        )
+        .abs()
+        + option_delta(
+            change.left_gpu_read_bandwidth_gbps,
+            change.right_gpu_read_bandwidth_gbps,
+        )
+        .abs()
+        + option_delta(
+            change.left_gpu_write_bandwidth_gbps,
+            change.right_gpu_write_bandwidth_gbps,
+        )
+        .abs()
+        + option_delta(
+            change.left_buffer_l1_miss_rate_percent,
+            change.right_buffer_l1_miss_rate_percent,
+        )
+        .abs()
+        + option_delta(
+            change.left_buffer_l1_read_accesses,
+            change.right_buffer_l1_read_accesses,
+        )
+        .abs()
+        + option_delta(
+            change.left_buffer_l1_read_bandwidth_gbps,
+            change.right_buffer_l1_read_bandwidth_gbps,
+        )
+        .abs()
+        + option_delta(
+            change.left_buffer_l1_write_accesses,
+            change.right_buffer_l1_write_accesses,
+        )
+        .abs()
+        + option_delta(
+            change.left_buffer_l1_write_bandwidth_gbps,
+            change.right_buffer_l1_write_bandwidth_gbps,
         )
         .abs()
 }

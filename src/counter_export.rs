@@ -48,7 +48,12 @@ pub struct CounterExportRow {
     pub last_level_cache_percent: Option<f64>,
     pub control_flow_percent: Option<f64>,
     pub device_memory_bandwidth_gbps: Option<f64>,
+    pub gpu_read_bandwidth_gbps: Option<f64>,
+    pub gpu_write_bandwidth_gbps: Option<f64>,
+    pub buffer_l1_miss_rate_percent: Option<f64>,
+    pub buffer_l1_read_accesses: Option<f64>,
     pub buffer_l1_read_bandwidth_gbps: Option<f64>,
+    pub buffer_l1_write_accesses: Option<f64>,
     pub buffer_l1_write_bandwidth_gbps: Option<f64>,
     pub temporary_register_count: Option<i64>,
     pub uniform_register_count: Option<i64>,
@@ -190,6 +195,11 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             .and_then(|limiter| limiter.buffer_l1_write_bandwidth_gbps)
             .or_else(|| xcode_metric("Buffer L1 Write Bandwidth"))
             .or_else(|| xcode_metric("L1 Write Bandwidth"));
+        let gpu_read_bandwidth_gbps = xcode_metric("GPU Read Bandwidth");
+        let gpu_write_bandwidth_gbps = xcode_metric("GPU Write Bandwidth");
+        let buffer_l1_miss_rate_percent = xcode_metric("Buffer L1 Miss Rate");
+        let buffer_l1_read_accesses = xcode_metric("Buffer L1 Read Accesses");
+        let buffer_l1_write_accesses = xcode_metric("Buffer L1 Write Accesses");
         let metric_source = if execution_cost_percent.is_some() {
             "execution-cost".to_owned()
         } else if sample_count > 0 {
@@ -197,7 +207,10 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
         } else if xcode_match.is_some()
             && (occupancy_percent.is_some()
                 || alu_utilization_percent.is_some()
-                || device_memory_bandwidth_gbps.is_some())
+                || device_memory_bandwidth_gbps.is_some()
+                || buffer_l1_miss_rate_percent.is_some()
+                || gpu_read_bandwidth_gbps.is_some()
+                || gpu_write_bandwidth_gbps.is_some())
         {
             "xcode-counters".to_owned()
         } else if limiter.is_some() {
@@ -242,7 +255,12 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             control_flow_percent: limiter
                 .and_then(|limiter| limiter.control_flow.map(normalize_percent_like)),
             device_memory_bandwidth_gbps,
+            gpu_read_bandwidth_gbps,
+            gpu_write_bandwidth_gbps,
+            buffer_l1_miss_rate_percent,
+            buffer_l1_read_accesses,
             buffer_l1_read_bandwidth_gbps,
+            buffer_l1_write_accesses,
             buffer_l1_write_bandwidth_gbps,
             temporary_register_count: pipeline_stats.map(|stats| stats.temporary_register_count),
             uniform_register_count: pipeline_stats.map(|stats| stats.uniform_register_count),
@@ -360,7 +378,7 @@ pub fn format_report(report: &CounterExportReport) -> String {
 
 pub fn format_csv(report: &CounterExportReport) -> String {
     let mut out = String::new();
-    out.push_str("row_index,command_buffer_index,encoder_index,encoder_label,kernel_name,pipeline_addr,start_time_ns,end_time_ns,duration_ns,dispatch_count,kernel_invocations,metric_source,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,occupancy_manager_percent,alu_utilization_percent,shader_launch_limiter_percent,instruction_throughput_percent,integer_complex_percent,f32_limiter_percent,l1_cache_percent,last_level_cache_percent,control_flow_percent,device_memory_bandwidth_gbps,buffer_l1_read_bandwidth_gbps,buffer_l1_write_bandwidth_gbps,temporary_register_count,uniform_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms\n");
+    out.push_str("row_index,command_buffer_index,encoder_index,encoder_label,kernel_name,pipeline_addr,start_time_ns,end_time_ns,duration_ns,dispatch_count,kernel_invocations,metric_source,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,occupancy_manager_percent,alu_utilization_percent,shader_launch_limiter_percent,instruction_throughput_percent,integer_complex_percent,f32_limiter_percent,l1_cache_percent,last_level_cache_percent,control_flow_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_read_bandwidth_gbps,buffer_l1_write_accesses,buffer_l1_write_bandwidth_gbps,temporary_register_count,uniform_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms\n");
     for row in &report.rows {
         let columns = vec![
             row.row_index.to_string(),
@@ -393,7 +411,12 @@ pub fn format_csv(report: &CounterExportReport) -> String {
             option_csv(row.last_level_cache_percent),
             option_csv(row.control_flow_percent),
             option_csv(row.device_memory_bandwidth_gbps),
+            option_csv(row.gpu_read_bandwidth_gbps),
+            option_csv(row.gpu_write_bandwidth_gbps),
+            option_csv(row.buffer_l1_miss_rate_percent),
+            option_csv(row.buffer_l1_read_accesses),
             option_csv(row.buffer_l1_read_bandwidth_gbps),
+            option_csv(row.buffer_l1_write_accesses),
             option_csv(row.buffer_l1_write_bandwidth_gbps),
             option_csv(row.temporary_register_count),
             option_csv(row.uniform_register_count),
@@ -482,7 +505,12 @@ mod tests {
                 last_level_cache_percent: Some(7.0),
                 control_flow_percent: Some(9.0),
                 device_memory_bandwidth_gbps: Some(3.2),
+                gpu_read_bandwidth_gbps: Some(2.2),
+                gpu_write_bandwidth_gbps: Some(1.0),
+                buffer_l1_miss_rate_percent: Some(4.5),
+                buffer_l1_read_accesses: Some(128.0),
                 buffer_l1_read_bandwidth_gbps: Some(1.4),
+                buffer_l1_write_accesses: Some(32.0),
                 buffer_l1_write_bandwidth_gbps: Some(0.8),
                 temporary_register_count: Some(24),
                 uniform_register_count: Some(12),

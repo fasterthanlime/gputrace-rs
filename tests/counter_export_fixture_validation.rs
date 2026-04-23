@@ -20,7 +20,12 @@ struct ReferenceCounterRow {
     alu_utilization_percent: Option<f64>,
     kernel_occupancy_percent: Option<f64>,
     device_memory_bandwidth_gbps: Option<f64>,
+    gpu_read_bandwidth_gbps: Option<f64>,
+    gpu_write_bandwidth_gbps: Option<f64>,
+    buffer_l1_miss_rate_percent: Option<f64>,
+    buffer_l1_read_accesses: Option<f64>,
     buffer_l1_read_bandwidth_gbps: Option<f64>,
+    buffer_l1_write_accesses: Option<f64>,
     buffer_l1_write_bandwidth_gbps: Option<f64>,
 }
 
@@ -125,9 +130,49 @@ fn validates_counter_export_against_xcode_reference_csv_when_fixtures_are_availa
             assert_metric_close(
                 case.name,
                 expected.index,
+                "GPU Read Bandwidth",
+                actual.gpu_read_bandwidth_gbps,
+                expected.gpu_read_bandwidth_gbps,
+                0.5,
+            );
+            assert_metric_close(
+                case.name,
+                expected.index,
+                "GPU Write Bandwidth",
+                actual.gpu_write_bandwidth_gbps,
+                expected.gpu_write_bandwidth_gbps,
+                0.5,
+            );
+            assert_metric_close(
+                case.name,
+                expected.index,
+                "Buffer L1 Miss Rate",
+                actual.buffer_l1_miss_rate_percent,
+                expected.buffer_l1_miss_rate_percent,
+                0.5,
+            );
+            assert_metric_close(
+                case.name,
+                expected.index,
+                "Buffer L1 Read Accesses",
+                actual.buffer_l1_read_accesses,
+                expected.buffer_l1_read_accesses,
+                0.5,
+            );
+            assert_metric_close(
+                case.name,
+                expected.index,
                 "Buffer L1 Read Bandwidth",
                 actual.buffer_l1_read_bandwidth_gbps,
                 expected.buffer_l1_read_bandwidth_gbps,
+                0.5,
+            );
+            assert_metric_close(
+                case.name,
+                expected.index,
+                "Buffer L1 Write Accesses",
+                actual.buffer_l1_write_accesses,
+                expected.buffer_l1_write_accesses,
                 0.5,
             );
             assert_metric_close(
@@ -177,7 +222,12 @@ fn parse_reference_csv(path: &Path) -> Result<Vec<ReferenceCounterRow>, Box<dyn 
     let alu_col = find_column(&headers, "ALU Utilization")?;
     let occupancy_col = find_column(&headers, "Kernel Occupancy")?;
     let device_bw_col = find_column(&headers, "Device Memory Bandwidth")?;
+    let gpu_read_bw_col = find_column(&headers, "GPU Read Bandwidth")?;
+    let gpu_write_bw_col = find_column(&headers, "GPU Write Bandwidth")?;
+    let buffer_l1_miss_rate_col = find_column(&headers, "Buffer L1 Miss Rate")?;
+    let buffer_l1_read_accesses_col = find_column(&headers, "Buffer L1 Read Accesses")?;
     let buffer_l1_read_bw_col = find_column(&headers, "Buffer L1 Read Bandwidth")?;
+    let buffer_l1_write_accesses_col = find_column(&headers, "Buffer L1 Write Accesses")?;
     let buffer_l1_write_bw_col = find_column(&headers, "Buffer L1 Write Bandwidth")?;
 
     let mut rows = Vec::new();
@@ -190,7 +240,12 @@ fn parse_reference_csv(path: &Path) -> Result<Vec<ReferenceCounterRow>, Box<dyn 
             alu_utilization_percent: parse_optional_f64(record.get(alu_col)),
             kernel_occupancy_percent: parse_optional_f64(record.get(occupancy_col)),
             device_memory_bandwidth_gbps: parse_optional_f64(record.get(device_bw_col)),
+            gpu_read_bandwidth_gbps: parse_optional_f64(record.get(gpu_read_bw_col)),
+            gpu_write_bandwidth_gbps: parse_optional_f64(record.get(gpu_write_bw_col)),
+            buffer_l1_miss_rate_percent: parse_optional_f64(record.get(buffer_l1_miss_rate_col)),
+            buffer_l1_read_accesses: parse_optional_f64(record.get(buffer_l1_read_accesses_col)),
             buffer_l1_read_bandwidth_gbps: parse_optional_f64(record.get(buffer_l1_read_bw_col)),
+            buffer_l1_write_accesses: parse_optional_f64(record.get(buffer_l1_write_accesses_col)),
             buffer_l1_write_bandwidth_gbps: parse_optional_f64(record.get(buffer_l1_write_bw_col)),
         });
     }

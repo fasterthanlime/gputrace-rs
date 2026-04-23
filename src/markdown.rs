@@ -233,7 +233,7 @@ pub fn diff_report(report: &DiffReport) -> String {
             "Profiler Metric Changes",
             report.counter_metric_changes.iter().map(|change| {
                 format!(
-                    "- `{}`: inv {} -> {}, exec {} -> {}, Occ {} -> {}, ALU {} -> {}, LLC {} -> {}, Dev BW {} -> {}\n",
+                    "- `{}`: inv {} -> {}, exec {} -> {}, Occ {} -> {}, ALU {} -> {}, LLC {} -> {}, Dev BW {} -> {}, GPU R {} -> {}, GPU W {} -> {}, L1 miss {} -> {}, L1 R acc {} -> {}, L1 R BW {} -> {}, L1 W acc {} -> {}, L1 W BW {} -> {}\n",
                     change.name,
                     option_metric(change.left_kernel_invocations),
                     option_metric(change.right_kernel_invocations),
@@ -247,6 +247,20 @@ pub fn diff_report(report: &DiffReport) -> String {
                     option_metric(change.right_last_level_cache_percent),
                     option_metric(change.left_device_memory_bandwidth_gbps),
                     option_metric(change.right_device_memory_bandwidth_gbps),
+                    option_metric(change.left_gpu_read_bandwidth_gbps),
+                    option_metric(change.right_gpu_read_bandwidth_gbps),
+                    option_metric(change.left_gpu_write_bandwidth_gbps),
+                    option_metric(change.right_gpu_write_bandwidth_gbps),
+                    option_metric(change.left_buffer_l1_miss_rate_percent),
+                    option_metric(change.right_buffer_l1_miss_rate_percent),
+                    option_metric(change.left_buffer_l1_read_accesses),
+                    option_metric(change.right_buffer_l1_read_accesses),
+                    option_metric(change.left_buffer_l1_read_bandwidth_gbps),
+                    option_metric(change.right_buffer_l1_read_bandwidth_gbps),
+                    option_metric(change.left_buffer_l1_write_accesses),
+                    option_metric(change.right_buffer_l1_write_accesses),
+                    option_metric(change.left_buffer_l1_write_bandwidth_gbps),
+                    option_metric(change.right_buffer_l1_write_bandwidth_gbps),
                 )
             }),
             10,
@@ -538,6 +552,20 @@ mod tests {
                 right_last_level_cache_percent: Some(6.0),
                 left_device_memory_bandwidth_gbps: Some(4.0),
                 right_device_memory_bandwidth_gbps: Some(9.0),
+                left_gpu_read_bandwidth_gbps: Some(2.0),
+                right_gpu_read_bandwidth_gbps: Some(4.0),
+                left_gpu_write_bandwidth_gbps: Some(1.0),
+                right_gpu_write_bandwidth_gbps: Some(2.0),
+                left_buffer_l1_miss_rate_percent: Some(3.0),
+                right_buffer_l1_miss_rate_percent: Some(7.0),
+                left_buffer_l1_read_accesses: Some(32.0),
+                right_buffer_l1_read_accesses: Some(48.0),
+                left_buffer_l1_read_bandwidth_gbps: Some(1.5),
+                right_buffer_l1_read_bandwidth_gbps: Some(2.5),
+                left_buffer_l1_write_accesses: Some(8.0),
+                right_buffer_l1_write_accesses: Some(16.0),
+                left_buffer_l1_write_bandwidth_gbps: Some(0.5),
+                right_buffer_l1_write_bandwidth_gbps: Some(1.5),
             }],
             kernel_changes: (0..11)
                 .map(|index| KernelChange {
@@ -558,7 +586,7 @@ mod tests {
         assert!(rendered.contains("## Buffer Changes"));
         assert!(rendered.contains("## Buffer Lifetime Changes"));
         assert!(rendered.contains(
-            "`kernel`: inv 2.00 -> 5.00, exec 40.00 -> 55.00, Occ 22.00 -> 31.00, ALU 35.00 -> 48.00"
+            "`kernel`: inv 2.00 -> 5.00, exec 40.00 -> 55.00, Occ 22.00 -> 31.00, ALU 35.00 -> 48.00, LLC 2.00 -> 6.00, Dev BW 4.00 -> 9.00, GPU R 2.00 -> 4.00"
         ));
         assert!(rendered.contains(
             "`buf` [changed]: uses 1 -> 3 (+2), encoders 1 -> 2, command buffers 1 -> 2"
