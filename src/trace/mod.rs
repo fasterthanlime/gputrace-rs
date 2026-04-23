@@ -9,7 +9,10 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 
-pub use mtsp::{CtRecord, MTLResourceUsage, MTSPHeader, MTSPRecord, RecordType, ResourceBinding};
+pub use mtsp::{
+    CDispatchRecord, CRecord, CiRecord, CtRecord, CtURecord, CttRecord, CulRecord, CululRecord,
+    CuwRecord, MTLResourceUsage, MTSPHeader, MTSPRecord, RecordType, ResourceBinding,
+};
 
 pub const MAGIC_MTSP: &[u8; 4] = b"MTSP";
 
@@ -54,6 +57,8 @@ pub struct TraceSummary {
     pub device_resource_count: usize,
     pub device_resource_bytes: u64,
 }
+
+pub type PipelineFunctionMap = BTreeMap<u64, String>;
 
 impl TraceBundle {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -113,6 +118,24 @@ impl TraceBundle {
     pub fn mtsp_records(&self) -> Result<Vec<MTSPRecord>> {
         let data = self.capture_data()?;
         MTSPRecord::parse_stream(&data)
+    }
+
+    pub fn pipeline_function_map(&self) -> Result<PipelineFunctionMap> {
+        let capture = self.capture_data()?;
+        let mut label_map = BTreeMap::new();
+        collect_labels_from_data(&capture, &mut label_map)?;
+        for resource in &self.device_resources {
+            let data = fs::read(&resource.path)?;
+            collect_labels_from_data(&data, &mut label_map)?;
+        }
+
+        let mut result = BTreeMap::new();
+        collect_pipeline_mappings_from_data(&capture, &label_map, &mut result)?;
+        for resource in &self.device_resources {
+            let data = fs::read(&resource.path)?;
+            collect_pipeline_mappings_from_data(&data, &label_map, &mut result)?;
+        }
+        Ok(result)
     }
 }
 
@@ -221,4 +244,34 @@ fn as_integer(value: &Value) -> Option<i64> {
         Value::Real(value) => Some(*value as i64),
         _ => None,
     }
+}
+
+fn collect_labels_from_data(data: &[u8], labels: &mut BTreeMap<u64, String>) -> Result<()> {
+    let records = MTSPRecord::parse_stream(data)?;
+    for record in records {
+        if record.record_type == RecordType::CS
+            && let (Some(address), Some(label)) = (record.address, record.label)
+        {
+            labels.insert(address, label);
+        }
+    }
+    Ok(())
+}
+
+fn collect_pipeline_mappings_from_data(
+    data: &[u8],
+    labels: &BTreeMap<u64, String>,
+    result: &mut PipelineFunctionMap,
+) -> Result<()> {
+    let records = MTSPRecord::parse_stream(data)?;
+    for record in records {
+        if record.record_type != RecordType::Ctt {
+            continue;
+        }
+        let ctt = record.parse_ctt_record()?;
+        if let Some(label) = labels.get(&ctt.function_addr) {
+            result.insert(ctt.pipeline_addr, label.clone());
+        }
+    }
+    Ok(())
 }

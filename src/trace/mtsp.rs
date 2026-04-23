@@ -180,6 +180,252 @@ impl MTSPRecord {
         })
     }
 
+    pub fn parse_ctt_record(&self) -> Result<CttRecord> {
+        if self.record_type != RecordType::Ctt {
+            return Err(Error::InvalidTrace("record was not a Ctt record"));
+        }
+        let Some(base) = find_bytes(&self.data, b"Ctt\0") else {
+            return Err(Error::InvalidTrace("Ctt marker not found"));
+        };
+        if base + 0x30 > self.data.len() {
+            return Err(Error::InvalidTrace("Ctt record too small"));
+        }
+
+        let binding_count = read_u32(&self.data, base + 0x28)?;
+        let stride = read_u32(&self.data, base + 0x2c)?;
+        let mut buffer_bindings = Vec::new();
+        let mut resource_bindings = Vec::new();
+        if binding_count > 0 && stride == 8 {
+            let bindings_offset = base + 0x30;
+            let bytes_needed = binding_count as usize * 8;
+            if bindings_offset + bytes_needed <= self.data.len() {
+                for index in 0..binding_count as usize {
+                    let addr = read_u64(&self.data, bindings_offset + index * 8)?;
+                    buffer_bindings.push(addr);
+                    resource_bindings.push(ResourceBinding {
+                        address: addr,
+                        index,
+                        usage: MTLResourceUsage::READ | MTLResourceUsage::WRITE,
+                    });
+                }
+            }
+        }
+
+        Ok(CttRecord {
+            record_size: self.size as u32,
+            command_flags: read_u32(&self.data, 4).unwrap_or_default(),
+            device_addr: read_u64(&self.data, base + 4)?,
+            function_addr: read_u64(&self.data, base + 12)?,
+            pipeline_addr: read_u64(&self.data, base + 0x20)?,
+            binding_count,
+            stride,
+            buffer_bindings,
+            resource_bindings,
+        })
+    }
+
+    pub fn parse_ci_record(&self) -> Result<CiRecord> {
+        if self.record_type != RecordType::Ci {
+            return Err(Error::InvalidTrace("record was not a Ci record"));
+        }
+        if self.data.len() < 52 {
+            return Err(Error::InvalidTrace("Ci record too small"));
+        }
+        let record = CiRecord {
+            record_size: read_u32(&self.data, 0)?,
+            command_flags: read_u32(&self.data, 4)?,
+            field_1: read_u32(&self.data, 0x20)?,
+            icb_addr: read_u64(&self.data, 0x28)?,
+            count: read_u32(&self.data, 0x30)?,
+            field_2: read_u32(&self.data, 0x34)?,
+        };
+        if record.record_size != 52 {
+            return Err(Error::InvalidTrace("unexpected Ci record size"));
+        }
+        Ok(record)
+    }
+
+    pub fn parse_culul_structured(&self) -> Result<CululRecord> {
+        if self.record_type != RecordType::Culul {
+            return Err(Error::InvalidTrace("record was not a Culul record"));
+        }
+        if self.data.len() < 0x58 {
+            return Err(Error::InvalidTrace("Culul record too small"));
+        }
+        let array_count = read_u32(&self.data, 0x50)?;
+        let mut array_addresses = Vec::new();
+        for index in 0..array_count as usize {
+            let offset = 0x58 + index * 8;
+            if offset + 8 > self.data.len() {
+                return Err(Error::InvalidTrace("Culul array ran out of bounds"));
+            }
+            array_addresses.push(read_u64(&self.data, offset)?);
+        }
+        Ok(CululRecord {
+            record_size: read_u32(&self.data, 0)?,
+            command_flags: read_u32(&self.data, 4)?,
+            marker_count: read_u32(&self.data, 0x20)?,
+            icb_addr: read_u64(&self.data, 0x28)?,
+            field_1: read_u32(&self.data, 0x30)?,
+            field_2: read_u32(&self.data, 0x34)?,
+            field_3: read_u32(&self.data, 0x38)?,
+            payload_size: read_u32(&self.data, 0x40)?,
+            payload_addr: read_u64(&self.data, 0x48)?,
+            array_count,
+            array_stride: read_u32(&self.data, 0x54)?,
+            array_addresses,
+        })
+    }
+
+    pub fn parse_cul_record(&self) -> Result<CulRecord> {
+        if self.record_type != RecordType::Cul {
+            return Err(Error::InvalidTrace("record was not a Cul record"));
+        }
+        if self.data.len() < 0x34 {
+            return Err(Error::InvalidTrace("Cul record too small"));
+        }
+        Ok(CulRecord {
+            record_size: read_u32(&self.data, 0)?,
+            command_flags: read_u32(&self.data, 4)?,
+            marker_count: read_u32(&self.data, 0x20)?,
+            buffer_addr: read_u64(&self.data, 0x28)?,
+            field_1: read_u32(&self.data, 0x30)?,
+        })
+    }
+
+    pub fn parse_cuw_record(&self) -> Result<CuwRecord> {
+        if self.record_type != RecordType::Cuw {
+            return Err(Error::InvalidTrace("record was not a Cuw record"));
+        }
+        if self.data.len() < 0x30 {
+            return Err(Error::InvalidTrace("Cuw record too small"));
+        }
+        let is_extended = self
+            .data
+            .get(0x24..)
+            .is_some_and(|tail| tail.starts_with(b"Cuwuw"));
+        let buffer_addr = if is_extended {
+            read_u64(&self.data, 0x2c)?
+        } else {
+            read_u64(&self.data, 0x28)?
+        };
+        let field_1 = if is_extended {
+            0
+        } else {
+            read_u64(&self.data, 0x30).unwrap_or_default()
+        };
+        let field_2 = if is_extended {
+            read_u32(&self.data, 0x34).unwrap_or_default()
+        } else {
+            0
+        };
+        Ok(CuwRecord {
+            record_size: read_u32(&self.data, 0)?,
+            command_flags: read_u32(&self.data, 4)?,
+            marker_count: read_u32(&self.data, 0x20)?,
+            buffer_addr,
+            field_1,
+            field_2,
+        })
+    }
+
+    pub fn parse_ctu_record(&self) -> Result<CtURecord> {
+        if self.record_type != RecordType::CtU {
+            return Err(Error::InvalidTrace("record was not a CtU record"));
+        }
+        let Some(base) = find_bytes(&self.data, b"CtU<b>ulul") else {
+            return Err(Error::InvalidTrace("CtU marker not found"));
+        };
+        let address = read_u64(&self.data, base + 20)?;
+        let name =
+            read_c_string(&self.data, base + 28).ok_or(Error::InvalidTrace("CtU name missing"))?;
+        Ok(CtURecord {
+            record_size: self.size as u32,
+            address,
+            name,
+        })
+    }
+
+    pub fn parse_ctulul_record(&self) -> Result<CttRecord> {
+        if self.record_type != RecordType::Ctulul {
+            return Err(Error::InvalidTrace("record was not a Ctulul record"));
+        }
+        let Some(base) = find_bytes(&self.data, b"Ctulul") else {
+            return Err(Error::InvalidTrace("Ctulul marker not found"));
+        };
+        if base + 52 > self.data.len() {
+            return Err(Error::InvalidTrace("Ctulul record too small"));
+        }
+        let binding_count = read_u32(&self.data, base + 44)?;
+        let buffer_start = base + 52;
+        let mut buffer_bindings = Vec::new();
+        for index in 0..binding_count as usize {
+            let offset = buffer_start + index * 8;
+            if offset + 8 > self.data.len() {
+                break;
+            }
+            buffer_bindings.push(read_u64(&self.data, offset)?);
+        }
+        let resource_bindings = buffer_bindings
+            .iter()
+            .enumerate()
+            .map(|(index, address)| ResourceBinding {
+                address: *address,
+                index,
+                usage: MTLResourceUsage::READ | MTLResourceUsage::WRITE,
+            })
+            .collect();
+        Ok(CttRecord {
+            record_size: self.size as u32,
+            command_flags: read_u32(&self.data, 4).unwrap_or_default(),
+            device_addr: 0,
+            function_addr: 0,
+            pipeline_addr: read_u64(&self.data, base + 8)?,
+            binding_count,
+            stride: 8,
+            buffer_bindings,
+            resource_bindings,
+        })
+    }
+
+    pub fn parse_c_record(&self) -> Result<CRecord> {
+        if self.record_type != RecordType::C {
+            return Err(Error::InvalidTrace("record was not a C record"));
+        }
+        let Some(base) = find_bytes(&self.data, b"C\0\0\0") else {
+            return Err(Error::InvalidTrace("C marker not found"));
+        };
+        Ok(CRecord {
+            record_size: self.size as u32,
+            command_flags: read_u32(&self.data, 4).unwrap_or_default(),
+            encoder_addr: read_u64(&self.data, base + 8)?,
+        })
+    }
+
+    pub fn parse_dispatch_record(&self) -> Result<CDispatchRecord> {
+        if self.record_type != RecordType::C3ul {
+            return Err(Error::InvalidTrace("record was not a dispatch record"));
+        }
+        if self.data.len() < 0x68 {
+            return Err(Error::InvalidTrace("dispatch record too small"));
+        }
+        Ok(CDispatchRecord {
+            record_size: self.size as u32,
+            command_flags: read_u32(&self.data, 4).unwrap_or_default(),
+            encoder_id: read_u64(&self.data, 0x30)?,
+            grid_size: [
+                read_u64(&self.data, 0x38)? as u32,
+                read_u64(&self.data, 0x40)? as u32,
+                read_u64(&self.data, 0x48)? as u32,
+            ],
+            group_size: [
+                read_u64(&self.data, 0x50)? as u32,
+                read_u64(&self.data, 0x58)? as u32,
+                read_u64(&self.data, 0x60)? as u32,
+            ],
+        })
+    }
+
     fn parse_csuwuw_record(&mut self) {
         let Some(base) = find_bytes(&self.data, b"CSuwuw") else {
             return;
@@ -245,6 +491,87 @@ pub struct CtRecord {
     pub command_flags: u32,
     pub pipeline_addr: u64,
     pub function_addr: u64,
+    pub binding_count: u32,
+    pub stride: u32,
+    pub buffer_bindings: Vec<u64>,
+    pub resource_bindings: Vec<ResourceBinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CiRecord {
+    pub record_size: u32,
+    pub command_flags: u32,
+    pub field_1: u32,
+    pub icb_addr: u64,
+    pub count: u32,
+    pub field_2: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CululRecord {
+    pub record_size: u32,
+    pub command_flags: u32,
+    pub marker_count: u32,
+    pub icb_addr: u64,
+    pub field_1: u32,
+    pub field_2: u32,
+    pub field_3: u32,
+    pub payload_size: u32,
+    pub payload_addr: u64,
+    pub array_count: u32,
+    pub array_stride: u32,
+    pub array_addresses: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CulRecord {
+    pub record_size: u32,
+    pub command_flags: u32,
+    pub marker_count: u32,
+    pub buffer_addr: u64,
+    pub field_1: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CuwRecord {
+    pub record_size: u32,
+    pub command_flags: u32,
+    pub marker_count: u32,
+    pub buffer_addr: u64,
+    pub field_1: u64,
+    pub field_2: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CtURecord {
+    pub record_size: u32,
+    pub address: u64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CRecord {
+    pub record_size: u32,
+    pub command_flags: u32,
+    pub encoder_addr: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CDispatchRecord {
+    pub record_size: u32,
+    pub command_flags: u32,
+    pub encoder_id: u64,
+    pub grid_size: [u32; 3],
+    pub group_size: [u32; 3],
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CttRecord {
+    pub record_size: u32,
+    pub command_flags: u32,
+    pub device_addr: u64,
+    pub function_addr: u64,
+    pub pipeline_addr: u64,
     pub binding_count: u32,
     pub stride: u32,
     pub buffer_bindings: Vec<u64>,
@@ -515,5 +842,61 @@ mod tests {
         assert_eq!(records[0].record_type, RecordType::CS);
         assert_eq!(records[0].address, Some(addr));
         assert_eq!(records[0].label.as_deref(), Some("Kernel"));
+    }
+
+    #[test]
+    fn parses_ctt_record() {
+        let mut data = vec![0u8; 96];
+        let marker_offset = 16;
+        data[marker_offset..marker_offset + 4].copy_from_slice(b"Ctt\0");
+        let device_addr = 0x1111u64;
+        let function_addr = 0x2222u64;
+        let pipeline_addr = 0x3333u64;
+        let binding = 0x4444u64;
+        data[marker_offset + 4..marker_offset + 12].copy_from_slice(&device_addr.to_le_bytes());
+        data[marker_offset + 12..marker_offset + 20].copy_from_slice(&function_addr.to_le_bytes());
+        data[marker_offset + 0x20..marker_offset + 0x28]
+            .copy_from_slice(&pipeline_addr.to_le_bytes());
+        data[marker_offset + 0x28..marker_offset + 0x2c].copy_from_slice(&1u32.to_le_bytes());
+        data[marker_offset + 0x2c..marker_offset + 0x30].copy_from_slice(&8u32.to_le_bytes());
+        data[marker_offset + 0x30..marker_offset + 0x38].copy_from_slice(&binding.to_le_bytes());
+
+        let record = MTSPRecord {
+            record_type: RecordType::Ctt,
+            offset: 0,
+            size: data.len(),
+            label: None,
+            address: None,
+            function_address: None,
+            data,
+        };
+        let ctt = record.parse_ctt_record().unwrap();
+        assert_eq!(ctt.device_addr, device_addr);
+        assert_eq!(ctt.function_addr, function_addr);
+        assert_eq!(ctt.pipeline_addr, pipeline_addr);
+        assert_eq!(ctt.buffer_bindings, vec![binding]);
+    }
+
+    #[test]
+    fn parses_ctu_record() {
+        let mut data = vec![0u8; 80];
+        let marker_offset = 10;
+        data[marker_offset..marker_offset + 10].copy_from_slice(b"CtU<b>ulul");
+        let address = 0xABCDEFu64;
+        data[marker_offset + 20..marker_offset + 28].copy_from_slice(&address.to_le_bytes());
+        data[marker_offset + 28..marker_offset + 38].copy_from_slice(b"MTLBuffer\0");
+
+        let record = MTSPRecord {
+            record_type: RecordType::CtU,
+            offset: 0,
+            size: data.len(),
+            label: None,
+            address: None,
+            function_address: None,
+            data,
+        };
+        let ctu = record.parse_ctu_record().unwrap();
+        assert_eq!(ctu.address, address);
+        assert_eq!(ctu.name, "MTLBuffer");
     }
 }
