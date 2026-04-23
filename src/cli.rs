@@ -7,6 +7,7 @@ use crate::automation::{self, XcodeProfileRun};
 use crate::buffer_timeline;
 use crate::buffers;
 use crate::commands;
+use crate::correlate;
 use crate::diff;
 use crate::error::Result;
 use crate::graphing;
@@ -32,6 +33,7 @@ enum CommandSet {
     Dependencies(DependenciesArgs),
     Shaders(ShadersArgs),
     ShaderSource(ShaderSourceArgs),
+    Correlate(CorrelateArgs),
     Timing(TimingArgs),
     CommandBuffers(CommandBuffersArgs),
     BufferAccess(BufferAccessArgs),
@@ -110,6 +112,17 @@ struct ShaderSourceArgs {
     search_paths: Vec<PathBuf>,
     #[arg(long, default_value_t = 4)]
     context: usize,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct CorrelateArgs {
+    trace: PathBuf,
+    #[arg(long = "search-path")]
+    search_paths: Vec<PathBuf>,
+    #[arg(short, long)]
+    verbose: bool,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -290,6 +303,20 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", shaders::format_source(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown shader-source format")),
+            }
+        }
+        CommandSet::Correlate(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let search_paths = if args.search_paths.is_empty() {
+                shaders::default_search_paths()
+            } else {
+                args.search_paths
+            };
+            let report = correlate::report(&trace, &search_paths)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", correlate::format_report(&report, args.verbose)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown correlate format")),
             }
         }
         CommandSet::Timing(args) => {
