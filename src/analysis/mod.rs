@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::trace::{KernelStat, TraceBundle, TraceSummary};
+use crate::trace::{BufferAccessStat, KernelStat, TraceBundle, TraceSummary};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnalysisReport {
@@ -20,8 +20,10 @@ pub struct AnalysisReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct BufferStat {
     pub name: String,
+    pub address: Option<u64>,
     pub kernel_count: usize,
     pub use_count: usize,
+    pub dispatch_count: usize,
 }
 
 pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
@@ -42,7 +44,19 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
             .cmp(&left.dispatch_count)
             .then_with(|| left.name.cmp(&right.name))
     });
-    let buffer_stats = summarize_buffers(&kernel_stats);
+    let mut buffer_stats: Vec<_> = trace
+        .analyze_buffers()
+        .unwrap_or_default()
+        .into_values()
+        .map(to_buffer_stat)
+        .collect();
+    buffer_stats.sort_by(|left, right| {
+        right
+            .use_count
+            .cmp(&left.use_count)
+            .then_with(|| right.kernel_count.cmp(&left.kernel_count))
+            .then_with(|| left.name.cmp(&right.name))
+    });
     let mut findings = Vec::new();
 
     if summary.device_resource_count == 0 {
@@ -104,63 +118,35 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
     }
 }
 
-fn summarize_buffers(kernel_stats: &[KernelStat]) -> Vec<BufferStat> {
-    let mut buffers: std::collections::BTreeMap<String, BufferStat> =
-        std::collections::BTreeMap::new();
-    for kernel in kernel_stats {
-        for (buffer_name, use_count) in &kernel.buffers {
-            let entry = buffers
-                .entry(buffer_name.clone())
-                .or_insert_with(|| BufferStat {
-                    name: buffer_name.clone(),
-                    kernel_count: 0,
-                    use_count: 0,
-                });
-            entry.kernel_count += 1;
-            entry.use_count += use_count;
-        }
+fn to_buffer_stat(buffer: BufferAccessStat) -> BufferStat {
+    BufferStat {
+        name: buffer.name,
+        address: buffer.address,
+        kernel_count: buffer.kernels.len(),
+        use_count: buffer.use_count,
+        dispatch_count: buffer.dispatch_count,
     }
-    let mut values: Vec<_> = buffers.into_values().collect();
-    values.sort_by(|left, right| {
-        right
-            .use_count
-            .cmp(&left.use_count)
-            .then_with(|| right.kernel_count.cmp(&left.kernel_count))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    values
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::KernelStat;
 
     #[test]
-    fn summarizes_buffers_across_kernels() {
-        let stats = vec![
-            KernelStat {
-                name: "a".into(),
-                pipeline_addr: 1,
-                dispatch_count: 2,
-                encoder_labels: Default::default(),
-                buffers: [("buf1".into(), 2), ("buf2".into(), 1)]
-                    .into_iter()
-                    .collect(),
-            },
-            KernelStat {
-                name: "b".into(),
-                pipeline_addr: 2,
-                dispatch_count: 3,
-                encoder_labels: Default::default(),
-                buffers: [("buf1".into(), 4)].into_iter().collect(),
-            },
-        ];
+    fn converts_buffer_access_stats() {
+        let stat = BufferAccessStat {
+            name: "buf1".into(),
+            address: Some(0x10),
+            use_count: 6,
+            dispatch_count: 6,
+            kernels: [("a".into(), 2), ("b".into(), 4)].into_iter().collect(),
+        };
 
-        let buffers = summarize_buffers(&stats);
-        assert_eq!(buffers.len(), 2);
-        assert_eq!(buffers[0].name, "buf1");
-        assert_eq!(buffers[0].kernel_count, 2);
-        assert_eq!(buffers[0].use_count, 6);
+        let buffer = to_buffer_stat(stat);
+        assert_eq!(buffer.name, "buf1");
+        assert_eq!(buffer.address, Some(0x10));
+        assert_eq!(buffer.kernel_count, 2);
+        assert_eq!(buffer.use_count, 6);
+        assert_eq!(buffer.dispatch_count, 6);
     }
 }

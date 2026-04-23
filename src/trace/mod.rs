@@ -121,6 +121,15 @@ pub struct BoundBuffer {
     pub index: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferAccessStat {
+    pub name: String,
+    pub address: Option<u64>,
+    pub use_count: usize,
+    pub dispatch_count: usize,
+    pub kernels: BTreeMap<String, usize>,
+}
+
 impl TraceBundle {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -355,6 +364,40 @@ impl TraceBundle {
             collect_buffer_names_from_data(&data, &mut names)?;
         }
         Ok(names)
+    }
+
+    pub fn analyze_buffers(&self) -> Result<BTreeMap<String, BufferAccessStat>> {
+        let regions = self.command_buffer_regions()?;
+        let mut stats = BTreeMap::new();
+
+        for region in regions {
+            for dispatch in region.dispatches {
+                let kernel_name = dispatch
+                    .kernel_name
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_owned());
+                for buffer in dispatch.buffers {
+                    let name = buffer
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("0x{:x}", buffer.address));
+                    let entry = stats
+                        .entry(name.clone())
+                        .or_insert_with(|| BufferAccessStat {
+                            name: name.clone(),
+                            address: Some(buffer.address),
+                            use_count: 0,
+                            dispatch_count: 0,
+                            kernels: BTreeMap::new(),
+                        });
+                    entry.use_count += 1;
+                    entry.dispatch_count += 1;
+                    *entry.kernels.entry(kernel_name.clone()).or_default() += 1;
+                }
+            }
+        }
+
+        Ok(stats)
     }
 }
 
