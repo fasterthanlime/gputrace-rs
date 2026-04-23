@@ -12,6 +12,7 @@ use crate::trace::{BoundBuffer, CommandBufferRegion, TraceBundle};
 #[derive(Debug, Clone, Serialize)]
 pub struct TimelineReport {
     pub synthetic: bool,
+    pub source: String,
     pub command_buffers_profiler_backed: bool,
     pub start_time_ns: u64,
     pub end_time_ns: u64,
@@ -141,13 +142,17 @@ struct DispatchSpan {
 
 pub fn report(trace: &TraceBundle) -> Result<TimelineReport> {
     let regions = trace.command_buffer_regions()?;
-    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
-    Ok(build(&regions, profiler_summary.as_ref()))
+    if let Ok(profiler_summary) = profiler::stream_data_summary(&trace.path) {
+        return Ok(build(&regions, Some(&profiler_summary), None));
+    }
+    let raw_timings = profiler::raw_encoder_timings(&trace.path).ok();
+    Ok(build(&regions, None, raw_timings.as_deref()))
 }
 
 pub fn build(
     regions: &[CommandBufferRegion],
     profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+    raw_encoder_timings: Option<&[profiler::ProfilerRawEncoderTiming]>,
 ) -> TimelineReport {
     let mut command_buffers = Vec::new();
     let mut encoders = Vec::new();
@@ -159,7 +164,6 @@ pub fn build(
     let profiler_dispatches = profiler_summary.map(|summary| &summary.dispatches[..]);
     let command_buffers_profiler_backed =
         profiler_timeline.is_some_and(|timeline| !timeline.command_buffer_timestamps.is_empty());
-    let mut profiler_dispatch_count = 0usize;
 
     events.push(metadata_event(1, 0, "process_name", "gputrace timeline"));
     events.push(metadata_event(1, 1, "thread_name", "Command Buffers"));
@@ -209,7 +213,10 @@ pub fn build(
             duration_ns,
             profiler_timeline,
             profiler_dispatches,
+            raw_encoder_timings,
         );
+        let raw_encoder_spans =
+            build_raw_encoder_spans(region, timestamp_ns, duration_ns, raw_encoder_timings);
         let mut encoder_dispatches: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (dispatch_pos, span) in dispatch_spans.iter().enumerate() {
             if let Some(address) = span.encoder_address {
@@ -237,6 +244,9 @@ pub fn build(
                         .iter()
                         .any(|position| dispatch_spans[*position].synthetic());
                     (start, end, duration, synthetic)
+                } else if let Some((start, end, duration)) = raw_encoder_spans.get(&encoder.address)
+                {
+                    (*start, *end, *duration, false)
                 } else if let Some(cb_duration_ns) = duration_ns {
                     let slice = if region.encoders.is_empty() {
                         0
@@ -300,9 +310,6 @@ pub fn build(
         }
 
         for span in dispatch_spans {
-            if !span.synthetic() {
-                profiler_dispatch_count += 1;
-            }
             let encoder_index = span.encoder_address.and_then(|address| {
                 region
                     .encoders
@@ -398,7 +405,14 @@ pub fn build(
     dispatches.sort_by(|left, right| left.index.cmp(&right.index));
 
     TimelineReport {
-        synthetic: !command_buffers_profiler_backed && profiler_dispatch_count == 0,
+        synthetic: profiler_summary.is_none() && raw_encoder_timings.is_none(),
+        source: if profiler_summary.is_some() {
+            "streamData".to_owned()
+        } else if raw_encoder_timings.is_some_and(|timings| !timings.is_empty()) {
+            "raw-profiler-heuristic".to_owned()
+        } else {
+            "synthetic".to_owned()
+        },
         command_buffers_profiler_backed,
         start_time_ns,
         end_time_ns,
@@ -427,15 +441,21 @@ pub fn export_raw_json(report: &RawTimelineReport) -> Result<String> {
 
 pub fn format_report(report: &TimelineReport) -> String {
     let mut out = String::new();
-    if report.command_buffers_profiler_backed && !report.synthetic {
+    if report.source == "streamData" && report.command_buffers_profiler_backed && !report.synthetic
+    {
         out.push_str("Profiler-backed timeline report\n");
         out.push_str(
             "Command-buffer and dispatch spans come from profiler data when available; remaining gaps stay synthetic.\n\n",
         );
-    } else if report.command_buffers_profiler_backed {
+    } else if report.source == "streamData" && report.command_buffers_profiler_backed {
         out.push_str("Mixed timeline report\n");
         out.push_str(
             "Command-buffer spans come from profiler APSTimelineData; encoder and dispatch slices remain synthetic.\n\n",
+        );
+    } else if report.source == "raw-profiler-heuristic" {
+        out.push_str("Raw-profiler timeline report\n");
+        out.push_str(
+            "Encoder spans come from Counters_f_* heuristic timing; command-buffer rows still follow trace ordering and dispatch slices stay synthetic inside encoder windows.\n\n",
         );
     } else {
         out.push_str("Synthetic timeline report\n");
@@ -660,6 +680,7 @@ fn build_dispatch_spans(
     duration_ns: Option<u64>,
     profiler_timeline: Option<&profiler::ProfilerTimelineInfo>,
     profiler_dispatches: Option<&[profiler::ProfilerDispatch]>,
+    raw_encoder_timings: Option<&[profiler::ProfilerRawEncoderTiming]>,
 ) -> Vec<DispatchSpan> {
     let first_command_buffer_start_ticks = profiler_timeline.and_then(|timeline| {
         timeline
@@ -744,6 +765,81 @@ fn build_dispatch_spans(
         }
     }
 
+    let raw_encoder_spans = build_raw_encoder_spans(
+        region,
+        command_buffer_start_ns,
+        duration_ns,
+        raw_encoder_timings,
+    );
+    if !raw_encoder_spans.is_empty() {
+        let mut per_encoder_dispatches = BTreeMap::<u64, usize>::new();
+        for dispatch in &region.dispatches {
+            if let Some(address) = dispatch.encoder_id {
+                *per_encoder_dispatches.entry(address).or_default() += 1;
+            }
+        }
+
+        let mut spans = Vec::with_capacity(region.dispatches.len());
+        let mut encoder_progress = BTreeMap::<u64, u64>::new();
+        for dispatch in &region.dispatches {
+            let (encoder_label, encoder_address) = dispatch
+                .encoder_id
+                .and_then(|address| {
+                    region
+                        .encoders
+                        .iter()
+                        .find(|encoder| encoder.address == address)
+                        .map(|encoder| (Some(encoder.label.clone()), Some(encoder.address)))
+                })
+                .unwrap_or((None, dispatch.encoder_id));
+
+            let (start_time_ns, end_time_ns, duration_ns, synthetic) = if let Some(address) =
+                encoder_address
+            {
+                if let Some((encoder_start_ns, _encoder_end_ns, encoder_duration_ns)) =
+                    raw_encoder_spans.get(&address)
+                {
+                    let dispatch_count = per_encoder_dispatches.get(&address).copied().unwrap_or(1);
+                    let per_dispatch_duration = encoder_duration_ns
+                        .map(|duration| duration / dispatch_count as u64)
+                        .filter(|duration| *duration > 0);
+                    let offset = encoder_progress.entry(address).or_default();
+                    let start = encoder_start_ns.saturating_add(*offset);
+                    let end = per_dispatch_duration
+                        .map(|duration| start.saturating_add(duration))
+                        .unwrap_or(start);
+                    if let Some(duration) = per_dispatch_duration {
+                        *offset = offset.saturating_add(duration);
+                    }
+                    (start, end, per_dispatch_duration, false)
+                } else {
+                    (command_buffer_start_ns, command_buffer_start_ns, None, true)
+                }
+            } else {
+                (command_buffer_start_ns, command_buffer_start_ns, None, true)
+            };
+
+            spans.push(DispatchSpan {
+                index: dispatch.index,
+                encoder_address,
+                encoder_label,
+                kernel_name: dispatch.kernel_name.clone(),
+                start_time_ns,
+                end_time_ns,
+                duration_ns,
+                grid_size: dispatch.grid_size,
+                group_size: dispatch.group_size,
+                buffers: dispatch
+                    .buffers
+                    .iter()
+                    .map(bound_buffer_to_timeline)
+                    .collect(),
+                synthetic,
+            });
+        }
+        return spans;
+    }
+
     let dispatch_count = region.dispatches.len();
     let per_dispatch_duration = duration_ns.and_then(|duration| {
         if dispatch_count == 0 {
@@ -790,6 +886,54 @@ fn build_dispatch_spans(
             synthetic: true,
         });
         current_start_ns = span_end_ns;
+    }
+    spans
+}
+
+fn build_raw_encoder_spans(
+    region: &CommandBufferRegion,
+    command_buffer_start_ns: u64,
+    duration_ns: Option<u64>,
+    raw_encoder_timings: Option<&[profiler::ProfilerRawEncoderTiming]>,
+) -> BTreeMap<u64, (u64, u64, Option<u64>)> {
+    let Some(raw_encoder_timings) = raw_encoder_timings else {
+        return BTreeMap::new();
+    };
+
+    let duration_by_index = raw_encoder_timings
+        .iter()
+        .map(|timing| (timing.index, timing.duration_ns))
+        .collect::<BTreeMap<_, _>>();
+    let known_total = region
+        .encoders
+        .iter()
+        .filter_map(|encoder| duration_by_index.get(&encoder.index).copied())
+        .sum::<u64>();
+    let unknown_count = region
+        .encoders
+        .iter()
+        .filter(|encoder| !duration_by_index.contains_key(&encoder.index))
+        .count();
+    let fallback_per_unknown = duration_ns
+        .and_then(|duration| duration.checked_sub(known_total))
+        .map(|remaining| remaining / unknown_count.max(1) as u64)
+        .filter(|duration| *duration > 0);
+
+    let mut current_start_ns = command_buffer_start_ns;
+    let mut spans = BTreeMap::new();
+    for encoder in &region.encoders {
+        let encoder_duration_ns = duration_by_index
+            .get(&encoder.index)
+            .copied()
+            .or(fallback_per_unknown);
+        let end_time_ns = encoder_duration_ns
+            .map(|duration| current_start_ns.saturating_add(duration))
+            .unwrap_or(current_start_ns);
+        spans.insert(
+            encoder.address,
+            (current_start_ns, end_time_ns, encoder_duration_ns),
+        );
+        current_start_ns = end_time_ns;
     }
     spans
 }
@@ -1074,9 +1218,10 @@ mod tests {
             },
         ];
 
-        let report = build(&regions, None);
+        let report = build(&regions, None, None);
 
         assert!(report.synthetic);
+        assert_eq!(report.source, "synthetic");
         assert!(!report.command_buffers_profiler_backed);
         assert_eq!(report.command_buffer_count, 2);
         assert_eq!(report.encoder_count, 1);
@@ -1146,9 +1291,10 @@ mod tests {
         };
 
         let summary = profiler_summary_with_timeline(timeline, vec![]);
-        let report = build(&regions, Some(&summary));
+        let report = build(&regions, Some(&summary), None);
 
         assert!(!report.synthetic);
+        assert_eq!(report.source, "streamData");
         assert!(report.command_buffers_profiler_backed);
         assert_eq!(report.command_buffers[0].timestamp_ns, 0);
         assert_eq!(report.command_buffers[0].duration_ns, Some(1_500));
@@ -1239,9 +1385,10 @@ mod tests {
         ];
 
         let summary = profiler_summary_with_timeline(timeline, dispatches);
-        let report = build(&regions, Some(&summary));
+        let report = build(&regions, Some(&summary), None);
 
         assert!(!report.synthetic);
+        assert_eq!(report.source, "streamData");
         assert!(report.command_buffers_profiler_backed);
         assert_eq!(report.dispatches[0].start_time_ns, 0);
         assert_eq!(report.dispatches[0].duration_ns, Some(400));
@@ -1252,6 +1399,108 @@ mod tests {
 
         let text = format_report(&report);
         assert!(text.contains("Profiler-backed timeline report"));
+    }
+
+    #[test]
+    fn builds_raw_profiler_backed_encoder_and_dispatch_spans() {
+        let regions = vec![
+            CommandBufferRegion {
+                command_buffer: CommandBuffer {
+                    index: 0,
+                    timestamp: 1_000_000,
+                    offset: 0,
+                },
+                end_offset: 100,
+                encoders: vec![
+                    ComputeEncoder {
+                        index: 0,
+                        address: 0x10,
+                        label: "main".to_owned(),
+                        offset: 10,
+                    },
+                    ComputeEncoder {
+                        index: 1,
+                        address: 0x20,
+                        label: "aux".to_owned(),
+                        offset: 11,
+                    },
+                ],
+                pipeline_events: vec![],
+                dispatches: vec![
+                    DispatchCall {
+                        index: 0,
+                        offset: 20,
+                        encoder_id: Some(0x10),
+                        pipeline_addr: Some(0xaa),
+                        kernel_name: Some("k0".to_owned()),
+                        buffers: vec![],
+                        grid_size: [8, 1, 1],
+                        group_size: [4, 1, 1],
+                    },
+                    DispatchCall {
+                        index: 1,
+                        offset: 30,
+                        encoder_id: Some(0x10),
+                        pipeline_addr: Some(0xbb),
+                        kernel_name: Some("k1".to_owned()),
+                        buffers: vec![],
+                        grid_size: [16, 1, 1],
+                        group_size: [8, 1, 1],
+                    },
+                    DispatchCall {
+                        index: 2,
+                        offset: 40,
+                        encoder_id: Some(0x20),
+                        pipeline_addr: Some(0xcc),
+                        kernel_name: Some("k2".to_owned()),
+                        buffers: vec![],
+                        grid_size: [4, 1, 1],
+                        group_size: [4, 1, 1],
+                    },
+                ],
+            },
+            CommandBufferRegion {
+                command_buffer: CommandBuffer {
+                    index: 1,
+                    timestamp: 5_000_000,
+                    offset: 100,
+                },
+                end_offset: 200,
+                encoders: vec![],
+                pipeline_events: vec![],
+                dispatches: vec![],
+            },
+        ];
+
+        let raw_timings = vec![
+            profiler::ProfilerRawEncoderTiming {
+                index: 0,
+                duration_ns: 2_000_000,
+                confidence_milli: 300,
+            },
+            profiler::ProfilerRawEncoderTiming {
+                index: 1,
+                duration_ns: 1_000_000,
+                confidence_milli: 300,
+            },
+        ];
+
+        let report = build(&regions, None, Some(&raw_timings));
+
+        assert!(!report.synthetic);
+        assert_eq!(report.source, "raw-profiler-heuristic");
+        assert!(!report.command_buffers_profiler_backed);
+        assert_eq!(report.encoders[0].duration_ns, Some(2_000_000));
+        assert_eq!(report.encoders[1].duration_ns, Some(1_000_000));
+        assert!(!report.encoders[0].synthetic);
+        assert!(!report.dispatches[0].synthetic);
+        assert_eq!(report.dispatches[0].start_time_ns, 1_000_000);
+        assert_eq!(report.dispatches[0].duration_ns, Some(1_000_000));
+        assert_eq!(report.dispatches[1].start_time_ns, 2_000_000);
+        assert_eq!(report.dispatches[2].start_time_ns, 3_000_000);
+
+        let text = format_report(&report);
+        assert!(text.contains("Raw-profiler timeline report"));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::analysis;
 use crate::error::Result;
+use crate::timeline;
 use crate::timing;
 use crate::trace::TraceBundle;
 
@@ -63,6 +64,8 @@ pub struct DependencyNode {
     pub command_buffer_index: usize,
     pub encoder_label: Option<String>,
     pub kernel_name: Option<String>,
+    pub start_time_ns: Option<u64>,
+    pub end_time_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -288,10 +291,36 @@ pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
 
 pub fn dependencies(trace: &TraceBundle) -> Result<DependencyReport> {
     let regions = trace.command_buffer_regions()?;
-    let mut nodes = Vec::new();
-    let mut edges: BTreeMap<(usize, usize), DependencyAccumulator> = BTreeMap::new();
-    let mut last_user: BTreeMap<String, (usize, crate::trace::MTLResourceUsage)> = BTreeMap::new();
+    let timeline = timeline::report(trace).ok();
+    let dispatch_spans = timeline
+        .as_ref()
+        .map(|report| {
+            report
+                .dispatches
+                .iter()
+                .map(|dispatch| {
+                    (
+                        dispatch.index,
+                        (dispatch.start_time_ns, dispatch.end_time_ns),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
 
+    #[derive(Clone)]
+    struct OrderedDispatch {
+        index: usize,
+        command_buffer_index: usize,
+        encoder_label: Option<String>,
+        kernel_name: Option<String>,
+        label: String,
+        start_time_ns: Option<u64>,
+        end_time_ns: Option<u64>,
+        buffers: Vec<crate::trace::BoundBuffer>,
+    }
+
+    let mut ordered_dispatches = Vec::new();
     for region in regions {
         for dispatch in region.dispatches {
             let label = dispatch
@@ -305,38 +334,69 @@ pub fn dependencies(trace: &TraceBundle) -> Result<DependencyReport> {
                         .map(|encoder| encoder.label.clone())
                 })
                 .unwrap_or_else(|| format!("dispatch_{}", dispatch.index));
+            let encoder_label = region
+                .encoders
+                .iter()
+                .find(|encoder| Some(encoder.address) == dispatch.encoder_id)
+                .map(|encoder| encoder.label.clone())
+                .filter(|label| !label.is_empty());
+            let (start_time_ns, end_time_ns) = dispatch_spans
+                .get(&dispatch.index)
+                .copied()
+                .map(|(start, end)| (Some(start), Some(end)))
+                .unwrap_or((None, None));
 
-            nodes.push(DependencyNode {
-                id: dispatch.index,
-                label: label.clone(),
+            ordered_dispatches.push(OrderedDispatch {
+                index: dispatch.index,
                 command_buffer_index: region.command_buffer.index,
-                encoder_label: region
-                    .encoders
-                    .iter()
-                    .find(|encoder| Some(encoder.address) == dispatch.encoder_id)
-                    .map(|encoder| encoder.label.clone())
-                    .filter(|label| !label.is_empty()),
+                encoder_label,
                 kernel_name: dispatch.kernel_name.clone(),
+                label,
+                start_time_ns,
+                end_time_ns,
+                buffers: dispatch.buffers,
             });
+        }
+    }
+    ordered_dispatches.sort_by(|left, right| {
+        left.start_time_ns
+            .unwrap_or(u64::MAX)
+            .cmp(&right.start_time_ns.unwrap_or(u64::MAX))
+            .then_with(|| left.index.cmp(&right.index))
+    });
 
-            let mut seen_buffers = BTreeSet::new();
-            for buffer in dispatch.buffers {
-                let buffer_name = buffer
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("0x{:x}", buffer.address));
-                if !seen_buffers.insert(buffer_name.clone()) {
-                    continue;
-                }
-                if let Some((previous, previous_usage)) =
-                    last_user.insert(buffer_name.clone(), (dispatch.index, buffer.usage))
-                    && previous != dispatch.index
-                {
-                    edges
-                        .entry((previous, dispatch.index))
-                        .or_default()
-                        .push(buffer_name, classify_hazard(previous_usage, buffer.usage));
-                }
+    let mut nodes = Vec::new();
+    let mut edges: BTreeMap<(usize, usize), DependencyAccumulator> = BTreeMap::new();
+    let mut last_user: BTreeMap<String, (usize, crate::trace::MTLResourceUsage)> = BTreeMap::new();
+
+    for dispatch in ordered_dispatches {
+        nodes.push(DependencyNode {
+            id: dispatch.index,
+            label: dispatch.label.clone(),
+            command_buffer_index: dispatch.command_buffer_index,
+            encoder_label: dispatch.encoder_label.clone(),
+            kernel_name: dispatch.kernel_name.clone(),
+            start_time_ns: dispatch.start_time_ns,
+            end_time_ns: dispatch.end_time_ns,
+        });
+
+        let mut seen_buffers = BTreeSet::new();
+        for buffer in dispatch.buffers {
+            let buffer_name = buffer
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("0x{:x}", buffer.address));
+            if !seen_buffers.insert(buffer_name.clone()) {
+                continue;
+            }
+            if let Some((previous, previous_usage)) =
+                last_user.insert(buffer_name.clone(), (dispatch.index, buffer.usage))
+                && previous != dispatch.index
+            {
+                edges
+                    .entry((previous, dispatch.index))
+                    .or_default()
+                    .push(buffer_name, classify_hazard(previous_usage, buffer.usage));
             }
         }
     }
@@ -1136,6 +1196,8 @@ mod tests {
                     command_buffer_index: 0,
                     encoder_label: Some("enc0".into()),
                     kernel_name: Some("first".into()),
+                    start_time_ns: None,
+                    end_time_ns: None,
                 },
                 DependencyNode {
                     id: 1,
@@ -1143,6 +1205,8 @@ mod tests {
                     command_buffer_index: 0,
                     encoder_label: Some("enc1".into()),
                     kernel_name: Some("second".into()),
+                    start_time_ns: None,
+                    end_time_ns: None,
                 },
             ],
             edges: vec![DependencyEdge {
@@ -1203,6 +1267,8 @@ mod tests {
                     command_buffer_index: 3,
                     encoder_label: Some("main".into()),
                     kernel_name: Some("blur".into()),
+                    start_time_ns: None,
+                    end_time_ns: None,
                 },
                 DependencyNode {
                     id: 4,
@@ -1210,6 +1276,8 @@ mod tests {
                     command_buffer_index: 3,
                     encoder_label: None,
                     kernel_name: None,
+                    start_time_ns: None,
+                    end_time_ns: None,
                 },
             ],
             edges: vec![DependencyEdge {
@@ -1243,6 +1311,8 @@ mod tests {
                 command_buffer_index: 0,
                 encoder_label: None,
                 kernel_name: None,
+                start_time_ns: None,
+                end_time_ns: None,
             }],
             edges: vec![],
         };
