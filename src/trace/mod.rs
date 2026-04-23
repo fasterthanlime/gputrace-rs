@@ -130,6 +130,20 @@ pub struct BufferAccessStat {
     pub kernels: BTreeMap<String, usize>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferLifecycleStat {
+    pub name: String,
+    pub address: Option<u64>,
+    pub first_command_buffer_index: usize,
+    pub last_command_buffer_index: usize,
+    pub first_dispatch_index: usize,
+    pub last_dispatch_index: usize,
+    pub command_buffer_span: usize,
+    pub dispatch_span: usize,
+    pub use_count: usize,
+    pub kernels: BTreeMap<String, usize>,
+}
+
 impl TraceBundle {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -398,6 +412,11 @@ impl TraceBundle {
         }
 
         Ok(stats)
+    }
+
+    pub fn analyze_buffer_lifecycles(&self) -> Result<BTreeMap<String, BufferLifecycleStat>> {
+        let regions = self.command_buffer_regions()?;
+        Ok(analyze_buffer_lifecycles_from_regions(&regions))
     }
 }
 
@@ -724,6 +743,56 @@ fn attribute_dispatches(
     dispatches
 }
 
+fn analyze_buffer_lifecycles_from_regions(
+    regions: &[CommandBufferRegion],
+) -> BTreeMap<String, BufferLifecycleStat> {
+    let mut stats = BTreeMap::new();
+
+    for region in regions {
+        for dispatch in &region.dispatches {
+            let kernel_name = dispatch
+                .kernel_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
+            for buffer in &dispatch.buffers {
+                let name = buffer
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("0x{:x}", buffer.address));
+                let entry = stats
+                    .entry(name.clone())
+                    .or_insert_with(|| BufferLifecycleStat {
+                        name: name.clone(),
+                        address: Some(buffer.address),
+                        first_command_buffer_index: region.command_buffer.index,
+                        last_command_buffer_index: region.command_buffer.index,
+                        first_dispatch_index: dispatch.index,
+                        last_dispatch_index: dispatch.index,
+                        command_buffer_span: 1,
+                        dispatch_span: 1,
+                        use_count: 0,
+                        kernels: BTreeMap::new(),
+                    });
+                entry.first_command_buffer_index = entry
+                    .first_command_buffer_index
+                    .min(region.command_buffer.index);
+                entry.last_command_buffer_index = entry
+                    .last_command_buffer_index
+                    .max(region.command_buffer.index);
+                entry.first_dispatch_index = entry.first_dispatch_index.min(dispatch.index);
+                entry.last_dispatch_index = entry.last_dispatch_index.max(dispatch.index);
+                entry.command_buffer_span =
+                    entry.last_command_buffer_index - entry.first_command_buffer_index + 1;
+                entry.dispatch_span = entry.last_dispatch_index - entry.first_dispatch_index + 1;
+                entry.use_count += 1;
+                *entry.kernels.entry(kernel_name.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    stats
+}
+
 fn find_bytes_from(data: &[u8], needle: &[u8], offset: usize) -> Option<usize> {
     data.get(offset..)?
         .windows(needle.len())
@@ -885,5 +954,91 @@ mod tests {
             regions[1].dispatches[0].buffers[0].name.as_deref(),
             Some("bb")
         );
+    }
+
+    #[test]
+    fn analyzes_buffer_lifecycles_from_regions() {
+        let regions = vec![
+            CommandBufferRegion {
+                command_buffer: CommandBuffer {
+                    index: 0,
+                    timestamp: 1,
+                    offset: 0,
+                },
+                end_offset: 10,
+                encoders: vec![],
+                pipeline_events: vec![],
+                dispatches: vec![
+                    DispatchCall {
+                        index: 0,
+                        offset: 1,
+                        encoder_id: Some(1),
+                        pipeline_addr: Some(10),
+                        kernel_name: Some("ka".into()),
+                        buffers: vec![BoundBuffer {
+                            address: 0xaa,
+                            name: Some("ba".into()),
+                            index: 0,
+                        }],
+                        grid_size: [1, 1, 1],
+                        group_size: [1, 1, 1],
+                    },
+                    DispatchCall {
+                        index: 1,
+                        offset: 2,
+                        encoder_id: Some(1),
+                        pipeline_addr: Some(10),
+                        kernel_name: Some("kb".into()),
+                        buffers: vec![BoundBuffer {
+                            address: 0xbb,
+                            name: Some("bb".into()),
+                            index: 1,
+                        }],
+                        grid_size: [1, 1, 1],
+                        group_size: [1, 1, 1],
+                    },
+                ],
+            },
+            CommandBufferRegion {
+                command_buffer: CommandBuffer {
+                    index: 2,
+                    timestamp: 2,
+                    offset: 10,
+                },
+                end_offset: 20,
+                encoders: vec![],
+                pipeline_events: vec![],
+                dispatches: vec![DispatchCall {
+                    index: 4,
+                    offset: 12,
+                    encoder_id: Some(2),
+                    pipeline_addr: Some(20),
+                    kernel_name: Some("ka".into()),
+                    buffers: vec![BoundBuffer {
+                        address: 0xaa,
+                        name: Some("ba".into()),
+                        index: 0,
+                    }],
+                    grid_size: [1, 1, 1],
+                    group_size: [1, 1, 1],
+                }],
+            },
+        ];
+        let stats = analyze_buffer_lifecycles_from_regions(&regions);
+
+        let ba = stats.get("ba").unwrap();
+        assert_eq!(ba.first_command_buffer_index, 0);
+        assert_eq!(ba.last_command_buffer_index, 2);
+        assert_eq!(ba.command_buffer_span, 3);
+        assert_eq!(ba.first_dispatch_index, 0);
+        assert_eq!(ba.last_dispatch_index, 4);
+        assert_eq!(ba.dispatch_span, 5);
+        assert_eq!(ba.use_count, 2);
+        assert_eq!(ba.kernels.get("ka"), Some(&2));
+
+        let bb = stats.get("bb").unwrap();
+        assert_eq!(bb.command_buffer_span, 1);
+        assert_eq!(bb.dispatch_span, 1);
+        assert_eq!(bb.use_count, 1);
     }
 }

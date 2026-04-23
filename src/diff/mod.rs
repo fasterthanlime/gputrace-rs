@@ -246,6 +246,7 @@ mod tests {
                 },
             ],
             buffer_stats: vec![],
+            buffer_lifecycles: vec![],
             findings: vec![],
         };
         let right = AnalysisReport {

@@ -68,6 +68,20 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
             ));
         }
     }
+    if !report.buffer_lifecycles.is_empty() {
+        out.push_str("\n## Buffer Lifecycles\n\n");
+        for stat in report.buffer_lifecycles.iter().take(10) {
+            out.push_str(&format!(
+                "- `{}`: command buffers {}..{}, dispatches {}..{}, {} total uses\n",
+                stat.name,
+                stat.first_command_buffer_index,
+                stat.last_command_buffer_index,
+                stat.first_dispatch_index,
+                stat.last_dispatch_index,
+                stat.use_count
+            ));
+        }
+    }
     out
 }
 

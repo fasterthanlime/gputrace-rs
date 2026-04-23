@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::trace::{BufferAccessStat, KernelStat, TraceBundle, TraceSummary};
+use crate::trace::{BufferAccessStat, BufferLifecycleStat, KernelStat, TraceBundle, TraceSummary};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnalysisReport {
@@ -14,6 +14,7 @@ pub struct AnalysisReport {
     pub buffer_count: usize,
     pub kernel_stats: Vec<KernelStat>,
     pub buffer_stats: Vec<BufferStat>,
+    pub buffer_lifecycles: Vec<BufferLifecycle>,
     pub findings: Vec<String>,
 }
 
@@ -24,6 +25,20 @@ pub struct BufferStat {
     pub kernel_count: usize,
     pub use_count: usize,
     pub dispatch_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferLifecycle {
+    pub name: String,
+    pub address: Option<u64>,
+    pub first_command_buffer_index: usize,
+    pub last_command_buffer_index: usize,
+    pub first_dispatch_index: usize,
+    pub last_dispatch_index: usize,
+    pub command_buffer_span: usize,
+    pub dispatch_span: usize,
+    pub use_count: usize,
+    pub kernel_count: usize,
 }
 
 pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
@@ -55,6 +70,20 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
             .use_count
             .cmp(&left.use_count)
             .then_with(|| right.kernel_count.cmp(&left.kernel_count))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let mut buffer_lifecycles: Vec<_> = trace
+        .analyze_buffer_lifecycles()
+        .unwrap_or_default()
+        .into_values()
+        .map(to_buffer_lifecycle)
+        .collect();
+    buffer_lifecycles.sort_by(|left, right| {
+        right
+            .command_buffer_span
+            .cmp(&left.command_buffer_span)
+            .then_with(|| right.dispatch_span.cmp(&left.dispatch_span))
+            .then_with(|| right.use_count.cmp(&left.use_count))
             .then_with(|| left.name.cmp(&right.name))
     });
     let mut findings = Vec::new();
@@ -102,6 +131,14 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
             top_buffer.name, top_buffer.use_count, top_buffer.kernel_count
         ));
     }
+    if let Some(longest_lived_buffer) = buffer_lifecycles.first() {
+        findings.push(format!(
+            "Longest-lived buffer: {} ({} command buffers, {} dispatches)",
+            longest_lived_buffer.name,
+            longest_lived_buffer.command_buffer_span,
+            longest_lived_buffer.dispatch_span
+        ));
+    }
 
     AnalysisReport {
         trace: summary,
@@ -114,6 +151,7 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
         buffer_count: buffer_stats.len(),
         kernel_stats,
         buffer_stats,
+        buffer_lifecycles,
         findings,
     }
 }
@@ -125,6 +163,21 @@ fn to_buffer_stat(buffer: BufferAccessStat) -> BufferStat {
         kernel_count: buffer.kernels.len(),
         use_count: buffer.use_count,
         dispatch_count: buffer.dispatch_count,
+    }
+}
+
+fn to_buffer_lifecycle(buffer: BufferLifecycleStat) -> BufferLifecycle {
+    BufferLifecycle {
+        name: buffer.name,
+        address: buffer.address,
+        first_command_buffer_index: buffer.first_command_buffer_index,
+        last_command_buffer_index: buffer.last_command_buffer_index,
+        first_dispatch_index: buffer.first_dispatch_index,
+        last_dispatch_index: buffer.last_dispatch_index,
+        command_buffer_span: buffer.command_buffer_span,
+        dispatch_span: buffer.dispatch_span,
+        use_count: buffer.use_count,
+        kernel_count: buffer.kernels.len(),
     }
 }
 
@@ -148,5 +201,29 @@ mod tests {
         assert_eq!(buffer.kernel_count, 2);
         assert_eq!(buffer.use_count, 6);
         assert_eq!(buffer.dispatch_count, 6);
+    }
+
+    #[test]
+    fn converts_buffer_lifecycle_stats() {
+        let stat = BufferLifecycleStat {
+            name: "buf1".into(),
+            address: Some(0x10),
+            first_command_buffer_index: 1,
+            last_command_buffer_index: 3,
+            first_dispatch_index: 2,
+            last_dispatch_index: 7,
+            command_buffer_span: 3,
+            dispatch_span: 6,
+            use_count: 4,
+            kernels: [("a".into(), 2), ("b".into(), 2)].into_iter().collect(),
+        };
+
+        let buffer = to_buffer_lifecycle(stat);
+        assert_eq!(buffer.name, "buf1");
+        assert_eq!(buffer.address, Some(0x10));
+        assert_eq!(buffer.command_buffer_span, 3);
+        assert_eq!(buffer.dispatch_span, 6);
+        assert_eq!(buffer.use_count, 4);
+        assert_eq!(buffer.kernel_count, 2);
     }
 }
