@@ -1,3 +1,5 @@
+mod mtsp;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,6 +8,8 @@ use plist::Value;
 use serde::Serialize;
 
 use crate::error::{Error, Result};
+
+pub use mtsp::{CtRecord, MTLResourceUsage, MTSPHeader, MTSPRecord, RecordType, ResourceBinding};
 
 pub const MAGIC_MTSP: &[u8; 4] = b"MTSP";
 
@@ -95,6 +99,20 @@ impl TraceBundle {
             device_resource_count: self.device_resources.len(),
             device_resource_bytes: self.device_resources.iter().map(|entry| entry.len).sum(),
         }
+    }
+
+    pub fn capture_data(&self) -> Result<Vec<u8>> {
+        Ok(fs::read(&self.capture_path)?)
+    }
+
+    pub fn mtsp_header(&self) -> Result<MTSPHeader> {
+        let data = self.capture_data()?;
+        MTSPHeader::parse(&data)
+    }
+
+    pub fn mtsp_records(&self) -> Result<Vec<MTSPRecord>> {
+        let data = self.capture_data()?;
+        MTSPRecord::parse_stream(&data)
     }
 }
 
