@@ -33,6 +33,7 @@ enum CommandSet {
     ShaderSource(ShaderSourceArgs),
     Timing(TimingArgs),
     CommandBuffers(CommandBuffersArgs),
+    BufferAccess(BufferAccessArgs),
     Buffers(BuffersArgs),
     BufferTimeline(BufferTimelineArgs),
     Diff(DiffArgs),
@@ -122,6 +123,15 @@ struct CommandBuffersArgs {
     trace: PathBuf,
     #[arg(short, long)]
     detailed: bool,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct BufferAccessArgs {
+    trace: PathBuf,
+    #[arg(short, long)]
+    verbose: bool,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -277,6 +287,17 @@ pub fn run() -> Result<()> {
                 ),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown command-buffers format")),
+            }
+        }
+        CommandSet::BufferAccess(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = commands::buffer_access(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => {
+                    print!("{}", commands::format_buffer_access(&report, args.verbose))
+                }
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown buffer-access format")),
             }
         }
         CommandSet::Buffers(args) => match args.command {

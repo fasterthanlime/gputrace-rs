@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
+use crate::analysis;
 use crate::error::Result;
 use crate::timing;
 use crate::trace::TraceBundle;
@@ -99,6 +100,47 @@ pub struct CommandBufferEncoderEntry {
     pub index: usize,
     pub label: String,
     pub address: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferAccessReport {
+    pub total_buffers: usize,
+    pub shared_buffers: usize,
+    pub single_use_buffers: usize,
+    pub short_lived_buffers: usize,
+    pub long_lived_buffers: usize,
+    pub total_encoders: usize,
+    pub alias_count: usize,
+    pub buffers: Vec<BufferAccessEntry>,
+    pub encoders: Vec<BufferAccessEncoderEntry>,
+    pub aliasing_instances: Vec<BufferAlias>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferAccessEntry {
+    pub name: String,
+    pub address: Option<u64>,
+    pub use_count: usize,
+    pub dispatch_count: usize,
+    pub encoder_count: usize,
+    pub command_buffer_count: usize,
+    pub first_dispatch_index: usize,
+    pub last_dispatch_index: usize,
+    pub is_shared: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferAccessEncoderEntry {
+    pub label: String,
+    pub address: u64,
+    pub unique_buffers: usize,
+    pub total_buffer_uses: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferAlias {
+    pub address: u64,
+    pub names: Vec<String>,
 }
 
 pub fn kernels(trace: &TraceBundle, filter: Option<&str>) -> Result<KernelReport> {
@@ -370,6 +412,98 @@ pub fn command_buffers(trace: &TraceBundle) -> Result<CommandBuffersReport> {
     })
 }
 
+pub fn buffer_access(trace: &TraceBundle) -> Result<BufferAccessReport> {
+    let analysis = analysis::analyze(trace);
+    let regions = trace.command_buffer_regions()?;
+    let buffer_name_map = trace.buffer_name_map()?;
+
+    let mut encoder_buffers: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    let mut encoder_uses: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut encoder_labels: BTreeMap<u64, String> = BTreeMap::new();
+    for region in &regions {
+        for encoder in &region.encoders {
+            encoder_labels
+                .entry(encoder.address)
+                .or_insert_with(|| encoder.label.clone());
+        }
+        for dispatch in &region.dispatches {
+            if let Some(encoder_id) = dispatch.encoder_id {
+                for buffer in &dispatch.buffers {
+                    let name = buffer
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("0x{:x}", buffer.address));
+                    encoder_buffers.entry(encoder_id).or_default().insert(name);
+                    *encoder_uses.entry(encoder_id).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    let mut aliases_by_address: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
+    for (address, name) in buffer_name_map {
+        aliases_by_address.entry(address).or_default().insert(name);
+    }
+    let aliasing_instances: Vec<_> = aliases_by_address
+        .into_iter()
+        .filter_map(|(address, names)| {
+            (names.len() > 1).then(|| BufferAlias {
+                address,
+                names: names.into_iter().collect(),
+            })
+        })
+        .collect();
+
+    let buffers = analysis
+        .buffer_stats
+        .iter()
+        .map(|buffer| BufferAccessEntry {
+            name: buffer.name.clone(),
+            address: buffer.address,
+            use_count: buffer.use_count,
+            dispatch_count: buffer.dispatch_count,
+            encoder_count: buffer.encoder_count,
+            command_buffer_count: buffer.command_buffer_count,
+            first_dispatch_index: buffer.first_dispatch_index,
+            last_dispatch_index: buffer.last_dispatch_index,
+            is_shared: buffer.encoder_count > 1,
+        })
+        .collect();
+
+    let mut encoders: Vec<_> = encoder_buffers
+        .into_iter()
+        .map(|(address, buffers)| BufferAccessEncoderEntry {
+            label: encoder_labels
+                .get(&address)
+                .cloned()
+                .unwrap_or_else(|| format!("0x{address:x}")),
+            address,
+            unique_buffers: buffers.len(),
+            total_buffer_uses: encoder_uses.get(&address).copied().unwrap_or_default(),
+        })
+        .collect();
+    encoders.sort_by(|left, right| {
+        right
+            .unique_buffers
+            .cmp(&left.unique_buffers)
+            .then_with(|| right.total_buffer_uses.cmp(&left.total_buffer_uses))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+
+    Ok(BufferAccessReport {
+        total_buffers: analysis.buffer_count,
+        shared_buffers: analysis.shared_buffer_count,
+        single_use_buffers: analysis.single_use_buffer_count,
+        short_lived_buffers: analysis.short_lived_buffer_count,
+        long_lived_buffers: analysis.long_lived_buffer_count,
+        total_encoders: encoders.len(),
+        alias_count: aliasing_instances.len(),
+        buffers,
+        encoders,
+        aliasing_instances,
+    })
+}
+
 pub fn format_encoders(report: &EncoderReport, verbose: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!("{} encoders\n", report.total_encoders));
@@ -511,6 +645,115 @@ pub fn format_command_buffers(report: &CommandBuffersReport, detailed: bool) -> 
     out
 }
 
+pub fn format_buffer_access(report: &BufferAccessReport, verbose: bool) -> String {
+    let mut out = String::new();
+    out.push_str("=== Buffer Access Analysis ===\n\n");
+    out.push_str("Summary:\n");
+    out.push_str(&format!("  Total Buffers:   {}\n", report.total_buffers));
+    out.push_str(&format!(
+        "  Shared Buffers:  {} (accessed by multiple encoders)\n",
+        report.shared_buffers
+    ));
+    out.push_str(&format!(
+        "  Single-use:      {}\n",
+        report.single_use_buffers
+    ));
+    out.push_str(&format!(
+        "  Short-lived:     {}\n",
+        report.short_lived_buffers
+    ));
+    out.push_str(&format!(
+        "  Long-lived:      {}\n",
+        report.long_lived_buffers
+    ));
+    out.push_str(&format!("  Total Encoders:  {}\n", report.total_encoders));
+    out.push_str(&format!("  Alias Sets:      {}\n\n", report.alias_count));
+
+    if !report.aliasing_instances.is_empty() {
+        out.push_str("Potential Aliasing:\n");
+        for (index, alias) in report.aliasing_instances.iter().take(10).enumerate() {
+            out.push_str(&format!(
+                "  [{}] 0x{:016x} -> {}\n",
+                index + 1,
+                alias.address,
+                alias.names.join(", ")
+            ));
+        }
+        out.push('\n');
+    }
+
+    let mut shared: Vec<_> = report
+        .buffers
+        .iter()
+        .filter(|buffer| buffer.is_shared)
+        .collect();
+    shared.sort_by(|left, right| {
+        right
+            .encoder_count
+            .cmp(&left.encoder_count)
+            .then_with(|| right.use_count.cmp(&left.use_count))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    if !shared.is_empty() {
+        out.push_str("Top Shared Buffers:\n");
+        for (index, buffer) in shared.iter().take(10).enumerate() {
+            out.push_str(&format!(
+                "  [{}] {} - {} encoders, {} uses\n",
+                index + 1,
+                buffer.name,
+                buffer.encoder_count,
+                buffer.use_count
+            ));
+        }
+        out.push('\n');
+    }
+
+    if verbose && !report.encoders.is_empty() {
+        out.push_str("Per-Encoder Statistics:\n");
+        for encoder in &report.encoders {
+            out.push_str(&format!(
+                "  {}: {} unique buffers, {} total accesses\n",
+                encoder.label, encoder.unique_buffers, encoder.total_buffer_uses
+            ));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("Optimization Opportunities:\n");
+    if report.shared_buffers > 0 {
+        out.push_str(&format!(
+            "  • {} buffers are shared across encoders\n",
+            report.shared_buffers
+        ));
+    }
+    if report.single_use_buffers > 0 {
+        out.push_str(&format!(
+            "  • {} buffers are only touched once\n",
+            report.single_use_buffers
+        ));
+    }
+    if report.short_lived_buffers > 0 {
+        out.push_str(&format!(
+            "  • {} buffers have short lifetimes and may be poolable\n",
+            report.short_lived_buffers
+        ));
+    }
+    if report.alias_count > 0 {
+        out.push_str(&format!(
+            "  • {} potential alias sets deserve review\n",
+            report.alias_count
+        ));
+    }
+    if report.shared_buffers == 0
+        && report.single_use_buffers == 0
+        && report.short_lived_buffers == 0
+        && report.alias_count == 0
+    {
+        out.push_str("  • No obvious access-pattern outliers detected\n");
+    }
+    out
+}
+
 fn truncate(value: &str, width: usize) -> String {
     if value.len() <= width {
         return value.to_owned();
@@ -638,5 +881,57 @@ mod tests {
         assert!(rendered.contains("offset=0x00000020"));
         assert!(rendered.contains("encoder   0"));
         assert!(rendered.contains("kernels: kernel"));
+    }
+
+    #[test]
+    fn formats_buffer_access_report() {
+        let report = BufferAccessReport {
+            total_buffers: 2,
+            shared_buffers: 1,
+            single_use_buffers: 1,
+            short_lived_buffers: 1,
+            long_lived_buffers: 0,
+            total_encoders: 1,
+            alias_count: 1,
+            buffers: vec![
+                BufferAccessEntry {
+                    name: "buf".into(),
+                    address: Some(1),
+                    use_count: 4,
+                    dispatch_count: 4,
+                    encoder_count: 2,
+                    command_buffer_count: 1,
+                    first_dispatch_index: 0,
+                    last_dispatch_index: 3,
+                    is_shared: true,
+                },
+                BufferAccessEntry {
+                    name: "tmp".into(),
+                    address: Some(2),
+                    use_count: 1,
+                    dispatch_count: 1,
+                    encoder_count: 1,
+                    command_buffer_count: 1,
+                    first_dispatch_index: 3,
+                    last_dispatch_index: 3,
+                    is_shared: false,
+                },
+            ],
+            encoders: vec![BufferAccessEncoderEntry {
+                label: "enc".into(),
+                address: 1,
+                unique_buffers: 2,
+                total_buffer_uses: 5,
+            }],
+            aliasing_instances: vec![BufferAlias {
+                address: 1,
+                names: vec!["buf".into(), "buf_alias".into()],
+            }],
+        };
+
+        let rendered = format_buffer_access(&report, true);
+        assert!(rendered.contains("Top Shared Buffers"));
+        assert!(rendered.contains("buf - 2 encoders, 4 uses"));
+        assert!(rendered.contains("enc: 2 unique buffers, 5 total accesses"));
     }
 }
