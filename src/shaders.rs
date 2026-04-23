@@ -18,6 +18,9 @@ pub struct ShaderReport {
     pub total_shaders: usize,
     pub indexed_files: usize,
     pub indexed_symbols: usize,
+    pub compute_bound_count: usize,
+    pub memory_bound_count: usize,
+    pub balanced_count: usize,
     pub shaders: Vec<ShaderEntry>,
 }
 
@@ -35,6 +38,18 @@ pub struct ShaderEntry {
     pub execution_cost_samples: usize,
     pub sample_count: usize,
     pub avg_sampling_density: Option<f64>,
+    pub threadgroups: [u64; 3],
+    pub threads_per_group: [u64; 3],
+    pub total_threadgroups: u64,
+    pub threads_per_threadgroup: u64,
+    pub total_threads: u64,
+    pub estimated_occupancy_percent: Option<f64>,
+    pub compute_ratio: Option<f64>,
+    pub classification: String,
+    pub estimated_bandwidth_gbps: Option<f64>,
+    pub estimated_bytes_accessed: Option<u64>,
+    pub bottlenecks: Vec<String>,
+    pub optimization_hints: Vec<String>,
     pub occupancy_percent: Option<f64>,
     pub occupancy_confidence: Option<f64>,
     pub alu_utilization_percent: Option<f64>,
@@ -123,24 +138,35 @@ struct XcodeCounterMatch {
     buffer_l1_write_accesses: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ShaderThreadMetrics {
+    threadgroups: [u64; 3],
+    threads_per_group: [u64; 3],
+    total_threadgroups: u64,
+    threads_per_threadgroup: u64,
+    total_threads: u64,
+}
+
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderReport> {
     let index = ShaderSourceIndex::build(search_paths)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     let limiter_metrics = counter::extract_limiters_for_trace(&trace.path);
     let xcode_counter_data = xcode_counters::parse(trace, None).ok();
-    let dispatches = trace.dispatch_calls()?;
+    let regions = trace.command_buffer_regions()?;
     let mut simd_groups_by_name = BTreeMap::<String, u64>::new();
+    let mut thread_metrics_by_name = BTreeMap::<String, ShaderThreadMetrics>::new();
     let mut total_simd_groups = 0u64;
-    for dispatch in &dispatches {
-        let Some(kernel_name) = &dispatch.kernel_name else {
-            continue;
-        };
-        let simd_groups = dispatch_simd_groups(dispatch);
-        if simd_groups == 0 {
-            continue;
+    for dispatch in regions.iter().flat_map(|region| region.dispatches.iter()) {
+        if let Some(kernel_name) = &dispatch.kernel_name {
+            let simd_groups = dispatch_simd_groups(dispatch);
+            if simd_groups > 0 {
+                *simd_groups_by_name.entry(kernel_name.clone()).or_default() += simd_groups;
+                total_simd_groups += simd_groups;
+            }
+            thread_metrics_by_name
+                .entry(kernel_name.clone())
+                .or_insert_with(|| dispatch_thread_metrics(dispatch));
         }
-        *simd_groups_by_name.entry(kernel_name.clone()).or_default() += simd_groups;
-        total_simd_groups += simd_groups;
     }
 
     let mut duration_by_name = BTreeMap::<String, u64>::new();
@@ -276,6 +302,23 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 .cloned()
                 .or_else(|| pipeline_stats_by_name.get(&kernel_name).cloned());
             let execution_cost_percent = execution_cost_by_name.get(&kernel_name).copied();
+            let thread_metrics = thread_metrics_by_name
+                .get(&kernel_name)
+                .cloned()
+                .unwrap_or_default();
+            let estimated_occupancy_percent =
+                estimate_occupancy_percent(thread_metrics.threads_per_threadgroup);
+            let buffer_binding_count = kernel.buffers.len().max(1) as f64;
+            let compute_ratio = (thread_metrics.total_threads > 0)
+                .then(|| thread_metrics.total_threads as f64 / buffer_binding_count);
+            let classification = classify_shader(compute_ratio);
+            let estimated_bytes_accessed =
+                (thread_metrics.total_threads > 0).then_some(thread_metrics.total_threads * 64);
+            let estimated_bandwidth_gbps = estimated_bytes_accessed.and_then(|bytes| {
+                total_duration_ns_for_shader
+                    .filter(|duration| *duration > 0)
+                    .map(|duration| bytes as f64 / (duration as f64 / 1e9) / 1e9)
+            });
             let weighted_cost = xcode_counter_match
                 .and_then(|entry| entry.kernel_alu_performance)
                 .filter(|value| *value > 0.0)
@@ -309,6 +352,18 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                     .unwrap_or(0),
                 sample_count: sample_count_by_name.get(&kernel_name).copied().unwrap_or(0),
                 avg_sampling_density,
+                threadgroups: thread_metrics.threadgroups,
+                threads_per_group: thread_metrics.threads_per_group,
+                total_threadgroups: thread_metrics.total_threadgroups,
+                threads_per_threadgroup: thread_metrics.threads_per_threadgroup,
+                total_threads: thread_metrics.total_threads,
+                estimated_occupancy_percent,
+                compute_ratio,
+                classification,
+                estimated_bandwidth_gbps,
+                estimated_bytes_accessed,
+                bottlenecks: Vec::new(),
+                optimization_hints: Vec::new(),
                 occupancy_percent: occupancy
                     .map(|(value, _)| value)
                     .or(xcode_counter_match.and_then(|entry| entry.occupancy_percent)),
@@ -370,6 +425,9 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
             }
         }
     }
+    for shader in &mut shaders {
+        identify_shader_bottlenecks(shader);
+    }
     shaders.sort_by(|left, right| {
         compare_option_f64_desc(right.execution_cost_percent, left.execution_cost_percent)
             .then_with(|| {
@@ -385,10 +443,25 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
             .then_with(|| left.name.cmp(&right.name))
     });
     let (indexed_files, indexed_symbols) = index.stats();
+    let compute_bound_count = shaders
+        .iter()
+        .filter(|shader| shader.classification == "compute_bound")
+        .count();
+    let memory_bound_count = shaders
+        .iter()
+        .filter(|shader| shader.classification == "memory_bound")
+        .count();
+    let balanced_count = shaders
+        .iter()
+        .filter(|shader| shader.classification == "balanced")
+        .count();
     Ok(ShaderReport {
         total_shaders: shaders.len(),
         indexed_files,
         indexed_symbols,
+        compute_bound_count,
+        memory_bound_count,
+        balanced_count,
         shaders,
     })
 }
@@ -664,6 +737,21 @@ pub fn format_report(report: &ShaderReport) -> String {
         "{} shaders, {} indexed files, {} indexed symbols\n\n",
         report.total_shaders, report.indexed_files, report.indexed_symbols
     ));
+    if report.compute_bound_count + report.memory_bound_count + report.balanced_count > 0 {
+        out.push_str("Classification Distribution:\n");
+        out.push_str(&format!(
+            "  Compute-Bound: {} shaders\n",
+            report.compute_bound_count
+        ));
+        out.push_str(&format!(
+            "  Memory-Bound:  {} shaders\n",
+            report.memory_bound_count
+        ));
+        out.push_str(&format!(
+            "  Balanced:      {} shaders\n\n",
+            report.balanced_count
+        ));
+    }
     let has_profiler_timing = report
         .shaders
         .iter()
@@ -689,8 +777,8 @@ pub fn format_report(report: &ShaderReport) -> String {
     let has_simd_groups = report.shaders.iter().any(|shader| shader.simd_groups > 0);
     if has_profiler_timing {
         out.push_str(&format!(
-            "{:<32} {:<18} {:>10}",
-            "Name", "Pipeline State", "Dispatches",
+            "{:<32} {:<18} {:>10} {:>12}",
+            "Name", "Pipeline State", "Dispatches", "Class",
         ));
         if has_simd_groups {
             out.push_str(&format!(" {:>12} {:>8}", "SIMD Groups", "SIMD %"));
@@ -721,8 +809,8 @@ pub fn format_report(report: &ShaderReport) -> String {
         out.push_str("  Source\n");
     } else {
         out.push_str(&format!(
-            "{:<32} {:<18} {:>10}",
-            "Name", "Pipeline State", "Dispatches"
+            "{:<32} {:<18} {:>10} {:>12}",
+            "Name", "Pipeline State", "Dispatches", "Class"
         ));
         if has_simd_groups {
             out.push_str(&format!(" {:>12} {:>8}", "SIMD Groups", "SIMD %"));
@@ -754,10 +842,11 @@ pub fn format_report(report: &ShaderReport) -> String {
         };
         if has_profiler_timing {
             out.push_str(&format!(
-                "{:<32} 0x{:<16x} {:>10}",
+                "{:<32} 0x{:<16x} {:>10} {:>12}",
                 truncate(&shader.name, 36),
                 shader.pipeline_addr,
                 shader.dispatch_count,
+                shader.classification,
             ));
             if has_simd_groups {
                 out.push_str(&format!(
@@ -867,10 +956,11 @@ pub fn format_report(report: &ShaderReport) -> String {
             out.push_str(&format!("  {source}\n"));
         } else {
             out.push_str(&format!(
-                "{:<32} 0x{:<16x} {:>10}",
+                "{:<32} 0x{:<16x} {:>10} {:>12}",
                 truncate(&shader.name, 36),
                 shader.pipeline_addr,
                 shader.dispatch_count,
+                shader.classification,
             ));
             if has_simd_groups {
                 out.push_str(&format!(
@@ -957,18 +1047,39 @@ pub fn format_report(report: &ShaderReport) -> String {
             out.push_str(&format!("  {source}\n"));
         }
     }
+    let bottlenecked = report
+        .shaders
+        .iter()
+        .filter(|shader| !shader.bottlenecks.is_empty())
+        .take(5)
+        .collect::<Vec<_>>();
+    if !bottlenecked.is_empty() {
+        out.push_str("\nTop Bottlenecks:\n");
+        for shader in bottlenecked {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                shader.name,
+                shader.bottlenecks.join(", ")
+            ));
+            for hint in shader.optimization_hints.iter().take(2) {
+                out.push_str(&format!("    hint: {hint}\n"));
+            }
+        }
+    }
     out
 }
 
 pub fn format_csv(report: &ShaderReport) -> String {
     let mut out = String::new();
-    out.push_str("name,pipeline_addr,dispatch_count,metric_source,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,weighted_cost,weighted_percent_of_total,kernel_alu_performance,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_write_accesses,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
+    out.push_str("name,pipeline_addr,dispatch_count,metric_source,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,weighted_cost,weighted_percent_of_total,kernel_alu_performance,execution_cost_samples,sample_count,avg_sampling_density,threadgroups_x,threadgroups_y,threadgroups_z,threads_per_group_x,threads_per_group_y,threads_per_group_z,total_threadgroups,threads_per_threadgroup,total_threads,estimated_occupancy_percent,compute_ratio,classification,estimated_bandwidth_gbps,estimated_bytes_accessed,bottlenecks,optimization_hints,occupancy_percent,occupancy_confidence,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_write_accesses,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
     for shader in &report.shaders {
         let source_file = shader
             .source_file
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
+        let bottlenecks = shader.bottlenecks.join(";");
+        let optimization_hints = shader.optimization_hints.join(";");
         let columns = vec![
             format!("\"{}\"", shader.name.replace('"', "\"\"")),
             format!("0x{:x}", shader.pipeline_addr),
@@ -985,6 +1096,22 @@ pub fn format_csv(report: &ShaderReport) -> String {
             shader.execution_cost_samples.to_string(),
             shader.sample_count.to_string(),
             option_csv(shader.avg_sampling_density),
+            shader.threadgroups[0].to_string(),
+            shader.threadgroups[1].to_string(),
+            shader.threadgroups[2].to_string(),
+            shader.threads_per_group[0].to_string(),
+            shader.threads_per_group[1].to_string(),
+            shader.threads_per_group[2].to_string(),
+            shader.total_threadgroups.to_string(),
+            shader.threads_per_threadgroup.to_string(),
+            shader.total_threads.to_string(),
+            option_csv(shader.estimated_occupancy_percent),
+            option_csv(shader.compute_ratio),
+            format!("\"{}\"", shader.classification.replace('"', "\"\"")),
+            option_csv(shader.estimated_bandwidth_gbps),
+            option_csv(shader.estimated_bytes_accessed),
+            format!("\"{}\"", bottlenecks.replace('"', "\"\"")),
+            format!("\"{}\"", optimization_hints.replace('"', "\"\"")),
             option_csv(shader.occupancy_percent),
             option_csv(shader.occupancy_confidence),
             option_csv(shader.alu_utilization_percent),
@@ -1191,6 +1318,108 @@ fn strip_type_suffixes(name: &str) -> String {
         }
     }
     name.to_owned()
+}
+
+fn dispatch_thread_metrics(dispatch: &crate::trace::DispatchCall) -> ShaderThreadMetrics {
+    let threadgroups = [
+        div_ceil_or_one(dispatch.grid_size[0], dispatch.group_size[0]),
+        div_ceil_or_one(dispatch.grid_size[1], dispatch.group_size[1]),
+        div_ceil_or_one(dispatch.grid_size[2], dispatch.group_size[2]),
+    ];
+    let threads_per_group = [
+        dispatch.group_size[0] as u64,
+        dispatch.group_size[1] as u64,
+        dispatch.group_size[2] as u64,
+    ];
+    let total_threadgroups = threadgroups[0]
+        .saturating_mul(threadgroups[1])
+        .saturating_mul(threadgroups[2]);
+    let threads_per_threadgroup = threads_per_group[0]
+        .saturating_mul(threads_per_group[1])
+        .saturating_mul(threads_per_group[2]);
+    let total_threads = total_threadgroups.saturating_mul(threads_per_threadgroup);
+    ShaderThreadMetrics {
+        threadgroups,
+        threads_per_group,
+        total_threadgroups,
+        threads_per_threadgroup,
+        total_threads,
+    }
+}
+
+fn estimate_occupancy_percent(threads_per_threadgroup: u64) -> Option<f64> {
+    if threads_per_threadgroup == 0 {
+        return None;
+    }
+    let mut occupancy = threads_per_threadgroup as f64 / 512.0;
+    if occupancy > 1.0 {
+        occupancy = 1.0 - (occupancy - 1.0) * 0.5;
+    }
+    Some(occupancy.clamp(0.0, 1.0) * 100.0)
+}
+
+fn classify_shader(compute_ratio: Option<f64>) -> String {
+    match compute_ratio {
+        Some(ratio) if ratio > 10_000.0 => "compute_bound".to_owned(),
+        Some(ratio) if ratio < 1_000.0 => "memory_bound".to_owned(),
+        Some(_) => "balanced".to_owned(),
+        None => "unknown".to_owned(),
+    }
+}
+
+fn identify_shader_bottlenecks(shader: &mut ShaderEntry) {
+    if let Some(occupancy) = shader.estimated_occupancy_percent
+        && occupancy < 30.0
+    {
+        shader.bottlenecks.push("low_gpu_occupancy".to_owned());
+        shader.optimization_hints.push(format!(
+            "Increase threadgroup size (current: {} threads, optimal: ~512)",
+            shader.threads_per_threadgroup
+        ));
+    }
+
+    if let Some(occupancy) = shader.estimated_occupancy_percent
+        && occupancy > 95.0
+        && shader.threads_per_threadgroup > 512
+    {
+        shader
+            .bottlenecks
+            .push("potential_resource_contention".to_owned());
+        shader
+            .optimization_hints
+            .push("Consider reducing threadgroup size to reduce register pressure".to_owned());
+    }
+
+    if shader.classification == "memory_bound" {
+        shader
+            .bottlenecks
+            .push("memory_bandwidth_limited".to_owned());
+        shader
+            .optimization_hints
+            .push("Optimize memory access patterns, consider threadgroup memory usage".to_owned());
+    }
+
+    if shader.total_threadgroups > 0 && shader.total_threadgroups < 10 {
+        shader.bottlenecks.push("small_dispatch_size".to_owned());
+        shader.optimization_hints.push(format!(
+            "Increase dispatch size (current: {} threadgroups)",
+            shader.total_threadgroups
+        ));
+    }
+
+    let gpu_percent = shader
+        .execution_cost_percent
+        .or(shader.weighted_percent_of_total)
+        .or(shader.percent_of_total)
+        .or(shader.simd_percent_of_total);
+    if let Some(percent) = gpu_percent
+        && percent > 20.0
+    {
+        shader.bottlenecks.push("hot_shader".to_owned());
+        shader.optimization_hints.push(format!(
+            "This shader consumes {percent:.1}% of GPU time - prime optimization target"
+        ));
+    }
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -1516,6 +1745,9 @@ mod tests {
             total_shaders: 1,
             indexed_files: 1,
             indexed_symbols: 1,
+            compute_bound_count: 0,
+            memory_bound_count: 1,
+            balanced_count: 0,
             shaders: vec![ShaderEntry {
                 name: "kernel".into(),
                 pipeline_addr: 0x1234,
@@ -1529,6 +1761,20 @@ mod tests {
                 execution_cost_samples: 11,
                 sample_count: 4,
                 avg_sampling_density: Some(0.2),
+                threadgroups: [16, 1, 1],
+                threads_per_group: [64, 1, 1],
+                total_threadgroups: 16,
+                threads_per_threadgroup: 64,
+                total_threads: 1024,
+                estimated_occupancy_percent: Some(12.5),
+                compute_ratio: Some(512.0),
+                classification: "memory_bound".into(),
+                estimated_bandwidth_gbps: Some(546.13),
+                estimated_bytes_accessed: Some(65_536),
+                bottlenecks: vec!["memory_bandwidth_limited".into()],
+                optimization_hints: vec![
+                    "Optimize memory access patterns, consider threadgroup memory usage".into(),
+                ],
                 occupancy_percent: Some(37.5),
                 occupancy_confidence: Some(0.8),
                 alu_utilization_percent: Some(61.0),
@@ -1556,6 +1802,9 @@ mod tests {
 
         let output = format_report(&report);
         assert!(output.contains("Duration ns"));
+        assert!(output.contains("Classification Distribution"));
+        assert!(output.contains("Memory-Bound"));
+        assert!(output.contains("Class"));
         assert!(output.contains("SIMD Groups"));
         assert!(output.contains("SIMD %"));
         assert!(output.contains("Time %"));
@@ -1584,6 +1833,8 @@ mod tests {
         assert!(output.contains("11.00"));
         assert!(output.contains("48"));
         assert!(output.contains("256"));
+        assert!(output.contains("Top Bottlenecks"));
+        assert!(output.contains("memory_bandwidth_limited"));
     }
 
     #[test]
@@ -1592,6 +1843,9 @@ mod tests {
             total_shaders: 1,
             indexed_files: 0,
             indexed_symbols: 0,
+            compute_bound_count: 0,
+            memory_bound_count: 1,
+            balanced_count: 0,
             shaders: vec![ShaderEntry {
                 name: "kernel".into(),
                 pipeline_addr: 0x1234,
@@ -1608,6 +1862,20 @@ mod tests {
                 execution_cost_samples: 11,
                 sample_count: 4,
                 avg_sampling_density: Some(0.2),
+                threadgroups: [16, 1, 1],
+                threads_per_group: [64, 1, 1],
+                total_threadgroups: 16,
+                threads_per_threadgroup: 64,
+                total_threads: 1024,
+                estimated_occupancy_percent: Some(12.5),
+                compute_ratio: Some(512.0),
+                classification: "memory_bound".into(),
+                estimated_bandwidth_gbps: Some(546.13),
+                estimated_bytes_accessed: Some(65_536),
+                bottlenecks: vec!["memory_bandwidth_limited".into()],
+                optimization_hints: vec![
+                    "Optimize memory access patterns, consider threadgroup memory usage".into(),
+                ],
                 occupancy_percent: Some(37.5),
                 occupancy_confidence: Some(0.8),
                 alu_utilization_percent: Some(61.0),
@@ -1640,6 +1908,9 @@ mod tests {
         assert!(output.contains("alu_utilization_percent"));
         assert!(output.contains("device_memory_bandwidth_gbps"));
         assert!(output.contains("simd_percent_of_total"));
+        assert!(output.contains("classification"));
+        assert!(output.contains("estimated_occupancy_percent"));
+        assert!(output.contains("memory_bandwidth_limited"));
         assert!(output.contains("\"kernel\",0x1234,2,\"xcode-weighted\",96,48"));
         assert!(output.contains("\"/tmp/kernel.metal\",42"));
     }
@@ -1662,6 +1933,18 @@ mod tests {
             execution_cost_samples: 0,
             sample_count: 0,
             avg_sampling_density: None,
+            threadgroups: [0, 0, 0],
+            threads_per_group: [0, 0, 0],
+            total_threadgroups: 0,
+            threads_per_threadgroup: 0,
+            total_threads: 0,
+            estimated_occupancy_percent: None,
+            compute_ratio: None,
+            classification: "unknown".into(),
+            estimated_bandwidth_gbps: None,
+            estimated_bytes_accessed: None,
+            bottlenecks: Vec::new(),
+            optimization_hints: Vec::new(),
             occupancy_percent: None,
             occupancy_confidence: None,
             alu_utilization_percent: Some(61.0),
