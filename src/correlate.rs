@@ -31,6 +31,7 @@ pub struct CorrelatedShader {
     pub synthetic_total_duration_ns: u64,
     pub synthetic_avg_duration_ns: u64,
     pub synthetic_percent_of_total: f64,
+    pub metric_source: String,
     pub execution_cost_percent: Option<f64>,
     pub execution_cost_samples: usize,
     pub sample_count: usize,
@@ -44,6 +45,8 @@ pub struct CorrelatedShader {
     pub spilled_bytes: Option<i64>,
     pub threadgroup_memory: Option<i64>,
     pub instruction_count: Option<i64>,
+    pub alu_instruction_count: Option<i64>,
+    pub branch_instruction_count: Option<i64>,
     pub compilation_time_ms: Option<f64>,
     pub encoder_count: usize,
     pub buffer_count: usize,
@@ -152,6 +155,18 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
                         bw_sum / *count as f64,
                     ))
                 });
+        let metric_source = if execution_cost_percent.is_some() {
+            "execution-cost"
+        } else if source.and_then(|shader| shader.total_duration_ns).is_some() {
+            "profiler-duration"
+        } else if source
+            .and_then(|shader| shader.simd_percent_of_total)
+            .is_some()
+        {
+            "simd-groups"
+        } else {
+            "timing-only"
+        };
         shaders.push(CorrelatedShader {
             shader_name: kernel.name.clone(),
             pipeline_addr,
@@ -159,6 +174,7 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
             synthetic_total_duration_ns: kernel.synthetic_duration_ns,
             synthetic_avg_duration_ns,
             synthetic_percent_of_total: kernel.percent_of_total,
+            metric_source: metric_source.to_owned(),
             execution_cost_percent,
             execution_cost_samples,
             sample_count,
@@ -178,6 +194,8 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
             spilled_bytes: source.and_then(|shader| shader.spilled_bytes),
             threadgroup_memory: source.and_then(|shader| shader.threadgroup_memory),
             instruction_count: source.and_then(|shader| shader.instruction_count),
+            alu_instruction_count: source.and_then(|shader| shader.alu_instruction_count),
+            branch_instruction_count: source.and_then(|shader| shader.branch_instruction_count),
             compilation_time_ms: source.and_then(|shader| shader.compilation_time_ms),
             encoder_count: kernel_stat
                 .map(|value| value.encoder_labels.len())
@@ -228,7 +246,9 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
             "Combines streamData timing, trace attribution, and optional source lookup.\n",
         );
     }
-    out.push_str("Hardware profiler counters are not included in this report.\n\n");
+    out.push_str(
+        "Includes profiler timing, execution cost, and correlated hardware counter summaries when available.\n\n",
+    );
     out.push_str(&format!("trace={}\n", report.trace_source.display()));
     out.push_str(&format!(
         "shaders={} sources={}/{} dispatches={} total={} ns\n\n",
@@ -274,8 +294,9 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
         ));
         if verbose {
             out.push_str(&format!(
-                "           avg={} ns samples/us={:.3} exec_samples={} occ={} occ_conf={} alu={} llc={} dev_bw={} regs={} spills={} tgmem={} inst={} compile_ms={} encoders={} buffers={} correlation={}\n",
+                "           avg={} ns source={} samples/us={:.3} exec_samples={} occ={} occ_conf={} alu={} llc={} dev_bw={} regs={} spills={} tgmem={} inst={} alu_inst={} branch_inst={} compile_ms={} encoders={} buffers={} correlation={}\n",
                 shader.synthetic_avg_duration_ns,
+                shader.metric_source,
                 shader.avg_sampling_density,
                 shader.execution_cost_samples,
                 shader
@@ -312,6 +333,14 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
                     .unwrap_or_else(|| "-".to_owned()),
                 shader
                     .instruction_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .alu_instruction_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .branch_instruction_count
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
                 shader
@@ -357,6 +386,7 @@ mod tests {
                 synthetic_total_duration_ns: 120,
                 synthetic_avg_duration_ns: 60,
                 synthetic_percent_of_total: 100.0,
+                metric_source: "execution-cost".into(),
                 execution_cost_percent: Some(75.0),
                 execution_cost_samples: 3,
                 sample_count: 4,
@@ -370,6 +400,8 @@ mod tests {
                 spilled_bytes: Some(512),
                 threadgroup_memory: Some(8192),
                 instruction_count: Some(2048),
+                alu_instruction_count: Some(1500),
+                branch_instruction_count: Some(48),
                 compilation_time_ms: Some(4.5),
                 encoder_count: 1,
                 buffer_count: 2,
@@ -383,6 +415,7 @@ mod tests {
         assert!(output.contains("kernel"));
         assert!(output.contains("/tmp/kernel.metal:42"));
         assert!(output.contains("correlation=name"));
+        assert!(output.contains("source=execution-cost"));
         assert!(output.contains("samples/us=0.200"));
         assert!(output.contains("75.00"));
         assert!(output.contains("exec_samples=3"));
@@ -391,5 +424,7 @@ mod tests {
         assert!(output.contains("dev_bw=8.20 GB/s"));
         assert!(output.contains("regs=64"));
         assert!(output.contains("spills=512"));
+        assert!(output.contains("alu_inst=1500"));
+        assert!(output.contains("branch_inst=48"));
     }
 }
