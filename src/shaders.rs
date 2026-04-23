@@ -8,6 +8,7 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::error::{Error, Result};
+use crate::profiler;
 use crate::trace::TraceBundle;
 
 #[derive(Debug, Clone, Serialize)]
@@ -23,6 +24,8 @@ pub struct ShaderEntry {
     pub name: String,
     pub pipeline_addr: u64,
     pub dispatch_count: usize,
+    pub total_duration_ns: Option<u64>,
+    pub percent_of_total: Option<f64>,
     pub source_file: Option<PathBuf>,
     pub source_line: Option<usize>,
 }
@@ -54,6 +57,21 @@ struct ShaderSourceIndex {
 
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderReport> {
     let index = ShaderSourceIndex::build(search_paths)?;
+    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    let mut duration_by_name = BTreeMap::<String, u64>::new();
+    let mut total_duration_ns = 0u64;
+    if let Some(summary) = &profiler_summary {
+        total_duration_ns = summary.total_time_us.saturating_mul(1_000);
+        for dispatch in &summary.dispatches {
+            let name = dispatch
+                .function_name
+                .clone()
+                .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
+            *duration_by_name.entry(name).or_default() +=
+                dispatch.duration_us.saturating_mul(1_000);
+        }
+    }
+
     let mut shaders: Vec<_> = trace
         .analyze_kernels()?
         .into_values()
@@ -62,10 +80,17 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 Some((file, line)) => (Some(file), Some(line)),
                 None => (None, None),
             };
+            let total_duration_ns_for_shader = duration_by_name.get(&kernel.name).copied();
+            let percent_of_total = total_duration_ns_for_shader.and_then(|duration| {
+                (total_duration_ns > 0)
+                    .then(|| (duration as f64 / total_duration_ns as f64) * 100.0)
+            });
             ShaderEntry {
                 name: kernel.name,
                 pipeline_addr: kernel.pipeline_addr,
                 dispatch_count: kernel.dispatch_count,
+                total_duration_ns: total_duration_ns_for_shader,
+                percent_of_total,
                 source_file,
                 source_line,
             }
@@ -73,8 +98,10 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
         .collect();
     shaders.sort_by(|left, right| {
         right
-            .dispatch_count
-            .cmp(&left.dispatch_count)
+            .total_duration_ns
+            .unwrap_or_default()
+            .cmp(&left.total_duration_ns.unwrap_or_default())
+            .then_with(|| right.dispatch_count.cmp(&left.dispatch_count))
             .then_with(|| left.name.cmp(&right.name))
     });
     let (indexed_files, indexed_symbols) = index.stats();
@@ -139,22 +166,51 @@ pub fn format_report(report: &ShaderReport) -> String {
         "{} shaders, {} indexed files, {} indexed symbols\n\n",
         report.total_shaders, report.indexed_files, report.indexed_symbols
     ));
-    out.push_str(&format!(
-        "{:<36} {:<18} {:>10}  {}\n",
-        "Name", "Pipeline State", "Dispatches", "Source"
-    ));
+    let has_profiler_timing = report
+        .shaders
+        .iter()
+        .any(|shader| shader.total_duration_ns.is_some());
+    if has_profiler_timing {
+        out.push_str(&format!(
+            "{:<36} {:<18} {:>10} {:>14} {:>8}  {}\n",
+            "Name", "Pipeline State", "Dispatches", "Duration ns", "Cost %", "Source"
+        ));
+    } else {
+        out.push_str(&format!(
+            "{:<36} {:<18} {:>10}  {}\n",
+            "Name", "Pipeline State", "Dispatches", "Source"
+        ));
+    }
     for shader in &report.shaders {
         let source = match (&shader.source_file, shader.source_line) {
             (Some(file), Some(line)) => format!("{}:{}", file.display(), line),
             _ => "-".to_owned(),
         };
-        out.push_str(&format!(
-            "{:<36} 0x{:<16x} {:>10}  {}\n",
-            truncate(&shader.name, 36),
-            shader.pipeline_addr,
-            shader.dispatch_count,
-            source
-        ));
+        if has_profiler_timing {
+            out.push_str(&format!(
+                "{:<36} 0x{:<16x} {:>10} {:>14} {:>7}  {}\n",
+                truncate(&shader.name, 36),
+                shader.pipeline_addr,
+                shader.dispatch_count,
+                shader
+                    .total_duration_ns
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .percent_of_total
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                source
+            ));
+        } else {
+            out.push_str(&format!(
+                "{:<36} 0x{:<16x} {:>10}  {}\n",
+                truncate(&shader.name, 36),
+                shader.pipeline_addr,
+                shader.dispatch_count,
+                source
+            ));
+        }
     }
     out
 }
@@ -318,5 +374,28 @@ mod tests {
     fn strips_type_suffixes() {
         assert_eq!(strip_type_suffixes("rope_float16"), "rope");
         assert_eq!(strip_type_suffixes("kernel"), "kernel");
+    }
+
+    #[test]
+    fn formats_report_with_profiler_columns() {
+        let report = ShaderReport {
+            total_shaders: 1,
+            indexed_files: 1,
+            indexed_symbols: 1,
+            shaders: vec![ShaderEntry {
+                name: "kernel".into(),
+                pipeline_addr: 0x1234,
+                dispatch_count: 2,
+                total_duration_ns: Some(120),
+                percent_of_total: Some(60.0),
+                source_file: Some(PathBuf::from("/tmp/kernel.metal")),
+                source_line: Some(42),
+            }],
+        };
+
+        let output = format_report(&report);
+        assert!(output.contains("Duration ns"));
+        assert!(output.contains("Cost %"));
+        assert!(output.contains("60.00"));
     }
 }
