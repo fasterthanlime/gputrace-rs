@@ -43,6 +43,11 @@ pub struct ShaderEntry {
     pub weighted_percent_of_total: Option<f64>,
     pub last_level_cache_percent: Option<f64>,
     pub device_memory_bandwidth_gbps: Option<f64>,
+    pub gpu_read_bandwidth_gbps: Option<f64>,
+    pub gpu_write_bandwidth_gbps: Option<f64>,
+    pub buffer_l1_miss_rate_percent: Option<f64>,
+    pub buffer_l1_read_accesses: Option<f64>,
+    pub buffer_l1_write_accesses: Option<f64>,
     pub temporary_register_count: Option<i64>,
     pub spilled_bytes: Option<i64>,
     pub threadgroup_memory: Option<i64>,
@@ -111,6 +116,11 @@ struct XcodeCounterMatch {
     occupancy_percent: Option<f64>,
     device_memory_bandwidth_gbps: Option<f64>,
     kernel_alu_performance: Option<f64>,
+    gpu_read_bandwidth_gbps: Option<f64>,
+    gpu_write_bandwidth_gbps: Option<f64>,
+    buffer_l1_miss_rate_percent: Option<f64>,
+    buffer_l1_read_accesses: Option<f64>,
+    buffer_l1_write_accesses: Option<f64>,
 }
 
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderReport> {
@@ -314,6 +324,16 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 device_memory_bandwidth_gbps: limiter
                     .map(|(_, _, bw)| bw)
                     .or(xcode_counter_match.and_then(|entry| entry.device_memory_bandwidth_gbps)),
+                gpu_read_bandwidth_gbps: xcode_counter_match
+                    .and_then(|entry| entry.gpu_read_bandwidth_gbps),
+                gpu_write_bandwidth_gbps: xcode_counter_match
+                    .and_then(|entry| entry.gpu_write_bandwidth_gbps),
+                buffer_l1_miss_rate_percent: xcode_counter_match
+                    .and_then(|entry| entry.buffer_l1_miss_rate_percent),
+                buffer_l1_read_accesses: xcode_counter_match
+                    .and_then(|entry| entry.buffer_l1_read_accesses),
+                buffer_l1_write_accesses: xcode_counter_match
+                    .and_then(|entry| entry.buffer_l1_write_accesses),
                 temporary_register_count: pipeline_stats
                     .as_ref()
                     .map(|stats| stats.temporary_register_count),
@@ -408,6 +428,16 @@ fn match_xcode_counters(
     let mut bw_count = 0usize;
     let mut alu_perf_sum = 0.0;
     let mut alu_perf_count = 0usize;
+    let mut gpu_read_bw_sum = 0.0;
+    let mut gpu_read_bw_count = 0usize;
+    let mut gpu_write_bw_sum = 0.0;
+    let mut gpu_write_bw_count = 0usize;
+    let mut l1_miss_sum = 0.0;
+    let mut l1_miss_count = 0usize;
+    let mut l1_read_acc_sum = 0.0;
+    let mut l1_read_acc_count = 0usize;
+    let mut l1_write_acc_sum = 0.0;
+    let mut l1_write_acc_count = 0usize;
 
     for encoder in matches {
         if let Some(value) = encoder.counters.get("ALU Utilization").copied() {
@@ -426,6 +456,26 @@ fn match_xcode_counters(
             alu_perf_sum += value;
             alu_perf_count += 1;
         }
+        if let Some(value) = encoder.counters.get("GPU Read Bandwidth").copied() {
+            gpu_read_bw_sum += value;
+            gpu_read_bw_count += 1;
+        }
+        if let Some(value) = encoder.counters.get("GPU Write Bandwidth").copied() {
+            gpu_write_bw_sum += value;
+            gpu_write_bw_count += 1;
+        }
+        if let Some(value) = encoder.counters.get("Buffer L1 Miss Rate").copied() {
+            l1_miss_sum += value;
+            l1_miss_count += 1;
+        }
+        if let Some(value) = encoder.counters.get("Buffer L1 Read Accesses").copied() {
+            l1_read_acc_sum += value;
+            l1_read_acc_count += 1;
+        }
+        if let Some(value) = encoder.counters.get("Buffer L1 Write Accesses").copied() {
+            l1_write_acc_sum += value;
+            l1_write_acc_count += 1;
+        }
     }
 
     Some(XcodeCounterMatch {
@@ -433,6 +483,16 @@ fn match_xcode_counters(
         occupancy_percent: (occupancy_count > 0).then(|| occupancy_sum / occupancy_count as f64),
         device_memory_bandwidth_gbps: (bw_count > 0).then(|| bw_sum / bw_count as f64),
         kernel_alu_performance: (alu_perf_count > 0).then(|| alu_perf_sum / alu_perf_count as f64),
+        gpu_read_bandwidth_gbps: (gpu_read_bw_count > 0)
+            .then(|| gpu_read_bw_sum / gpu_read_bw_count as f64),
+        gpu_write_bandwidth_gbps: (gpu_write_bw_count > 0)
+            .then(|| gpu_write_bw_sum / gpu_write_bw_count as f64),
+        buffer_l1_miss_rate_percent: (l1_miss_count > 0)
+            .then(|| l1_miss_sum / l1_miss_count as f64),
+        buffer_l1_read_accesses: (l1_read_acc_count > 0)
+            .then(|| l1_read_acc_sum / l1_read_acc_count as f64),
+        buffer_l1_write_accesses: (l1_write_acc_count > 0)
+            .then(|| l1_write_acc_sum / l1_write_acc_count as f64),
     })
 }
 
@@ -620,6 +680,8 @@ pub fn format_report(report: &ShaderReport) -> String {
         shader.alu_utilization_percent.is_some()
             || shader.last_level_cache_percent.is_some()
             || shader.device_memory_bandwidth_gbps.is_some()
+            || shader.gpu_read_bandwidth_gbps.is_some()
+            || shader.buffer_l1_miss_rate_percent.is_some()
     });
     let has_weighted_metrics = report.shaders.iter().any(|shader| {
         shader.weighted_percent_of_total.is_some() || shader.kernel_alu_performance.is_some()
@@ -651,7 +713,10 @@ pub fn format_report(report: &ShaderReport) -> String {
             out.push_str(&format!(" {:>8}", "Occ %"));
         }
         if has_counter_metrics {
-            out.push_str(&format!(" {:>8} {:>8} {:>10}", "ALU %", "LLC %", "Dev BW"));
+            out.push_str(&format!(
+                " {:>8} {:>8} {:>10} {:>10} {:>10}",
+                "ALU %", "LLC %", "Dev BW", "GPU R", "L1 Miss"
+            ));
         }
         out.push_str("  Source\n");
     } else {
@@ -675,7 +740,10 @@ pub fn format_report(report: &ShaderReport) -> String {
             out.push_str(&format!(" {:>8}", "Occ %"));
         }
         if has_counter_metrics {
-            out.push_str(&format!(" {:>8} {:>8} {:>10}", "ALU %", "LLC %", "Dev BW"));
+            out.push_str(&format!(
+                " {:>8} {:>8} {:>10} {:>10} {:>10}",
+                "ALU %", "LLC %", "Dev BW", "GPU R", "L1 Miss"
+            ));
         }
         out.push_str("  Source\n");
     }
@@ -773,7 +841,7 @@ pub fn format_report(report: &ShaderReport) -> String {
             }
             if has_counter_metrics {
                 out.push_str(&format!(
-                    " {:>8} {:>8} {:>10}",
+                    " {:>8} {:>8} {:>10} {:>10} {:>10}",
                     shader
                         .alu_utilization_percent
                         .map(|value| format!("{value:.2}"))
@@ -784,6 +852,14 @@ pub fn format_report(report: &ShaderReport) -> String {
                         .unwrap_or_else(|| "-".to_owned()),
                     shader
                         .device_memory_bandwidth_gbps
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .gpu_read_bandwidth_gbps
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .buffer_l1_miss_rate_percent
                         .map(|value| format!("{value:.2}"))
                         .unwrap_or_else(|| "-".to_owned())
                 ));
@@ -855,7 +931,7 @@ pub fn format_report(report: &ShaderReport) -> String {
             }
             if has_counter_metrics {
                 out.push_str(&format!(
-                    " {:>8} {:>8} {:>10}",
+                    " {:>8} {:>8} {:>10} {:>10} {:>10}",
                     shader
                         .alu_utilization_percent
                         .map(|value| format!("{value:.2}"))
@@ -866,6 +942,14 @@ pub fn format_report(report: &ShaderReport) -> String {
                         .unwrap_or_else(|| "-".to_owned()),
                     shader
                         .device_memory_bandwidth_gbps
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .gpu_read_bandwidth_gbps
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .buffer_l1_miss_rate_percent
                         .map(|value| format!("{value:.2}"))
                         .unwrap_or_else(|| "-".to_owned())
                 ));
@@ -878,7 +962,7 @@ pub fn format_report(report: &ShaderReport) -> String {
 
 pub fn format_csv(report: &ShaderReport) -> String {
     let mut out = String::new();
-    out.push_str("name,pipeline_addr,dispatch_count,metric_source,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,weighted_cost,weighted_percent_of_total,kernel_alu_performance,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
+    out.push_str("name,pipeline_addr,dispatch_count,metric_source,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,weighted_cost,weighted_percent_of_total,kernel_alu_performance,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_write_accesses,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
     for shader in &report.shaders {
         let source_file = shader
             .source_file
@@ -906,6 +990,11 @@ pub fn format_csv(report: &ShaderReport) -> String {
             option_csv(shader.alu_utilization_percent),
             option_csv(shader.last_level_cache_percent),
             option_csv(shader.device_memory_bandwidth_gbps),
+            option_csv(shader.gpu_read_bandwidth_gbps),
+            option_csv(shader.gpu_write_bandwidth_gbps),
+            option_csv(shader.buffer_l1_miss_rate_percent),
+            option_csv(shader.buffer_l1_read_accesses),
+            option_csv(shader.buffer_l1_write_accesses),
             option_csv(shader.temporary_register_count),
             option_csv(shader.spilled_bytes),
             option_csv(shader.threadgroup_memory),
@@ -1384,6 +1473,11 @@ mod tests {
                 "Kernel Occupancy".into(),
                 "Device Memory Bandwidth".into(),
                 "Kernel ALU Performance".into(),
+                "GPU Read Bandwidth".into(),
+                "GPU Write Bandwidth".into(),
+                "Buffer L1 Miss Rate".into(),
+                "Buffer L1 Read Accesses".into(),
+                "Buffer L1 Write Accesses".into(),
             ],
             encoders: vec![XcodeEncoderCounters {
                 index: 0,
@@ -1395,6 +1489,11 @@ mod tests {
                     ("Kernel Occupancy".into(), 37.5),
                     ("Device Memory Bandwidth".into(), 4.2),
                     ("Kernel ALU Performance".into(), 2048.0),
+                    ("GPU Read Bandwidth".into(), 6.1),
+                    ("GPU Write Bandwidth".into(), 2.3),
+                    ("Buffer L1 Miss Rate".into(), 11.0),
+                    ("Buffer L1 Read Accesses".into(), 128.0),
+                    ("Buffer L1 Write Accesses".into(), 16.0),
                 ]),
             }],
         };
@@ -1404,6 +1503,11 @@ mod tests {
         assert_eq!(matched.occupancy_percent, Some(37.5));
         assert_eq!(matched.device_memory_bandwidth_gbps, Some(4.2));
         assert_eq!(matched.kernel_alu_performance, Some(2048.0));
+        assert_eq!(matched.gpu_read_bandwidth_gbps, Some(6.1));
+        assert_eq!(matched.gpu_write_bandwidth_gbps, Some(2.3));
+        assert_eq!(matched.buffer_l1_miss_rate_percent, Some(11.0));
+        assert_eq!(matched.buffer_l1_read_accesses, Some(128.0));
+        assert_eq!(matched.buffer_l1_write_accesses, Some(16.0));
     }
 
     #[test]
@@ -1433,6 +1537,11 @@ mod tests {
                 weighted_percent_of_total: Some(52.0),
                 last_level_cache_percent: Some(0.04),
                 device_memory_bandwidth_gbps: Some(8.2),
+                gpu_read_bandwidth_gbps: Some(6.1),
+                gpu_write_bandwidth_gbps: Some(2.3),
+                buffer_l1_miss_rate_percent: Some(11.0),
+                buffer_l1_read_accesses: Some(128.0),
+                buffer_l1_write_accesses: Some(16.0),
                 temporary_register_count: Some(48),
                 spilled_bytes: Some(256),
                 threadgroup_memory: Some(4096),
@@ -1458,6 +1567,8 @@ mod tests {
         assert!(output.contains("Occ %"));
         assert!(output.contains("ALU %"));
         assert!(output.contains("Dev BW"));
+        assert!(output.contains("GPU R"));
+        assert!(output.contains("L1 Miss"));
         assert!(output.contains("Regs"));
         assert!(output.contains("Spills"));
         assert!(output.contains("Compile ms"));
@@ -1469,6 +1580,8 @@ mod tests {
         assert!(output.contains("37.50"));
         assert!(output.contains("61.00"));
         assert!(output.contains("8.20"));
+        assert!(output.contains("6.10"));
+        assert!(output.contains("11.00"));
         assert!(output.contains("48"));
         assert!(output.contains("256"));
     }
@@ -1500,6 +1613,11 @@ mod tests {
                 alu_utilization_percent: Some(61.0),
                 last_level_cache_percent: Some(0.04),
                 device_memory_bandwidth_gbps: Some(8.2),
+                gpu_read_bandwidth_gbps: Some(6.1),
+                gpu_write_bandwidth_gbps: Some(2.3),
+                buffer_l1_miss_rate_percent: Some(11.0),
+                buffer_l1_read_accesses: Some(128.0),
+                buffer_l1_write_accesses: Some(16.0),
                 temporary_register_count: Some(48),
                 spilled_bytes: Some(256),
                 threadgroup_memory: Some(4096),
@@ -1516,6 +1634,8 @@ mod tests {
         assert!(output.contains("metric_source"));
         assert!(output.contains("weighted_percent_of_total"));
         assert!(output.contains("kernel_alu_performance"));
+        assert!(output.contains("gpu_read_bandwidth_gbps"));
+        assert!(output.contains("buffer_l1_miss_rate_percent"));
         assert!(output.contains("simd_groups"));
         assert!(output.contains("alu_utilization_percent"));
         assert!(output.contains("device_memory_bandwidth_gbps"));
@@ -1547,6 +1667,11 @@ mod tests {
             alu_utilization_percent: Some(61.0),
             last_level_cache_percent: None,
             device_memory_bandwidth_gbps: None,
+            gpu_read_bandwidth_gbps: None,
+            gpu_write_bandwidth_gbps: None,
+            buffer_l1_miss_rate_percent: None,
+            buffer_l1_read_accesses: None,
+            buffer_l1_write_accesses: None,
             temporary_register_count: None,
             spilled_bytes: None,
             threadgroup_memory: None,

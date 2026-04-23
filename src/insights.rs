@@ -218,6 +218,56 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                     });
                 }
 
+                if let Some(gpu_read_bw) = shader.gpu_read_bandwidth_gbps
+                    && gpu_read_bw >= 8.0
+                {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Optimization,
+                        severity: InsightSeverity::Medium,
+                        shader_name: Some(shader.name.clone()),
+                        title: format!("{} has heavy GPU read bandwidth", shader.name),
+                        description: format!(
+                            "{} reports {:.2} GB/s GPU read bandwidth from imported Xcode counters.",
+                            shader.name, gpu_read_bw
+                        ),
+                        recommendations: vec![
+                            "Inspect buffer reuse and read amplification before adding more parallelism."
+                                .to_owned(),
+                            "Check whether neighboring dispatches can share or fuse reads."
+                                .to_owned(),
+                        ],
+                        impact: Some(
+                            "Points to read-side memory pressure in the fallback counter path."
+                                .to_owned(),
+                        ),
+                    });
+                }
+
+                if let Some(l1_miss_rate) = shader.buffer_l1_miss_rate_percent
+                    && l1_miss_rate >= 10.0
+                {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Optimization,
+                        severity: InsightSeverity::Medium,
+                        shader_name: Some(shader.name.clone()),
+                        title: format!("{} shows Buffer L1 miss pressure", shader.name),
+                        description: format!(
+                            "{} reports {:.1}% Buffer L1 miss rate from imported Xcode counters.",
+                            shader.name, l1_miss_rate
+                        ),
+                        recommendations: vec![
+                            "Inspect access stride, data layout, and per-thread working-set size."
+                                .to_owned(),
+                            "Use `shader-hotspots` and `buffer-access` together to localize the miss-heavy path."
+                                .to_owned(),
+                        ],
+                        impact: Some(
+                            "Suggests cache-unfriendly accesses are contributing to the weighted shader cost."
+                                .to_owned(),
+                        ),
+                    });
+                }
+
                 if let Some(miss_rate) = shader
                     .metric_source
                     .eq("xcode-weighted")
