@@ -1,9 +1,11 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::analysis::{AnalysisReport, analyze};
 use crate::counter_export;
 use crate::error::Result;
+use crate::profiler;
 use crate::trace::TraceBundle;
 
 #[derive(Debug, Clone, Serialize)]
@@ -15,7 +17,113 @@ pub struct DiffReport {
     pub kernel_changes: Vec<KernelChange>,
     pub kernel_timing_changes: Vec<KernelTimingChange>,
     pub counter_metric_changes: Vec<CounterMetricChange>,
+    pub profile_diff: Option<ProfileDiffReport>,
     pub summary: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiffOptions {
+    pub profile: ProfileDiffOptions,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileDiffOptions {
+    pub limit: usize,
+    pub min_delta_us: i64,
+    pub only_encoder: Option<usize>,
+    pub only_function: Option<String>,
+}
+
+impl Default for ProfileDiffOptions {
+    fn default() -> Self {
+        Self {
+            limit: 20,
+            min_delta_us: 0,
+            only_encoder: None,
+            only_function: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileDiffReport {
+    pub schema_version: String,
+    pub left_path: String,
+    pub right_path: String,
+    pub summary: ProfileDiffSummary,
+    pub top_function_deltas: Vec<ProfileFunctionDelta>,
+    pub top_dispatch_outliers: Vec<ProfileMatchPair>,
+    pub encoder_deltas: Vec<ProfileEncoderDelta>,
+    pub matched_pairs: Vec<ProfileMatchPair>,
+    pub unmatched: Vec<ProfileUnmatchedDispatch>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileDiffSummary {
+    pub left_label: String,
+    pub right_label: String,
+    pub left_dispatch_count: usize,
+    pub right_dispatch_count: usize,
+    pub dispatch_count_delta: isize,
+    pub left_total_gpu_time_us: u64,
+    pub right_total_gpu_time_us: u64,
+    pub total_delta_us: i64,
+    pub matched_delta_us: i64,
+    pub unmatched_delta_us: i64,
+    pub likely_cause: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileFunctionDelta {
+    pub function_name: String,
+    pub left_dispatch_count: usize,
+    pub right_dispatch_count: usize,
+    pub dispatch_count_delta: isize,
+    pub matched_pairs: usize,
+    pub left_total_us: u64,
+    pub right_total_us: u64,
+    pub total_delta_us: i64,
+    pub first_occurrence_delta_us: i64,
+    pub max_occurrence_delta_us: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileEncoderDelta {
+    pub encoder_index: usize,
+    pub left_dispatch_count: usize,
+    pub right_dispatch_count: usize,
+    pub dispatch_count_delta: isize,
+    pub left_total_us: u64,
+    pub right_total_us: u64,
+    pub total_delta_us: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileMatchPair {
+    pub left_source_index: usize,
+    pub right_source_index: usize,
+    pub function_name: String,
+    pub kernel_id: String,
+    pub encoder_index: usize,
+    pub left_pipeline_id: Option<i64>,
+    pub right_pipeline_id: Option<i64>,
+    pub left_duration_us: u64,
+    pub right_duration_us: u64,
+    pub delta_us: i64,
+    pub match_method: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileUnmatchedDispatch {
+    pub trace: String,
+    pub source_index: usize,
+    pub function_name: String,
+    pub kernel_id: String,
+    pub encoder_index: usize,
+    pub pipeline_id: Option<i64>,
+    pub duration_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,12 +208,28 @@ pub struct CounterMetricChange {
 }
 
 pub fn diff_paths(left: impl AsRef<Path>, right: impl AsRef<Path>) -> Result<DiffReport> {
+    diff_paths_with_options(left, right, &DiffOptions::default())
+}
+
+pub fn diff_paths_with_options(
+    left: impl AsRef<Path>,
+    right: impl AsRef<Path>,
+    options: &DiffOptions,
+) -> Result<DiffReport> {
     let left = TraceBundle::open(left)?;
     let right = TraceBundle::open(right)?;
-    Ok(diff(&left, &right))
+    Ok(diff_with_options(&left, &right, options))
 }
 
 pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
+    diff_with_options(left, right, &DiffOptions::default())
+}
+
+pub fn diff_with_options(
+    left: &TraceBundle,
+    right: &TraceBundle,
+    options: &DiffOptions,
+) -> DiffReport {
     let left_report = analyze(left);
     let right_report = analyze(right);
     let buffer_changes = diff_buffer_stats(&left_report, &right_report);
@@ -113,6 +237,7 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
     let kernel_changes = diff_kernel_stats(&left_report, &right_report);
     let kernel_timing_changes = diff_kernel_timing_stats(&left_report, &right_report);
     let counter_metric_changes = diff_counter_metrics(left, right);
+    let profile_diff = diff_profile(left, right, &options.profile);
     let mut summary = Vec::new();
     let added_buffers = buffer_changes
         .iter()
@@ -277,6 +402,23 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
             format_option_f64(change.right_buffer_l1_write_bandwidth_gbps),
         ));
     }
+    if let Some(profile) = &profile_diff {
+        summary.push(format!(
+            "Profile dispatch delta: {} -> {} ({:+}), GPU time {} -> {} us ({:+} us), matched delta {:+} us, unmatched delta {:+} us",
+            profile.summary.left_dispatch_count,
+            profile.summary.right_dispatch_count,
+            profile.summary.dispatch_count_delta,
+            profile.summary.left_total_gpu_time_us,
+            profile.summary.right_total_gpu_time_us,
+            profile.summary.total_delta_us,
+            profile.summary.matched_delta_us,
+            profile.summary.unmatched_delta_us
+        ));
+        summary.push(format!(
+            "Likely profile cause: {}",
+            profile.summary.likely_cause
+        ));
+    }
     if summary.is_empty() {
         summary.push("No high-level differences detected yet.".to_owned());
     }
@@ -289,6 +431,7 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
         kernel_changes,
         kernel_timing_changes,
         counter_metric_changes,
+        profile_diff,
         summary,
     }
 }
@@ -353,6 +496,482 @@ fn diff_counter_metrics(left: &TraceBundle, right: &TraceBundle) -> Vec<CounterM
             .then_with(|| left.name.cmp(&right.name))
     });
     changes
+}
+
+#[derive(Debug, Clone)]
+struct ProfileTraceData {
+    path: String,
+    label: String,
+    dispatches: Vec<ProfileDispatch>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProfileDispatch {
+    source_index: usize,
+    function_name: String,
+    function_key: String,
+    kernel_id: String,
+    pipeline_id: Option<i64>,
+    encoder_index: usize,
+    duration_us: u64,
+}
+
+fn diff_profile(
+    left: &TraceBundle,
+    right: &TraceBundle,
+    options: &ProfileDiffOptions,
+) -> Option<ProfileDiffReport> {
+    let left_trace = load_profile_trace(left, options);
+    let right_trace = load_profile_trace(right, options);
+    if left_trace.dispatches.is_empty() && right_trace.dispatches.is_empty() {
+        return None;
+    }
+
+    let (matches, unmatched_left, unmatched_right) =
+        align_profile_dispatches(&left_trace.dispatches, &right_trace.dispatches);
+    let mut warnings = left_trace.warnings.clone();
+    warnings.extend(right_trace.warnings.clone());
+
+    let left_total = total_profile_duration(&left_trace.dispatches);
+    let right_total = total_profile_duration(&right_trace.dispatches);
+    let matched_delta = matches.iter().map(|pair| pair.delta_us).sum::<i64>();
+    let unmatched_left_total = unmatched_left
+        .iter()
+        .map(|index| left_trace.dispatches[*index].duration_us)
+        .sum::<u64>();
+    let unmatched_right_total = unmatched_right
+        .iter()
+        .map(|index| right_trace.dispatches[*index].duration_us)
+        .sum::<u64>();
+    let unmatched_delta = unmatched_left_total as i64 - unmatched_right_total as i64;
+
+    let mut unmatched = unmatched_left
+        .iter()
+        .map(|index| unmatched_profile_dispatch("left", &left_trace.dispatches[*index]))
+        .collect::<Vec<_>>();
+    unmatched.extend(
+        unmatched_right
+            .iter()
+            .map(|index| unmatched_profile_dispatch("right", &right_trace.dispatches[*index])),
+    );
+
+    let mut report = ProfileDiffReport {
+        schema_version: "gputrace.diff.profile.v1".to_owned(),
+        left_path: left_trace.path.clone(),
+        right_path: right_trace.path.clone(),
+        summary: ProfileDiffSummary {
+            left_label: left_trace.label.clone(),
+            right_label: right_trace.label.clone(),
+            left_dispatch_count: left_trace.dispatches.len(),
+            right_dispatch_count: right_trace.dispatches.len(),
+            dispatch_count_delta: left_trace.dispatches.len() as isize
+                - right_trace.dispatches.len() as isize,
+            left_total_gpu_time_us: left_total,
+            right_total_gpu_time_us: right_total,
+            total_delta_us: left_total as i64 - right_total as i64,
+            matched_delta_us: matched_delta,
+            unmatched_delta_us: unmatched_delta,
+            likely_cause: infer_profile_likely_cause(
+                left_total as i64 - right_total as i64,
+                matched_delta,
+                unmatched_delta,
+            ),
+        },
+        top_function_deltas: build_profile_function_deltas(
+            &left_trace.dispatches,
+            &right_trace.dispatches,
+            &matches,
+        ),
+        top_dispatch_outliers: top_profile_outliers(&matches, options),
+        encoder_deltas: build_profile_encoder_deltas(
+            &left_trace.dispatches,
+            &right_trace.dispatches,
+        ),
+        matched_pairs: matches,
+        unmatched,
+        warnings,
+    };
+
+    let limit = options.limit.max(1);
+    truncate_profile_report(&mut report, limit);
+    Some(report)
+}
+
+fn load_profile_trace(trace: &TraceBundle, options: &ProfileDiffOptions) -> ProfileTraceData {
+    let path = trace.path.display().to_string();
+    let label = trace
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path.as_str())
+        .to_owned();
+    let mut warnings = Vec::new();
+    let summary = match profiler::stream_data_summary(&trace.path) {
+        Ok(summary) => summary,
+        Err(error) => {
+            warnings.push(format!(
+                "profile streamData unavailable for {label}: {error}"
+            ));
+            return ProfileTraceData {
+                path,
+                label,
+                dispatches: Vec::new(),
+                warnings,
+            };
+        }
+    };
+
+    let only_function = options
+        .only_function
+        .as_ref()
+        .map(|value| value.to_ascii_lowercase());
+    let mut dispatches = summary
+        .dispatches
+        .iter()
+        .filter(|dispatch| {
+            options
+                .only_encoder
+                .is_none_or(|encoder| dispatch.encoder_index == encoder)
+        })
+        .filter(|dispatch| {
+            only_function.as_ref().is_none_or(|needle| {
+                dispatch
+                    .function_name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .contains(needle)
+            })
+        })
+        .map(|dispatch| {
+            let function_name = dispatch.function_name.clone().unwrap_or_default();
+            let function_key = profile_function_key(&function_name, dispatch);
+            ProfileDispatch {
+                source_index: dispatch.index,
+                function_name,
+                kernel_id: function_key.clone(),
+                function_key,
+                pipeline_id: dispatch.pipeline_id,
+                encoder_index: dispatch.encoder_index,
+                duration_us: dispatch.duration_us,
+            }
+        })
+        .collect::<Vec<_>>();
+    dispatches.sort_by_key(|dispatch| dispatch.source_index);
+
+    if dispatches.is_empty() {
+        warnings.push(format!("no profile dispatches after filtering for {label}"));
+    }
+
+    ProfileTraceData {
+        path,
+        label,
+        dispatches,
+        warnings,
+    }
+}
+
+fn profile_function_key(function_name: &str, dispatch: &profiler::ProfilerDispatch) -> String {
+    let normalized = normalize_profile_name(function_name);
+    if normalized.is_empty() {
+        format!(
+            "pipeline:{}:{}",
+            dispatch
+                .pipeline_id
+                .unwrap_or(dispatch.pipeline_index as i64),
+            dispatch.encoder_index
+        )
+    } else {
+        normalized
+    }
+}
+
+fn normalize_profile_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn align_profile_dispatches(
+    left: &[ProfileDispatch],
+    right: &[ProfileDispatch],
+) -> (Vec<ProfileMatchPair>, Vec<usize>, Vec<usize>) {
+    let mut right_by_key = BTreeMap::<String, Vec<usize>>::new();
+    for (index, dispatch) in right.iter().enumerate() {
+        right_by_key
+            .entry(dispatch.function_key.clone())
+            .or_default()
+            .push(index);
+    }
+
+    let mut next_by_key = BTreeMap::<String, usize>::new();
+    let mut matched_left = vec![false; left.len()];
+    let mut matched_right = vec![false; right.len()];
+    let mut matches = Vec::new();
+    let mut last_right = None;
+
+    for (left_index, left_dispatch) in left.iter().enumerate() {
+        let Some(candidates) = right_by_key.get(&left_dispatch.function_key) else {
+            continue;
+        };
+        let next = next_by_key
+            .entry(left_dispatch.function_key.clone())
+            .or_default();
+        while *next < candidates.len() && last_right.is_some_and(|last| candidates[*next] <= last) {
+            *next += 1;
+        }
+        if *next >= candidates.len() {
+            continue;
+        }
+        let right_index = candidates[*next];
+        *next += 1;
+        last_right = Some(right_index);
+        matched_left[left_index] = true;
+        matched_right[right_index] = true;
+        matches.push(profile_match_pair(
+            left_dispatch,
+            &right[right_index],
+            "function_occurrence",
+            0.95,
+        ));
+    }
+
+    let unmatched_left = matched_left
+        .iter()
+        .enumerate()
+        .filter_map(|(index, matched)| (!matched).then_some(index))
+        .collect::<Vec<_>>();
+    let unmatched_right = matched_right
+        .iter()
+        .enumerate()
+        .filter_map(|(index, matched)| (!matched).then_some(index))
+        .collect::<Vec<_>>();
+    (matches, unmatched_left, unmatched_right)
+}
+
+fn profile_match_pair(
+    left: &ProfileDispatch,
+    right: &ProfileDispatch,
+    method: &str,
+    confidence: f64,
+) -> ProfileMatchPair {
+    ProfileMatchPair {
+        left_source_index: left.source_index,
+        right_source_index: right.source_index,
+        function_name: if left.function_name.is_empty() {
+            safe_profile_name(&right.function_name)
+        } else {
+            safe_profile_name(&left.function_name)
+        },
+        kernel_id: if left.kernel_id.is_empty() {
+            right.kernel_id.clone()
+        } else {
+            left.kernel_id.clone()
+        },
+        encoder_index: left.encoder_index,
+        left_pipeline_id: left.pipeline_id,
+        right_pipeline_id: right.pipeline_id,
+        left_duration_us: left.duration_us,
+        right_duration_us: right.duration_us,
+        delta_us: left.duration_us as i64 - right.duration_us as i64,
+        match_method: method.to_owned(),
+        confidence,
+    }
+}
+
+fn unmatched_profile_dispatch(trace: &str, dispatch: &ProfileDispatch) -> ProfileUnmatchedDispatch {
+    ProfileUnmatchedDispatch {
+        trace: trace.to_owned(),
+        source_index: dispatch.source_index,
+        function_name: safe_profile_name(&dispatch.function_name),
+        kernel_id: dispatch.kernel_id.clone(),
+        encoder_index: dispatch.encoder_index,
+        pipeline_id: dispatch.pipeline_id,
+        duration_us: dispatch.duration_us,
+    }
+}
+
+fn safe_profile_name(name: &str) -> String {
+    if name.trim().is_empty() {
+        "(unnamed)".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+fn total_profile_duration(dispatches: &[ProfileDispatch]) -> u64 {
+    dispatches.iter().map(|dispatch| dispatch.duration_us).sum()
+}
+
+fn build_profile_function_deltas(
+    left: &[ProfileDispatch],
+    right: &[ProfileDispatch],
+    matches: &[ProfileMatchPair],
+) -> Vec<ProfileFunctionDelta> {
+    #[derive(Default)]
+    struct FunctionAgg {
+        function_name: String,
+        left_dispatch_count: usize,
+        right_dispatch_count: usize,
+        matched_pairs: usize,
+        left_total_us: u64,
+        right_total_us: u64,
+        first_occurrence_delta_us: Option<i64>,
+        max_occurrence_delta_us: i64,
+    }
+
+    let mut by_name = BTreeMap::<String, FunctionAgg>::new();
+    for dispatch in left {
+        let name = safe_profile_name(&dispatch.function_name);
+        let agg = by_name.entry(name.clone()).or_insert_with(|| FunctionAgg {
+            function_name: name,
+            ..Default::default()
+        });
+        agg.left_dispatch_count += 1;
+        agg.left_total_us += dispatch.duration_us;
+    }
+    for dispatch in right {
+        let name = safe_profile_name(&dispatch.function_name);
+        let agg = by_name.entry(name.clone()).or_insert_with(|| FunctionAgg {
+            function_name: name,
+            ..Default::default()
+        });
+        agg.right_dispatch_count += 1;
+        agg.right_total_us += dispatch.duration_us;
+    }
+    for pair in matches {
+        let agg = by_name
+            .entry(pair.function_name.clone())
+            .or_insert_with(|| FunctionAgg {
+                function_name: pair.function_name.clone(),
+                ..Default::default()
+            });
+        agg.matched_pairs += 1;
+        if agg.first_occurrence_delta_us.is_none() {
+            agg.first_occurrence_delta_us = Some(pair.delta_us);
+        }
+        if pair.delta_us.abs() > agg.max_occurrence_delta_us.abs() {
+            agg.max_occurrence_delta_us = pair.delta_us;
+        }
+    }
+
+    let mut deltas = by_name
+        .into_values()
+        .map(|agg| ProfileFunctionDelta {
+            function_name: agg.function_name,
+            left_dispatch_count: agg.left_dispatch_count,
+            right_dispatch_count: agg.right_dispatch_count,
+            dispatch_count_delta: agg.left_dispatch_count as isize
+                - agg.right_dispatch_count as isize,
+            matched_pairs: agg.matched_pairs,
+            left_total_us: agg.left_total_us,
+            right_total_us: agg.right_total_us,
+            total_delta_us: agg.left_total_us as i64 - agg.right_total_us as i64,
+            first_occurrence_delta_us: agg.first_occurrence_delta_us.unwrap_or_default(),
+            max_occurrence_delta_us: agg.max_occurrence_delta_us,
+        })
+        .collect::<Vec<_>>();
+    deltas.sort_by(|left, right| {
+        right
+            .total_delta_us
+            .abs()
+            .cmp(&left.total_delta_us.abs())
+            .then_with(|| left.function_name.cmp(&right.function_name))
+    });
+    deltas
+}
+
+fn build_profile_encoder_deltas(
+    left: &[ProfileDispatch],
+    right: &[ProfileDispatch],
+) -> Vec<ProfileEncoderDelta> {
+    #[derive(Default)]
+    struct EncoderAgg {
+        left_dispatch_count: usize,
+        right_dispatch_count: usize,
+        left_total_us: u64,
+        right_total_us: u64,
+    }
+
+    let mut by_encoder = BTreeMap::<usize, EncoderAgg>::new();
+    for dispatch in left {
+        let agg = by_encoder.entry(dispatch.encoder_index).or_default();
+        agg.left_dispatch_count += 1;
+        agg.left_total_us += dispatch.duration_us;
+    }
+    for dispatch in right {
+        let agg = by_encoder.entry(dispatch.encoder_index).or_default();
+        agg.right_dispatch_count += 1;
+        agg.right_total_us += dispatch.duration_us;
+    }
+
+    let mut deltas = by_encoder
+        .into_iter()
+        .map(|(encoder_index, agg)| ProfileEncoderDelta {
+            encoder_index,
+            left_dispatch_count: agg.left_dispatch_count,
+            right_dispatch_count: agg.right_dispatch_count,
+            dispatch_count_delta: agg.left_dispatch_count as isize
+                - agg.right_dispatch_count as isize,
+            left_total_us: agg.left_total_us,
+            right_total_us: agg.right_total_us,
+            total_delta_us: agg.left_total_us as i64 - agg.right_total_us as i64,
+        })
+        .collect::<Vec<_>>();
+    deltas.sort_by(|left, right| {
+        right
+            .total_delta_us
+            .abs()
+            .cmp(&left.total_delta_us.abs())
+            .then_with(|| left.encoder_index.cmp(&right.encoder_index))
+    });
+    deltas
+}
+
+fn top_profile_outliers(
+    matches: &[ProfileMatchPair],
+    options: &ProfileDiffOptions,
+) -> Vec<ProfileMatchPair> {
+    let min_delta = options.min_delta_us.max(0);
+    let mut outliers = matches
+        .iter()
+        .filter(|pair| pair.delta_us.abs() >= min_delta)
+        .cloned()
+        .collect::<Vec<_>>();
+    outliers.sort_by(|left, right| {
+        right
+            .delta_us
+            .abs()
+            .cmp(&left.delta_us.abs())
+            .then_with(|| left.left_source_index.cmp(&right.left_source_index))
+    });
+    outliers
+}
+
+fn infer_profile_likely_cause(
+    total_delta: i64,
+    matched_delta: i64,
+    unmatched_delta: i64,
+) -> String {
+    let abs_total = total_delta.abs();
+    if abs_total == 0 {
+        return "no profile timing delta".to_owned();
+    }
+    let matched_ratio = matched_delta.abs() as f64 / abs_total as f64;
+    let unmatched_ratio = unmatched_delta.abs() as f64 / abs_total as f64;
+    if matched_ratio >= 0.65 && unmatched_ratio < 0.35 {
+        "common matched dispatches changed duration".to_owned()
+    } else if unmatched_ratio >= 0.65 && matched_ratio < 0.35 {
+        "inserted or removed dispatches dominate".to_owned()
+    } else {
+        "mixed matched-duration and structural dispatch changes".to_owned()
+    }
+}
+
+fn truncate_profile_report(report: &mut ProfileDiffReport, limit: usize) {
+    report.top_function_deltas.truncate(limit);
+    report.top_dispatch_outliers.truncate(limit);
+    report.encoder_deltas.truncate(limit);
+    report.unmatched.truncate(limit * 4);
 }
 
 fn aggregate_counter_metrics(
@@ -1135,5 +1754,65 @@ mod tests {
         assert_eq!(changes[0].status, BufferChangeStatus::Changed);
         assert_eq!(changes[0].command_buffer_span_delta, 2);
         assert_eq!(changes[0].dispatch_span_delta, 4);
+    }
+
+    #[test]
+    fn profile_alignment_reports_matched_unmatched_and_outliers() {
+        let left = vec![
+            profile_dispatch(0, "gemm", 0, Some(11), 100),
+            profile_dispatch(1, "copy", 0, Some(12), 20),
+            profile_dispatch(2, "norm", 1, Some(13), 50),
+        ];
+        let right = vec![
+            profile_dispatch(0, "gemm", 0, Some(11), 160),
+            profile_dispatch(1, "norm", 1, Some(13), 30),
+            profile_dispatch(2, "extra", 1, Some(14), 70),
+        ];
+
+        let (matches, unmatched_left, unmatched_right) = align_profile_dispatches(&left, &right);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].function_name, "gemm");
+        assert_eq!(matches[0].delta_us, -60);
+        assert_eq!(unmatched_left, vec![1]);
+        assert_eq!(unmatched_right, vec![2]);
+
+        let function_deltas = build_profile_function_deltas(&left, &right, &matches);
+        assert_eq!(function_deltas[0].function_name, "extra");
+        assert_eq!(function_deltas[0].total_delta_us, -70);
+
+        let outliers = top_profile_outliers(
+            &matches,
+            &ProfileDiffOptions {
+                limit: 20,
+                min_delta_us: 40,
+                only_encoder: None,
+                only_function: None,
+            },
+        );
+        assert_eq!(outliers.len(), 1);
+        assert_eq!(outliers[0].function_name, "gemm");
+    }
+
+    fn profile_dispatch(
+        source_index: usize,
+        function_name: &str,
+        encoder_index: usize,
+        pipeline_id: Option<i64>,
+        duration_us: u64,
+    ) -> ProfileDispatch {
+        let function_key = if function_name.is_empty() {
+            format!("pipeline:{}", pipeline_id.unwrap_or_default())
+        } else {
+            function_name.to_owned()
+        };
+        ProfileDispatch {
+            source_index,
+            function_name: function_name.to_owned(),
+            kernel_id: function_key.clone(),
+            function_key,
+            pipeline_id,
+            encoder_index,
+            duration_us,
+        }
     }
 }

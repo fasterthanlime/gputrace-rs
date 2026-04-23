@@ -270,6 +270,92 @@ pub fn diff_report_with_limit(report: &DiffReport, limit: usize) -> String {
             limit,
         );
     }
+    if let Some(profile) = &report.profile_diff {
+        push_metric_block(
+            &mut out,
+            "Profile Diff",
+            &[
+                (
+                    "Total GPU delta",
+                    format!(
+                        "{:+} us ({} -> {})",
+                        profile.summary.total_delta_us,
+                        profile.summary.left_total_gpu_time_us,
+                        profile.summary.right_total_gpu_time_us
+                    ),
+                ),
+                (
+                    "Dispatch delta",
+                    format!(
+                        "{:+} ({} -> {})",
+                        profile.summary.dispatch_count_delta,
+                        profile.summary.left_dispatch_count,
+                        profile.summary.right_dispatch_count
+                    ),
+                ),
+                (
+                    "Matched delta",
+                    format!("{:+} us", profile.summary.matched_delta_us),
+                ),
+                (
+                    "Unmatched delta",
+                    format!("{:+} us", profile.summary.unmatched_delta_us),
+                ),
+                ("Likely cause", profile.summary.likely_cause.clone()),
+            ],
+        );
+        if !profile.top_function_deltas.is_empty() {
+            out.push_str("## Top Profile Function Deltas\n\n");
+            out.push_str("| Function | Count Left | Count Right | Delta us |\n");
+            out.push_str("|---|---:|---:|---:|\n");
+            for delta in profile.top_function_deltas.iter().take(limit) {
+                out.push_str(&format!(
+                    "| `{}` | {} | {} | {:+} |\n",
+                    escape_markdown_table_cell(&delta.function_name),
+                    delta.left_dispatch_count,
+                    delta.right_dispatch_count,
+                    delta.total_delta_us
+                ));
+            }
+            out.push('\n');
+        }
+        if !profile.top_dispatch_outliers.is_empty() {
+            out.push_str("## Top Profile Dispatch Outliers\n\n");
+            out.push_str(
+                "| Left idx | Right idx | Encoder | Function | Left us | Right us | Delta us |\n",
+            );
+            out.push_str("|---:|---:|---:|---|---:|---:|---:|\n");
+            for pair in profile.top_dispatch_outliers.iter().take(limit) {
+                out.push_str(&format!(
+                    "| {} | {} | {} | `{}` | {} | {} | {:+} |\n",
+                    pair.left_source_index,
+                    pair.right_source_index,
+                    pair.encoder_index,
+                    escape_markdown_table_cell(&pair.function_name),
+                    pair.left_duration_us,
+                    pair.right_duration_us,
+                    pair.delta_us
+                ));
+            }
+            out.push('\n');
+        }
+        if !profile.unmatched.is_empty() {
+            out.push_str("## Unmatched Profile Dispatches\n\n");
+            out.push_str("| Trace | Index | Encoder | Function | Duration us |\n");
+            out.push_str("|---|---:|---:|---|---:|\n");
+            for dispatch in profile.unmatched.iter().take(limit) {
+                out.push_str(&format!(
+                    "| {} | {} | {} | `{}` | {} |\n",
+                    dispatch.trace,
+                    dispatch.source_index,
+                    dispatch.encoder_index,
+                    escape_markdown_table_cell(&dispatch.function_name),
+                    dispatch.duration_us
+                ));
+            }
+            out.push('\n');
+        }
+    }
     if !report.buffer_changes.is_empty() {
         push_section(
             &mut out,
@@ -326,6 +412,10 @@ fn option_metric(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.2}"))
         .unwrap_or_else(|| "-".to_owned())
+}
+
+fn escape_markdown_table_cell(value: &str) -> String {
+    value.replace('|', r"\|")
 }
 
 fn push_section(
@@ -571,6 +661,7 @@ mod tests {
                 left_buffer_l1_write_bandwidth_gbps: Some(0.5),
                 right_buffer_l1_write_bandwidth_gbps: Some(1.5),
             }],
+            profile_diff: None,
             kernel_changes: (0..11)
                 .map(|index| KernelChange {
                     name: format!("kernel_{index}"),

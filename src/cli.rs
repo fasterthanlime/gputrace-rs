@@ -110,8 +110,8 @@ struct TracePath {
 
 #[derive(Debug, Args)]
 struct DiffArgs {
-    left: PathBuf,
-    right: PathBuf,
+    left: Option<PathBuf>,
+    right: Option<PathBuf>,
     #[arg(long)]
     markdown: bool,
     #[arg(long)]
@@ -122,6 +122,12 @@ struct DiffArgs {
     format: Option<String>,
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    #[arg(long)]
+    min_delta_us: Option<i64>,
+    #[arg(long)]
+    only_encoder: Option<usize>,
+    #[arg(long)]
+    only_function: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1104,7 +1110,24 @@ pub fn run() -> Result<()> {
             }
         }
         CommandSet::Diff(args) => {
-            let report = diff::diff_paths(args.left, args.right)?;
+            let left = args.left.ok_or_else(|| {
+                crate::Error::InvalidInput("diff requires a left trace path".to_owned())
+            })?;
+            let right = args.right.ok_or_else(|| {
+                crate::Error::InvalidInput("diff requires a right trace path".to_owned())
+            })?;
+            let report = diff::diff_paths_with_options(
+                left,
+                right,
+                &diff::DiffOptions {
+                    profile: diff::ProfileDiffOptions {
+                        limit: args.limit,
+                        min_delta_us: args.min_delta_us.unwrap_or_default(),
+                        only_encoder: args.only_encoder,
+                        only_function: args.only_function,
+                    },
+                },
+            )?;
             if let Some(path) = args.md_out.as_ref() {
                 fs::write(path, markdown::diff_report_with_limit(&report, args.limit))?;
             }

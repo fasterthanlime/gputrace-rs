@@ -394,13 +394,16 @@ fn dump_records_help_keeps_filters() {
 fn diff_help_keeps_markdown_and_format_outputs() {
     let help = render_help(&["diff"]);
 
-    assert!(help.contains("<LEFT>"));
-    assert!(help.contains("<RIGHT>"));
+    assert!(help.contains("[LEFT]"));
+    assert!(help.contains("[RIGHT]"));
     assert!(help.contains("--markdown"));
     assert!(help.contains("--json"));
     assert!(help.contains("--md-out <MD_OUT>"));
     assert!(help.contains("--format <FORMAT>"));
     assert!(help.contains("--limit <LIMIT>"));
+    assert!(help.contains("--min-delta-us <MIN_DELTA_US>"));
+    assert!(help.contains("--only-encoder <ONLY_ENCODER>"));
+    assert!(help.contains("--only-function <ONLY_FUNCTION>"));
 }
 
 #[test]
@@ -495,6 +498,12 @@ fn important_top_level_commands_parse_their_existing_contracts() {
             "diff.md",
             "--limit",
             "5",
+            "--min-delta-us",
+            "10",
+            "--only-encoder",
+            "2",
+            "--only-function",
+            "gemm",
         ],
         vec![
             "gputrace",
