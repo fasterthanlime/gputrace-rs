@@ -12,11 +12,13 @@ use crate::correlate;
 use crate::diff;
 use crate::dump;
 use crate::error::Result;
+use crate::fences;
 use crate::graphing;
 use crate::insights;
 use crate::markdown;
 use crate::mtlb;
 use crate::shaders;
+use crate::timeline;
 use crate::timing;
 use crate::trace::{RecordType, TraceBundle};
 
@@ -34,7 +36,9 @@ enum CommandSet {
     Analyze(TracePath),
     ApiCalls(ApiCallsArgs),
     DumpRecords(DumpRecordsArgs),
+    Fences(FencesArgs),
     Mtlb(MtlbArgs),
+    Timeline(TimelineArgs),
     Kernels(KernelsArgs),
     Encoders(EncodersArgs),
     Dependencies(DependenciesArgs),
@@ -107,6 +111,22 @@ struct MtlbArgs {
     path: PathBuf,
     #[arg(short, long, default_value = "text")]
     format: String,
+}
+
+#[derive(Debug, Args)]
+struct FencesArgs {
+    trace: PathBuf,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct TimelineArgs {
+    trace: PathBuf,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+    #[arg(long, default_value_t = false)]
+    raw: bool,
 }
 
 #[derive(Debug, Args)]
@@ -349,6 +369,35 @@ pub fn run() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
                 _ => return Err(crate::Error::Unsupported("unknown mtlb format")),
+            }
+        }
+        CommandSet::Fences(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = fences::report(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", fences::format_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown fences format")),
+            }
+        }
+        CommandSet::Timeline(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            if args.raw {
+                let report = timeline::raw_report(&trace)?;
+                match args.format.as_str() {
+                    "text" | "table" => print!("{}", timeline::format_raw_report(&report)),
+                    "json" => print!("{}", timeline::export_raw_json(&report)?),
+                    _ => return Err(crate::Error::Unsupported("unknown raw timeline format")),
+                }
+            } else {
+                let report = timeline::report(&trace)?;
+                match args.format.as_str() {
+                    "text" | "table" => print!("{}", timeline::format_report(&report)),
+                    "json" => print!("{}", timeline::export_json(&report)?),
+                    "chrome" => print!("{}", timeline::format_chrome_trace_json(&report)?),
+                    "perfetto" => print!("{}", timeline::format_perfetto_trace_json(&report)?),
+                    _ => return Err(crate::Error::Unsupported("unknown timeline format")),
+                }
             }
         }
         CommandSet::Kernels(args) => {
