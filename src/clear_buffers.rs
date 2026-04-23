@@ -2,17 +2,19 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::error::{Error, Result};
 
 const ZERO_CHUNK_SIZE: usize = 64 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClearBufferFile {
     pub path: PathBuf,
     pub size: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct ClearBuffersReport {
     pub files: Vec<ClearBufferFile>,
     pub total_bytes: u64,
@@ -29,7 +31,7 @@ impl ClearBuffersReport {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct ClearBuffersRunReport {
     pub files_cleared: usize,
     pub bytes_cleared: u64,

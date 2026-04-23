@@ -47,6 +47,7 @@ pub struct ApiCallEntry {
     pub dispatch_index: Option<usize>,
     pub buffer_slot: Option<usize>,
     pub buffer_name: Option<String>,
+    pub buffer_usage: Option<String>,
     pub grid_size: Option<[u32; 3]>,
     pub group_size: Option<[u32; 3]>,
 }
@@ -168,6 +169,7 @@ fn report_from_regions(regions: &[CommandBufferRegion], filter: Option<&str>) ->
                     None,
                     None,
                     None,
+                    None,
                 );
             }
 
@@ -206,6 +208,7 @@ fn report_from_regions(regions: &[CommandBufferRegion], filter: Option<&str>) ->
                         None,
                         None,
                         None,
+                        None,
                     );
                     last_pipeline_by_encoder.insert(encoder_address, pipeline_addr);
                 }
@@ -218,13 +221,19 @@ fn report_from_regions(regions: &[CommandBufferRegion], filter: Option<&str>) ->
                     dispatch.offset,
                     "buffer_binding",
                     "setBuffer",
-                    format!("slot={} buffer={}", buffer.index, display_buffer(buffer)),
+                    format!(
+                        "slot={} buffer={} usage={}",
+                        buffer.index,
+                        display_buffer(buffer),
+                        buffer.usage
+                    ),
                     encoder,
                     pipeline_addr,
                     kernel_name.clone(),
                     Some(dispatch.index),
                     Some(buffer.index),
                     Some(display_buffer(buffer)),
+                    Some(buffer.usage.to_string()),
                     None,
                     None,
                 );
@@ -246,6 +255,7 @@ fn report_from_regions(regions: &[CommandBufferRegion], filter: Option<&str>) ->
                 pipeline_addr,
                 kernel_name,
                 Some(dispatch.index),
+                None,
                 None,
                 None,
                 Some(dispatch.grid_size),
@@ -300,6 +310,7 @@ fn push_call(
         dispatch_index: None,
         buffer_slot: None,
         buffer_name: None,
+        buffer_usage: None,
         grid_size: None,
         group_size: None,
     });
@@ -319,6 +330,7 @@ fn push_call_with_context(
     dispatch_index: Option<usize>,
     buffer_slot: Option<usize>,
     buffer_name: Option<String>,
+    buffer_usage: Option<String>,
     grid_size: Option<[u32; 3]>,
     group_size: Option<[u32; 3]>,
 ) {
@@ -338,6 +350,7 @@ fn push_call_with_context(
         dispatch_index,
         buffer_slot,
         buffer_name,
+        buffer_usage,
         grid_size,
         group_size,
     });

@@ -3,10 +3,12 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::analysis;
+use crate::analyze_usage;
 use crate::apicalls;
 use crate::automation::{self, XcodeProfileRun};
 use crate::buffer_timeline;
 use crate::buffers;
+use crate::clear_buffers;
 use crate::commands;
 use crate::correlate;
 use crate::diff;
@@ -34,7 +36,9 @@ pub struct Cli {
 enum CommandSet {
     Stats(TracePath),
     Analyze(TracePath),
+    AnalyzeUsage(AnalyzeUsageArgs),
     ApiCalls(ApiCallsArgs),
+    ClearBuffers(ClearBuffersArgs),
     DumpRecords(DumpRecordsArgs),
     Fences(FencesArgs),
     Mtlb(MtlbArgs),
@@ -85,6 +89,22 @@ struct ApiCallsArgs {
     trace: PathBuf,
     #[arg(short = 'k', long)]
     kernel: Option<String>,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct AnalyzeUsageArgs {
+    trace: PathBuf,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ClearBuffersArgs {
+    trace: PathBuf,
+    #[arg(long, default_value_t = false)]
+    execute: bool,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -319,6 +339,16 @@ pub fn run() -> Result<()> {
             let report = analysis::analyze(&trace);
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        CommandSet::AnalyzeUsage(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = analyze_usage::build(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", analyze_usage::format_text(&report)),
+                "json" => print!("{}", analyze_usage::format_json(&report)?),
+                "dot" => print!("{}", analyze_usage::format_dot(&report)),
+                _ => return Err(crate::Error::Unsupported("unknown analyze-usage format")),
+            }
+        }
         CommandSet::ApiCalls(args) => {
             let trace = TraceBundle::open(args.trace)?;
             let report = apicalls::report(&trace, args.kernel.as_deref())?;
@@ -326,6 +356,29 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", apicalls::format_report(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown api-calls format")),
+            }
+        }
+        CommandSet::ClearBuffers(args) => {
+            let report = clear_buffers::inventory(&args.trace)?;
+            if args.execute {
+                let run = clear_buffers::clear_report(&report)?;
+                match args.format.as_str() {
+                    "text" | "table" => {
+                        print!(
+                            "Cleared {} buffer files ({} total)\n",
+                            run.files_cleared,
+                            clear_buffers::format_byte_size(run.bytes_cleared)
+                        );
+                    }
+                    "json" => println!("{}", serde_json::to_string_pretty(&run)?),
+                    _ => return Err(crate::Error::Unsupported("unknown clear-buffers format")),
+                }
+            } else {
+                match args.format.as_str() {
+                    "text" | "table" => print!("{}", clear_buffers::format_report(&report)),
+                    "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                    _ => return Err(crate::Error::Unsupported("unknown clear-buffers format")),
+                }
             }
         }
         CommandSet::DumpRecords(args) => {

@@ -67,6 +67,7 @@ pub struct TimelineBufferBinding {
     pub index: usize,
     pub address: u64,
     pub name: Option<String>,
+    pub usage: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -632,6 +633,7 @@ fn bound_buffer_to_timeline(buffer: &BoundBuffer) -> TimelineBufferBinding {
         index: buffer.index,
         address: buffer.address,
         name: buffer.name.clone(),
+        usage: buffer.usage.to_string(),
     }
 }
 
