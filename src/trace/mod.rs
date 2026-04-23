@@ -80,6 +80,8 @@ pub struct DispatchCall {
     pub index: usize,
     pub offset: usize,
     pub encoder_id: Option<u64>,
+    pub pipeline_addr: Option<u64>,
+    pub kernel_name: Option<String>,
     pub grid_size: [u32; 3],
     pub group_size: [u32; 3],
 }
@@ -97,7 +99,16 @@ pub struct CommandBufferRegion {
     pub command_buffer: CommandBuffer,
     pub end_offset: usize,
     pub encoders: Vec<ComputeEncoder>,
+    pub pipeline_events: Vec<PipelineStateEvent>,
     pub dispatches: Vec<DispatchCall>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PipelineStateEvent {
+    pub offset: usize,
+    pub encoder_addr: u64,
+    pub pipeline_addr: u64,
+    pub function_addr: u64,
 }
 
 impl TraceBundle {
@@ -208,6 +219,8 @@ impl TraceBundle {
                 index: dispatches.len(),
                 offset: record.offset,
                 encoder_id: Some(dispatch.encoder_id),
+                pipeline_addr: None,
+                kernel_name: None,
                 grid_size: dispatch.grid_size,
                 group_size: dispatch.group_size,
             });
@@ -219,12 +232,15 @@ impl TraceBundle {
         let capture = self.capture_data()?;
         let command_buffers = parse_command_buffers(&capture);
         let encoders = dedupe_encoders(parse_compute_encoders(&capture))?;
+        let pipeline_events = parse_pipeline_state_events(&capture)?;
         let dispatches = self.dispatch_calls()?;
         Ok(build_command_buffer_regions(
             &capture,
             command_buffers,
             encoders,
+            pipeline_events,
             dispatches,
+            &self.pipeline_function_map()?,
         ))
     }
 
@@ -261,18 +277,25 @@ impl TraceBundle {
                             .find(|encoder| encoder.offset <= dispatch.offset)
                     });
 
-                let name = encoder
-                    .map(|encoder| encoder.label.clone())
-                    .filter(|label| !label.is_empty())
+                let name = dispatch
+                    .kernel_name
+                    .clone()
+                    .or_else(|| {
+                        encoder
+                            .map(|encoder| encoder.label.clone())
+                            .filter(|label| !label.is_empty())
+                    })
                     .unwrap_or_else(|| "unknown".to_owned());
 
-                let pipeline_addr = encoder
-                    .and_then(|encoder| {
-                        pipeline_map.iter().find_map(|(addr, candidate)| {
-                            (candidate == &encoder.label).then_some(*addr)
+                let pipeline_addr = dispatch.pipeline_addr.unwrap_or_else(|| {
+                    encoder
+                        .and_then(|encoder| {
+                            pipeline_map.iter().find_map(|(addr, candidate)| {
+                                (candidate == &encoder.label).then_some(*addr)
+                            })
                         })
-                    })
-                    .unwrap_or_default();
+                        .unwrap_or_default()
+                });
 
                 let stat = stats.entry(name.clone()).or_insert_with(|| KernelStat {
                     name: name.clone(),
@@ -483,6 +506,24 @@ fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
     encoders
 }
 
+fn parse_pipeline_state_events(data: &[u8]) -> Result<Vec<PipelineStateEvent>> {
+    let records = MTSPRecord::parse_stream(data)?;
+    let mut events = Vec::new();
+    for record in records {
+        if record.record_type != RecordType::Ct {
+            continue;
+        }
+        let ct = record.parse_ct_record()?;
+        events.push(PipelineStateEvent {
+            offset: record.offset,
+            encoder_addr: ct.function_addr,
+            pipeline_addr: ct.pipeline_addr,
+            function_addr: ct.function_addr,
+        });
+    }
+    Ok(events)
+}
+
 fn dedupe_encoders(mut encoders: Vec<ComputeEncoder>) -> Result<Vec<ComputeEncoder>> {
     encoders.sort_by_key(|encoder| (encoder.offset, encoder.address));
     encoders.dedup_by(|left, right| left.offset == right.offset && left.address == right.address);
@@ -496,7 +537,9 @@ fn build_command_buffer_regions(
     capture: &[u8],
     command_buffers: Vec<CommandBuffer>,
     encoders: Vec<ComputeEncoder>,
+    pipeline_events: Vec<PipelineStateEvent>,
     dispatches: Vec<DispatchCall>,
+    pipeline_map: &PipelineFunctionMap,
 ) -> Vec<CommandBufferRegion> {
     if command_buffers.is_empty() {
         return vec![CommandBufferRegion {
@@ -507,7 +550,8 @@ fn build_command_buffer_regions(
             },
             end_offset: capture.len(),
             encoders,
-            dispatches,
+            pipeline_events: pipeline_events.clone(),
+            dispatches: attribute_dispatches(dispatches, &pipeline_events, pipeline_map),
         }];
     }
 
@@ -524,21 +568,60 @@ fn build_command_buffer_regions(
             })
             .cloned()
             .collect();
+        let region_pipeline_events: Vec<_> = pipeline_events
+            .iter()
+            .filter(|event| event.offset >= command_buffer.offset && event.offset < end_offset)
+            .cloned()
+            .collect();
         let region_dispatches = dispatches
             .iter()
             .filter(|dispatch| {
                 dispatch.offset >= command_buffer.offset && dispatch.offset < end_offset
             })
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
         regions.push(CommandBufferRegion {
             command_buffer,
             end_offset,
             encoders: region_encoders,
-            dispatches: region_dispatches,
+            pipeline_events: region_pipeline_events.clone(),
+            dispatches: attribute_dispatches(
+                region_dispatches,
+                &region_pipeline_events,
+                pipeline_map,
+            ),
         });
     }
     regions
+}
+
+fn attribute_dispatches(
+    mut dispatches: Vec<DispatchCall>,
+    pipeline_events: &[PipelineStateEvent],
+    pipeline_map: &PipelineFunctionMap,
+) -> Vec<DispatchCall> {
+    for dispatch in &mut dispatches {
+        let event = pipeline_events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.offset <= dispatch.offset && Some(event.encoder_addr) == dispatch.encoder_id
+            })
+            .or_else(|| {
+                pipeline_events
+                    .iter()
+                    .rev()
+                    .find(|event| event.offset <= dispatch.offset)
+            });
+        if let Some(event) = event {
+            dispatch.pipeline_addr = Some(event.pipeline_addr);
+            dispatch.kernel_name = pipeline_map.get(&event.pipeline_addr).cloned();
+            if dispatch.encoder_id.is_none() {
+                dispatch.encoder_id = Some(event.encoder_addr);
+            }
+        }
+    }
+    dispatches
 }
 
 fn find_bytes_from(data: &[u8], needle: &[u8], offset: usize) -> Option<usize> {
@@ -632,6 +715,8 @@ mod tests {
                 index: 0,
                 offset: 30,
                 encoder_id: Some(1),
+                pipeline_addr: None,
+                kernel_name: None,
                 grid_size: [1, 1, 1],
                 group_size: [1, 1, 1],
             },
@@ -639,17 +724,46 @@ mod tests {
                 index: 1,
                 offset: 70,
                 encoder_id: Some(2),
+                pipeline_addr: None,
+                kernel_name: None,
                 grid_size: [1, 1, 1],
                 group_size: [1, 1, 1],
             },
         ];
+        let pipeline_events = vec![
+            PipelineStateEvent {
+                offset: 25,
+                encoder_addr: 1,
+                pipeline_addr: 10,
+                function_addr: 1,
+            },
+            PipelineStateEvent {
+                offset: 65,
+                encoder_addr: 2,
+                pipeline_addr: 20,
+                function_addr: 2,
+            },
+        ];
+        let mut pipeline_map = BTreeMap::new();
+        pipeline_map.insert(10, "ka".into());
+        pipeline_map.insert(20, "kb".into());
 
-        let regions =
-            build_command_buffer_regions(&vec![0; 100], command_buffers, encoders, dispatches);
+        let regions = build_command_buffer_regions(
+            &vec![0; 100],
+            command_buffers,
+            encoders,
+            pipeline_events,
+            dispatches,
+            &pipeline_map,
+        );
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0].encoders.len(), 1);
+        assert_eq!(regions[0].pipeline_events.len(), 1);
         assert_eq!(regions[0].dispatches.len(), 1);
+        assert_eq!(regions[0].dispatches[0].kernel_name.as_deref(), Some("ka"));
         assert_eq!(regions[1].encoders.len(), 1);
+        assert_eq!(regions[1].pipeline_events.len(), 1);
         assert_eq!(regions[1].dispatches.len(), 1);
+        assert_eq!(regions[1].dispatches[0].kernel_name.as_deref(), Some("kb"));
     }
 }
