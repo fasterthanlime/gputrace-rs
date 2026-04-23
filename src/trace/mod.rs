@@ -10,8 +10,9 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 
 pub use mtsp::{
-    CDispatchRecord, CRecord, CiRecord, CtRecord, CtURecord, CttRecord, CulRecord, CululRecord,
-    CuwRecord, MTLResourceUsage, MTSPHeader, MTSPRecord, RecordType, ResourceBinding,
+    CDispatchRecord, CRecord, CiRecord, CiululRecord, CtRecord, CtURecord, CttRecord, CuRecord,
+    CuiRecord, CulRecord, CululRecord, CuwRecord, MTLResourceUsage, MTSPHeader, MTSPRecord,
+    RecordType, ResourceBinding,
 };
 
 pub const MAGIC_MTSP: &[u8; 4] = b"MTSP";

@@ -125,6 +125,8 @@ impl MTSPRecord {
                 RecordType::CSuwuw => record.parse_csuwuw_record(),
                 RecordType::CiulSl => record.parse_ciulsl_record(),
                 RecordType::CU | RecordType::Cut => record.parse_cu_record(),
+                RecordType::Cui => record.populate_cui_record(),
+                RecordType::Ciulul => record.populate_ciulul_record(),
                 RecordType::Culul => record.parse_culul_record(),
                 _ => {}
             }
@@ -329,6 +331,56 @@ impl MTSPRecord {
         })
     }
 
+    pub fn parse_cu_structured(&self) -> Result<CuRecord> {
+        if self.record_type != RecordType::CU && self.record_type != RecordType::Cut {
+            return Err(Error::InvalidTrace("record was not a CU/Cut record"));
+        }
+        let Some(base) =
+            find_bytes(&self.data, b"CU\0\0").or_else(|| find_bytes(&self.data, b"Cut"))
+        else {
+            return Err(Error::InvalidTrace("CU/Cut marker not found"));
+        };
+        if base + 0x28 > self.data.len() {
+            return Err(Error::InvalidTrace("CU/Cut record too small"));
+        }
+        Ok(CuRecord {
+            record_size: read_u32(&self.data, 0)?,
+            command_flags: read_u32(&self.data, 4)?,
+            device_addr: read_u64(&self.data, base + 4)?,
+            identifier: self.label.clone(),
+            heap_addr: read_u64(&self.data, base + 0x20)?,
+        })
+    }
+
+    pub fn parse_cui_record(&self) -> Result<CuiRecord> {
+        if self.record_type != RecordType::Cui {
+            return Err(Error::InvalidTrace("record was not a Cui record"));
+        }
+        let Some(base) = find_bytes(&self.data, b"Cui\0") else {
+            return Err(Error::InvalidTrace("Cui marker not found"));
+        };
+        Ok(CuiRecord {
+            record_size: read_u32(&self.data, 0)?,
+            command_flags: read_u32(&self.data, 4).unwrap_or_default(),
+            shared_event_addr: read_u64(&self.data, base + 4)?,
+        })
+    }
+
+    pub fn parse_ciulul_record(&self) -> Result<CiululRecord> {
+        if self.record_type != RecordType::Ciulul {
+            return Err(Error::InvalidTrace("record was not a Ciulul record"));
+        }
+        let Some(base) = find_bytes(&self.data, b"Ciulul") else {
+            return Err(Error::InvalidTrace("Ciulul marker not found"));
+        };
+        Ok(CiululRecord {
+            record_size: self.size as u32,
+            command_flags: read_u32(&self.data, 4).unwrap_or_default(),
+            icb_addr: read_u64(&self.data, base + 8).ok(),
+            count: read_u32(&self.data, base + 16).ok(),
+        })
+    }
+
     pub fn parse_ctu_record(&self) -> Result<CtURecord> {
         if self.record_type != RecordType::CtU {
             return Err(Error::InvalidTrace("record was not a CtU record"));
@@ -477,6 +529,20 @@ impl MTSPRecord {
         }
     }
 
+    fn populate_cui_record(&mut self) {
+        let Some(base) = find_bytes(&self.data, b"Cui\0") else {
+            return;
+        };
+        self.address = read_u64(&self.data, base + 4).ok();
+    }
+
+    fn populate_ciulul_record(&mut self) {
+        let Some(base) = find_bytes(&self.data, b"Ciulul") else {
+            return;
+        };
+        self.address = read_u64(&self.data, base + 8).ok();
+    }
+
     fn parse_culul_record(&mut self) {
         let Some(base) = find_bytes(&self.data, b"Culul") else {
             return;
@@ -543,6 +609,30 @@ pub struct CuwRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CuRecord {
+    pub record_size: u32,
+    pub command_flags: u32,
+    pub device_addr: u64,
+    pub identifier: Option<String>,
+    pub heap_addr: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CuiRecord {
+    pub record_size: u32,
+    pub command_flags: u32,
+    pub shared_event_addr: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CiululRecord {
+    pub record_size: u32,
+    pub command_flags: u32,
+    pub icb_addr: Option<u64>,
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CtURecord {
     pub record_size: u32,
     pub address: u64,
@@ -585,6 +675,14 @@ impl MTLResourceUsage {
     pub const READ: Self = Self(0x01);
     pub const WRITE: Self = Self(0x02);
     pub const SAMPLE: Self = Self(0x04);
+
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub fn contains(self, rhs: Self) -> bool {
+        self.0 & rhs.0 == rhs.0
+    }
 }
 
 impl std::ops::BitOr for MTLResourceUsage {
@@ -592,6 +690,25 @@ impl std::ops::BitOr for MTLResourceUsage {
 
     fn bitor(self, rhs: Self) -> Self::Output {
         Self(self.0 | rhs.0)
+    }
+}
+
+impl fmt::Display for MTLResourceUsage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts = Vec::new();
+        if self.contains(Self::READ) {
+            parts.push("read");
+        }
+        if self.contains(Self::WRITE) {
+            parts.push("write");
+        }
+        if self.contains(Self::SAMPLE) {
+            parts.push("sample");
+        }
+        if parts.is_empty() {
+            parts.push("none");
+        }
+        f.write_str(&parts.join("|"))
     }
 }
 
@@ -898,5 +1015,95 @@ mod tests {
         let ctu = record.parse_ctu_record().unwrap();
         assert_eq!(ctu.address, address);
         assert_eq!(ctu.name, "MTLBuffer");
+    }
+
+    #[test]
+    fn parses_cu_record() {
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(&(64u32).to_le_bytes());
+        data[4..8].copy_from_slice(&(0x55u32).to_le_bytes());
+        let marker_offset = 0x18;
+        data[marker_offset..marker_offset + 4].copy_from_slice(b"CU\0\0");
+        data[marker_offset + 4..marker_offset + 12]
+            .copy_from_slice(&0x1122334455667788u64.to_le_bytes());
+        data[marker_offset + 0x20..marker_offset + 0x28]
+            .copy_from_slice(&0x8877665544332211u64.to_le_bytes());
+
+        let record = MTSPRecord {
+            record_type: RecordType::CU,
+            offset: 0,
+            size: data.len(),
+            label: Some("01234567-89ab-cdef".into()),
+            address: None,
+            function_address: None,
+            data,
+        };
+
+        let cu = record.parse_cu_structured().unwrap();
+        assert_eq!(cu.record_size, 64);
+        assert_eq!(cu.command_flags, 0x55);
+        assert_eq!(cu.device_addr, 0x1122334455667788);
+        assert_eq!(cu.heap_addr, 0x8877665544332211);
+        assert_eq!(cu.identifier.as_deref(), Some("01234567-89ab-cdef"));
+    }
+
+    #[test]
+    fn parses_cui_record() {
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&(32u32).to_le_bytes());
+        data[4..8].copy_from_slice(&(0x22u32).to_le_bytes());
+        let marker_offset = 0x10;
+        data[marker_offset..marker_offset + 4].copy_from_slice(b"Cui\0");
+        data[marker_offset + 4..marker_offset + 12]
+            .copy_from_slice(&0xDEADBEEF00112233u64.to_le_bytes());
+
+        let record = MTSPRecord {
+            record_type: RecordType::Cui,
+            offset: 0,
+            size: data.len(),
+            label: None,
+            address: None,
+            function_address: None,
+            data,
+        };
+
+        let cui = record.parse_cui_record().unwrap();
+        assert_eq!(cui.shared_event_addr, 0xDEADBEEF00112233);
+    }
+
+    #[test]
+    fn parses_ciulul_record() {
+        let mut data = vec![0u8; 48];
+        data[0..4].copy_from_slice(&(48u32).to_le_bytes());
+        data[4..8].copy_from_slice(&(0x33u32).to_le_bytes());
+        let marker_offset = 0x10;
+        data[marker_offset..marker_offset + 6].copy_from_slice(b"Ciulul");
+        data[marker_offset + 8..marker_offset + 16]
+            .copy_from_slice(&0xCAFEBABE11223344u64.to_le_bytes());
+        data[marker_offset + 16..marker_offset + 20].copy_from_slice(&(7u32).to_le_bytes());
+
+        let record = MTSPRecord {
+            record_type: RecordType::Ciulul,
+            offset: 0,
+            size: data.len(),
+            label: None,
+            address: None,
+            function_address: None,
+            data,
+        };
+
+        let ciulul = record.parse_ciulul_record().unwrap();
+        assert_eq!(ciulul.command_flags, 0x33);
+        assert_eq!(ciulul.icb_addr, Some(0xCAFEBABE11223344));
+        assert_eq!(ciulul.count, Some(7));
+    }
+
+    #[test]
+    fn formats_resource_usage() {
+        let usage = MTLResourceUsage::READ | MTLResourceUsage::WRITE;
+        assert!(usage.contains(MTLResourceUsage::READ));
+        assert!(usage.contains(MTLResourceUsage::WRITE));
+        assert_eq!(usage.bits(), 0x03);
+        assert_eq!(usage.to_string(), "read|write");
     }
 }
