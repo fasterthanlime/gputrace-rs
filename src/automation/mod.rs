@@ -11,6 +11,8 @@ use crate::error::{Error, Result};
 const XCODE_APP_NAME: &str = "Xcode";
 const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const FIELD_SEPARATOR: char = '\u{1f}';
+const RECORD_SEPARATOR: char = '\u{1e}';
 
 #[derive(Debug, Clone, Serialize)]
 pub struct XcodeProfileRun {
@@ -65,9 +67,95 @@ pub struct XcodeWindowStatus {
     pub raw: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XcodeWindowInfo {
+    pub title: String,
+    pub document: Option<String>,
+    pub role: String,
+    pub subrole: Option<String>,
+    pub focused: bool,
+    pub main: bool,
+    pub modal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XcodeWindowSnapshot {
+    pub window: XcodeWindowInfo,
+    pub button_count: usize,
+    pub tab_count: usize,
+    pub toolbar_count: usize,
+    pub status: XcodeAutomationStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XcodeButtonInfo {
+    pub window_title: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XcodeTabInfo {
+    pub window_title: String,
+    pub role: String,
+    pub subrole: Option<String>,
+    pub name: String,
+    pub selected: bool,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XcodeMenuItemInfo {
+    pub menu_path: Vec<String>,
+    pub title: String,
+    pub enabled: bool,
+    pub has_submenu: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct XcodeUiElementInfo {
+    pub path: Vec<String>,
+    pub role: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub identifier: Option<String>,
+    pub enabled: Option<bool>,
+}
+
 pub fn activate_xcode() -> Result<()> {
     run_osascript(r#"tell application "Xcode" to activate"#)?;
     Ok(())
+}
+
+pub fn list_windows() -> Result<Vec<XcodeWindowInfo>> {
+    let raw = run_osascript(&build_windows_script())?;
+    parse_windows_output(&raw)
+}
+
+pub fn inspect_window(trace_path: Option<&Path>) -> Result<Option<XcodeWindowSnapshot>> {
+    let raw = run_osascript(&build_window_snapshot_script(trace_path))?;
+    parse_window_snapshot_output(&raw)
+}
+
+pub fn list_buttons(trace_path: Option<&Path>) -> Result<Vec<XcodeButtonInfo>> {
+    let raw = run_osascript(&build_buttons_script(trace_path))?;
+    parse_buttons_output(&raw)
+}
+
+pub fn list_tabs(trace_path: Option<&Path>) -> Result<Vec<XcodeTabInfo>> {
+    let raw = run_osascript(&build_tabs_script(trace_path))?;
+    parse_tabs_output(&raw)
+}
+
+pub fn list_menu_items(menu_path: &[&str]) -> Result<Vec<XcodeMenuItemInfo>> {
+    let raw = run_osascript(&build_menu_items_script(menu_path))?;
+    parse_menu_items_output(&raw)
+}
+
+pub fn list_ui_elements(trace_path: Option<&Path>) -> Result<Vec<XcodeUiElementInfo>> {
+    let raw = run_osascript(&build_ui_elements_script(trace_path))?;
+    parse_ui_elements_output(&raw)
 }
 
 pub fn run_profile(request: &XcodeProfileRun) -> Result<()> {
@@ -230,56 +318,12 @@ fn run_open_command(path: &Path, launch_mode: XcodeLaunchMode) -> Result<Output>
 }
 
 fn xcode_window_count() -> Result<u32> {
-    let script = r#"
-tell application "System Events"
-    if not (exists process "Xcode") then
-        return "not-running"
-    end if
-end tell
-
-tell application "Xcode"
-    try
-        return count of windows
-    on error errMsg number errNum
-        error "failed to inspect Xcode windows (" & errNum & "): " & errMsg
-    end try
-end tell
-"#;
-
-    let raw = run_osascript(script)?;
+    let raw = run_osascript(&build_window_count_script())?;
     parse_window_count(&raw)
 }
 
 fn build_status_script(trace_path: Option<&Path>) -> String {
-    let title_filter = trace_path
-        .and_then(Path::file_name)
-        .map(applescript_string_literal);
-
-    let target_window = match title_filter {
-        Some(filter) => format!(
-            r#"
-            set targetWindow to missing value
-            repeat with candidateWindow in windows
-                try
-                    if name of candidateWindow contains {filter} then
-                        set targetWindow to candidateWindow
-                        exit repeat
-                    end if
-                end try
-            end repeat
-            if targetWindow is missing value then
-                return "unknown"
-            end if
-"#
-        ),
-        None => r#"
-            if (count of windows) is 0 then
-                return "not-running"
-            end if
-            set targetWindow to window 1
-"#
-        .to_owned(),
-    };
+    let target_window = build_target_window_clause(trace_path, "unknown", true);
 
     format!(
         r#"
@@ -350,6 +394,553 @@ end tell
 return "unknown"
 "#
     )
+}
+
+fn build_window_count_script() -> String {
+    r#"
+tell application "System Events"
+    if not (exists process "Xcode") then
+        return "not-running"
+    end if
+end tell
+
+tell application "Xcode"
+    try
+        return count of windows
+    on error errMsg number errNum
+        error "failed to inspect Xcode windows (" & errNum & "): " & errMsg
+    end try
+end tell
+"#
+    .to_owned()
+}
+
+fn build_windows_script() -> String {
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+set recordSeparator to ASCII character 30
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        set outputLines to {{}}
+        repeat with candidateWindow in windows
+            set titleText to my element_name(candidateWindow)
+            set documentText to my attribute_text(candidateWindow, "AXDocument")
+            set roleText to my role_text(candidateWindow)
+            set subroleText to my optional_text(my attribute_text(candidateWindow, "AXSubrole"))
+            set focusedText to my boolean_text(my attribute_bool(candidateWindow, "AXFocused"))
+            set mainText to my boolean_text(my attribute_bool(candidateWindow, "AXMain"))
+            set modalText to my boolean_text(my attribute_bool(candidateWindow, "AXModal"))
+            set end of outputLines to titleText & fieldSeparator & documentText & fieldSeparator & roleText & fieldSeparator & subroleText & fieldSeparator & focusedText & fieldSeparator & mainText & fieldSeparator & modalText
+        end repeat
+        return my join_records(outputLines, recordSeparator)
+    end tell
+end tell
+
+{helpers}
+"#,
+        app = XCODE_APP_NAME,
+        helpers = common_applescript_helpers()
+    )
+}
+
+fn build_window_snapshot_script(trace_path: Option<&Path>) -> String {
+    let target_window = build_target_window_clause(trace_path, "missing-window", false);
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        {target_window}
+
+        if targetWindow is missing value then
+            return "missing-window"
+        end if
+
+        set titleText to my element_name(targetWindow)
+        set documentText to my attribute_text(targetWindow, "AXDocument")
+        set roleText to my role_text(targetWindow)
+        set subroleText to my optional_text(my attribute_text(targetWindow, "AXSubrole"))
+        set focusedText to my boolean_text(my attribute_bool(targetWindow, "AXFocused"))
+        set mainText to my boolean_text(my attribute_bool(targetWindow, "AXMain"))
+        set modalText to my boolean_text(my attribute_bool(targetWindow, "AXModal"))
+        set statusText to "unknown"
+        set buttonCount to 0
+        set tabCount to 0
+        set toolbarCount to 0
+
+        try
+            set allElements to entire contents of targetWindow
+        on error
+            set allElements to {{}}
+        end try
+
+        repeat with elem in allElements
+            try
+                set roleName to my role_text(elem)
+                if roleName is "AXButton" then
+                    set buttonCount to buttonCount + 1
+                    set buttonName to my element_name(elem)
+                    if buttonName is "Show Performance" then
+                        set statusText to "complete"
+                    else if (buttonName is "Stop" or buttonName is "Stop GPU workload") and (my attribute_bool(elem, "AXEnabled")) then
+                        set statusText to "running"
+                    else if (buttonName is "Profile" or buttonName is "Replay") and statusText is not "running" and statusText is not "complete" then
+                        if my attribute_bool(elem, "AXEnabled") then
+                            set statusText to "replay-ready"
+                        else
+                            set statusText to "initializing"
+                        end if
+                    end if
+                else if roleName is "AXToolbar" then
+                    set toolbarCount to toolbarCount + 1
+                else if roleName is "AXRadioButton" then
+                    set tabCount to tabCount + 1
+                end if
+
+                if statusText is not "complete" then
+                    set textValue to my element_text(elem)
+                    if textValue contains "Profiling GPU Trace" then
+                        set statusText to "running"
+                    else if textValue contains "Performance data not available" and statusText is not "running" then
+                        set statusText to "replay-ready"
+                    end if
+                end if
+            end try
+        end repeat
+
+        return titleText & fieldSeparator & documentText & fieldSeparator & roleText & fieldSeparator & subroleText & fieldSeparator & focusedText & fieldSeparator & mainText & fieldSeparator & modalText & fieldSeparator & buttonCount & fieldSeparator & tabCount & fieldSeparator & toolbarCount & fieldSeparator & statusText
+    end tell
+end tell
+
+{helpers}
+"#,
+        app = XCODE_APP_NAME,
+        target_window = target_window,
+        helpers = common_applescript_helpers()
+    )
+}
+
+fn build_buttons_script(trace_path: Option<&Path>) -> String {
+    let target_window = build_target_window_clause(trace_path, "not-running", false);
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+set recordSeparator to ASCII character 30
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        {target_window}
+
+        if targetWindow is missing value then
+            return ""
+        end if
+
+        set windowTitle to my element_name(targetWindow)
+        set outputLines to {{}}
+        set allElements to entire contents of targetWindow
+        repeat with elem in allElements
+            try
+                if my role_text(elem) is "AXButton" then
+                    set buttonName to my element_name(elem)
+                    set buttonDescription to my optional_text(my attribute_text(elem, "AXDescription"))
+                    set enabledText to my boolean_text(my attribute_bool(elem, "AXEnabled"))
+                    set end of outputLines to windowTitle & fieldSeparator & buttonName & fieldSeparator & buttonDescription & fieldSeparator & enabledText
+                end if
+            end try
+        end repeat
+        return my join_records(outputLines, recordSeparator)
+    end tell
+end tell
+
+{helpers}
+"#,
+        app = XCODE_APP_NAME,
+        target_window = target_window,
+        helpers = common_applescript_helpers()
+    )
+}
+
+fn build_tabs_script(trace_path: Option<&Path>) -> String {
+    let target_window = build_target_window_clause(trace_path, "not-running", false);
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+set recordSeparator to ASCII character 30
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        {target_window}
+
+        if targetWindow is missing value then
+            return ""
+        end if
+
+        set windowTitle to my element_name(targetWindow)
+        set outputLines to {{}}
+        set allElements to entire contents of targetWindow
+        repeat with elem in allElements
+            try
+                set roleName to my role_text(elem)
+                set subroleText to my optional_text(my attribute_text(elem, "AXSubrole"))
+                if roleName is "AXRadioButton" or subroleText is "AXTabButton" then
+                    set nameText to my element_name(elem)
+                    set selectedText to my boolean_text(my attribute_bool(elem, "AXValue"))
+                    set enabledText to my boolean_text(my attribute_bool(elem, "AXEnabled"))
+                    set end of outputLines to windowTitle & fieldSeparator & roleName & fieldSeparator & subroleText & fieldSeparator & nameText & fieldSeparator & selectedText & fieldSeparator & enabledText
+                end if
+            end try
+        end repeat
+        return my join_records(outputLines, recordSeparator)
+    end tell
+end tell
+
+{helpers}
+"#,
+        app = XCODE_APP_NAME,
+        target_window = target_window,
+        helpers = common_applescript_helpers()
+    )
+}
+
+fn build_menu_items_script(menu_path: &[&str]) -> String {
+    let menu_path = menu_path
+        .iter()
+        .map(|segment| applescript_string_literal(OsStr::new(segment)))
+        .collect::<Vec<_>>();
+    let traversal = match menu_path.as_slice() {
+        [] => {
+            r#"
+        set outputLines to {}
+        repeat with menuBarItem in menu bar items of menu bar 1
+            set menuTitle to my element_name(menuBarItem)
+            set enabledText to my boolean_text(my attribute_bool(menuBarItem, "AXEnabled"))
+            set submenuText to my boolean_text(true)
+            set end of outputLines to menuTitle & fieldSeparator & menuTitle & fieldSeparator & enabledText & fieldSeparator & submenuText
+        end repeat
+        return my join_records(outputLines, recordSeparator)
+"#
+            .to_owned()
+        }
+        [root] => format!(
+            r#"
+        set targetMenuBarItem to menu bar item {root} of menu bar 1
+        set targetMenu to menu 1 of targetMenuBarItem
+        set outputLines to {{}}
+        repeat with menuItemRef in menu items of targetMenu
+            set itemTitle to my element_name(menuItemRef)
+            set enabledText to my boolean_text(my attribute_bool(menuItemRef, "AXEnabled"))
+            set hasSubmenuText to my boolean_text(my has_submenu(menuItemRef))
+            set end of outputLines to {root} & fieldSeparator & itemTitle & fieldSeparator & enabledText & fieldSeparator & hasSubmenuText
+        end repeat
+        return my join_records(outputLines, recordSeparator)
+"#
+        ),
+        _ => {
+            let root = menu_path[0].clone();
+            let mut traversal = format!(
+                "        set currentMenu to menu 1 of menu bar item {root} of menu bar 1\n"
+            );
+            let mut visible_path = vec![menu_path[0].clone()];
+            for segment in &menu_path[1..] {
+                visible_path.push(segment.clone());
+                traversal.push_str(&format!(
+                    "        set currentMenu to menu 1 of menu item {segment} of currentMenu\n"
+                ));
+            }
+            let path_string = visible_path.join(" & \">\" & ");
+            traversal.push_str(&format!(
+                r#"        set outputLines to {{}}
+        repeat with menuItemRef in menu items of currentMenu
+            set itemTitle to my element_name(menuItemRef)
+            set enabledText to my boolean_text(my attribute_bool(menuItemRef, "AXEnabled"))
+            set hasSubmenuText to my boolean_text(my has_submenu(menuItemRef))
+            set end of outputLines to ({path_string}) & fieldSeparator & itemTitle & fieldSeparator & enabledText & fieldSeparator & hasSubmenuText
+        end repeat
+        return my join_records(outputLines, recordSeparator)
+"#
+            ));
+            traversal
+        }
+    };
+
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+set recordSeparator to ASCII character 30
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+{traversal}
+    end tell
+end tell
+
+{helpers}
+"#,
+        app = XCODE_APP_NAME,
+        traversal = traversal,
+        helpers = common_applescript_helpers()
+    )
+}
+
+fn build_ui_elements_script(trace_path: Option<&Path>) -> String {
+    let target_window = build_target_window_clause(trace_path, "not-running", false);
+    format!(
+        r#"
+set fieldSeparator to ASCII character 31
+set recordSeparator to ASCII character 30
+
+tell application "System Events"
+    if not (exists process "{app}") then
+        return "not-running"
+    end if
+
+    tell process "{app}"
+        {target_window}
+
+        if targetWindow is missing value then
+            return ""
+        end if
+
+        set outputLines to {{}}
+        my collect_children(targetWindow, "Window", outputLines)
+        return my join_records(outputLines, recordSeparator)
+    end tell
+end tell
+
+{helpers}
+
+on collect_children(parentElement, pathText, outputLines)
+    try
+        set childElements to UI elements of parentElement
+    on error
+        try
+            set childElements to entire contents of parentElement
+        on error
+            set childElements to {{}}
+        end try
+    end try
+
+    repeat with elem in childElements
+        try
+            set roleText to my role_text(elem)
+            set titleText to my optional_text(my element_name(elem))
+            set descriptionText to my optional_text(my attribute_text(elem, "AXDescription"))
+            set identifierText to my optional_text(my attribute_text(elem, "AXIdentifier"))
+            set enabledText to my optional_boolean_text(my optional_attribute_bool(elem, "AXEnabled"))
+            set labelText to roleText
+            if titleText is not "" then
+                set labelText to roleText & "(" & titleText & ")"
+            end if
+            set childPath to pathText & ">" & labelText
+            set end of outputLines to childPath & fieldSeparator & roleText & fieldSeparator & titleText & fieldSeparator & descriptionText & fieldSeparator & identifierText & fieldSeparator & enabledText
+            my collect_children(elem, childPath, outputLines)
+        end try
+    end repeat
+end collect_children
+"#,
+        app = XCODE_APP_NAME,
+        target_window = target_window,
+        helpers = common_applescript_helpers()
+    )
+}
+
+fn build_target_window_clause(
+    trace_path: Option<&Path>,
+    missing_result: &str,
+    return_when_empty: bool,
+) -> String {
+    let title_filter = trace_path
+        .and_then(Path::file_name)
+        .map(applescript_string_literal);
+
+    match title_filter {
+        Some(filter) => format!(
+            r#"
+        set targetWindow to missing value
+        repeat with candidateWindow in windows
+            try
+                set windowName to my element_name(candidateWindow)
+                set documentName to my attribute_text(candidateWindow, "AXDocument")
+                if windowName contains {filter} or documentName contains {filter} then
+                    set targetWindow to candidateWindow
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if targetWindow is missing value then
+            return "{missing_result}"
+        end if
+"#
+        ),
+        None if return_when_empty => format!(
+            r#"
+        if (count of windows) is 0 then
+            return "{missing_result}"
+        end if
+        set targetWindow to window 1
+"#
+        ),
+        None => format!(
+            r#"
+        if (count of windows) is 0 then
+            set targetWindow to missing value
+        else
+            set targetWindow to window 1
+        end if
+"#
+        ),
+    }
+}
+
+fn common_applescript_helpers() -> String {
+    r#"
+on join_records(recordsList, recordSeparator)
+    if (count of recordsList) is 0 then
+        return ""
+    end if
+    set oldDelimiters to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to recordSeparator
+    set joined to recordsList as text
+    set AppleScript's text item delimiters to oldDelimiters
+    return joined
+end join_records
+
+on sanitize_text(valueText)
+    if valueText is missing value then
+        return ""
+    end if
+    set textValue to valueText as text
+    set textValue to my replace_text(textValue, ASCII character 31, " ")
+    set textValue to my replace_text(textValue, ASCII character 30, " ")
+    set textValue to my replace_text(textValue, linefeed, " ")
+    set textValue to my replace_text(textValue, return, " ")
+    return textValue
+end sanitize_text
+
+on replace_text(sourceText, findText, replaceText)
+    set oldDelimiters to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to findText
+    set textItems to every text item of sourceText
+    set AppleScript's text item delimiters to replaceText
+    set newText to textItems as text
+    set AppleScript's text item delimiters to oldDelimiters
+    return newText
+end replace_text
+
+on optional_text(valueText)
+    if valueText is missing value then
+        return ""
+    end if
+    return my sanitize_text(valueText)
+end optional_text
+
+on element_name(elementRef)
+    try
+        return my sanitize_text(name of elementRef)
+    on error
+        try
+            return my sanitize_text(value of elementRef)
+        on error
+            return ""
+        end try
+    end try
+end element_name
+
+on element_text(elementRef)
+    try
+        return my sanitize_text(value of elementRef)
+    on error
+        try
+            return my sanitize_text(name of elementRef)
+        on error
+            return ""
+        end try
+    end try
+end element_text
+
+on role_text(elementRef)
+    try
+        return my sanitize_text(value of attribute "AXRole" of elementRef)
+    on error
+        try
+            return my sanitize_text(role of elementRef)
+        on error
+            return ""
+        end try
+    end try
+end role_text
+
+on attribute_text(elementRef, attributeName)
+    try
+        return my sanitize_text(value of attribute attributeName of elementRef)
+    on error
+        return ""
+    end try
+end attribute_text
+
+on optional_attribute_bool(elementRef, attributeName)
+    try
+        return value of attribute attributeName of elementRef
+    on error
+        return missing value
+    end try
+end optional_attribute_bool
+
+on attribute_bool(elementRef, attributeName)
+    set valueText to my optional_attribute_bool(elementRef, attributeName)
+    if valueText is missing value then
+        return false
+    end if
+    return valueText as boolean
+end attribute_bool
+
+on boolean_text(flag)
+    if flag then
+        return "true"
+    end if
+    return "false"
+end boolean_text
+
+on optional_boolean_text(flag)
+    if flag is missing value then
+        return ""
+    end if
+    return my boolean_text(flag as boolean)
+end optional_boolean_text
+
+on has_submenu(menuItemRef)
+    try
+        set ignoredMenu to menu 1 of menuItemRef
+        return true
+    on error
+        return false
+    end try
+end has_submenu
+"#
+    .to_owned()
 }
 
 fn applescript_string_literal(value: &OsStr) -> String {
@@ -439,6 +1030,175 @@ fn parse_status(raw: &str) -> XcodeAutomationStatus {
     }
 }
 
+fn parse_windows_output(raw: &str) -> Result<Vec<XcodeWindowInfo>> {
+    parse_records(raw, 7)?
+        .into_iter()
+        .map(|columns| {
+            Ok(XcodeWindowInfo {
+                title: columns[0].clone(),
+                document: optional_string(&columns[1]),
+                role: columns[2].clone(),
+                subrole: optional_string(&columns[3]),
+                focused: parse_bool(&columns[4])?,
+                main: parse_bool(&columns[5])?,
+                modal: parse_bool(&columns[6])?,
+            })
+        })
+        .collect()
+}
+
+fn parse_window_snapshot_output(raw: &str) -> Result<Option<XcodeWindowSnapshot>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("not-running")
+        || trimmed.eq_ignore_ascii_case("missing-window")
+    {
+        return Ok(None);
+    }
+
+    let columns = parse_single_record(raw, 11)?;
+    Ok(Some(XcodeWindowSnapshot {
+        window: XcodeWindowInfo {
+            title: columns[0].clone(),
+            document: optional_string(&columns[1]),
+            role: columns[2].clone(),
+            subrole: optional_string(&columns[3]),
+            focused: parse_bool(&columns[4])?,
+            main: parse_bool(&columns[5])?,
+            modal: parse_bool(&columns[6])?,
+        },
+        button_count: parse_usize(&columns[7])?,
+        tab_count: parse_usize(&columns[8])?,
+        toolbar_count: parse_usize(&columns[9])?,
+        status: parse_status(&columns[10]),
+    }))
+}
+
+fn parse_buttons_output(raw: &str) -> Result<Vec<XcodeButtonInfo>> {
+    parse_records(raw, 4)?
+        .into_iter()
+        .map(|columns| {
+            Ok(XcodeButtonInfo {
+                window_title: columns[0].clone(),
+                name: columns[1].clone(),
+                description: optional_string(&columns[2]),
+                enabled: parse_bool(&columns[3])?,
+            })
+        })
+        .collect()
+}
+
+fn parse_tabs_output(raw: &str) -> Result<Vec<XcodeTabInfo>> {
+    parse_records(raw, 6)?
+        .into_iter()
+        .map(|columns| {
+            Ok(XcodeTabInfo {
+                window_title: columns[0].clone(),
+                role: columns[1].clone(),
+                subrole: optional_string(&columns[2]),
+                name: columns[3].clone(),
+                selected: parse_bool(&columns[4])?,
+                enabled: parse_bool(&columns[5])?,
+            })
+        })
+        .collect()
+}
+
+fn parse_menu_items_output(raw: &str) -> Result<Vec<XcodeMenuItemInfo>> {
+    parse_records(raw, 4)?
+        .into_iter()
+        .map(|columns| {
+            Ok(XcodeMenuItemInfo {
+                menu_path: columns[0].split('>').map(ToOwned::to_owned).collect(),
+                title: columns[1].clone(),
+                enabled: parse_bool(&columns[2])?,
+                has_submenu: parse_bool(&columns[3])?,
+            })
+        })
+        .collect()
+}
+
+fn parse_ui_elements_output(raw: &str) -> Result<Vec<XcodeUiElementInfo>> {
+    parse_records(raw, 6)?
+        .into_iter()
+        .map(|columns| {
+            Ok(XcodeUiElementInfo {
+                path: columns[0].split('>').map(ToOwned::to_owned).collect(),
+                role: columns[1].clone(),
+                title: optional_string(&columns[2]),
+                description: optional_string(&columns[3]),
+                identifier: optional_string(&columns[4]),
+                enabled: optional_bool(&columns[5])?,
+            })
+        })
+        .collect()
+}
+
+fn parse_records(raw: &str, expected_columns: usize) -> Result<Vec<Vec<String>>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("not-running") {
+        return Ok(Vec::new());
+    }
+
+    trimmed
+        .split(RECORD_SEPARATOR)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let columns = record
+                .split(FIELD_SEPARATOR)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if columns.len() != expected_columns {
+                return Err(Error::InvalidInput(format!(
+                    "expected {expected_columns} columns but got {} in automation output",
+                    columns.len()
+                )));
+            }
+            Ok(columns)
+        })
+        .collect()
+}
+
+fn parse_single_record(raw: &str, expected_columns: usize) -> Result<Vec<String>> {
+    let mut rows = parse_records(raw, expected_columns)?;
+    if rows.len() != 1 {
+        return Err(Error::InvalidInput(format!(
+            "expected 1 record but got {} in automation output",
+            rows.len()
+        )));
+    }
+    Ok(rows.remove(0))
+}
+
+fn parse_bool(raw: &str) -> Result<bool> {
+    match raw {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(Error::InvalidInput(format!(
+            "unexpected boolean value in automation output: {other}"
+        ))),
+    }
+}
+
+fn optional_bool(raw: &str) -> Result<Option<bool>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    parse_bool(raw).map(Some)
+}
+
+fn parse_usize(raw: &str) -> Result<usize> {
+    raw.parse::<usize>().map_err(|_| {
+        Error::InvalidInput(format!(
+            "unexpected integer value in automation output: {raw}"
+        ))
+    })
+}
+
+fn optional_string(raw: &str) -> Option<String> {
+    (!raw.is_empty()).then(|| raw.to_owned())
+}
+
 fn wait_for_condition<F>(timeout: Duration, poll_interval: Duration, mut f: F) -> Result<bool>
 where
     F: FnMut() -> Result<bool>,
@@ -458,6 +1218,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(columns: &[&str]) -> String {
+        columns.join(&FIELD_SEPARATOR.to_string())
+    }
 
     #[test]
     fn parse_status_maps_known_values() {
@@ -514,5 +1278,137 @@ mod tests {
     fn status_script_without_trace_uses_front_window() {
         let script = build_status_script(None);
         assert!(script.contains("set targetWindow to window 1"));
+    }
+
+    #[test]
+    fn build_windows_script_includes_helper_surface() {
+        let script = build_windows_script();
+        assert!(script.contains("AXDocument"));
+        assert!(script.contains("AXSubrole"));
+        assert!(script.contains("join_records"));
+    }
+
+    #[test]
+    fn build_buttons_script_targets_named_trace() {
+        let script = build_buttons_script(Some(Path::new("/tmp/Profile Trace.gputrace")));
+        assert!(script.contains("Profile Trace.gputrace"));
+        assert!(script.contains("AXButton"));
+        assert!(script.contains("AXDescription"));
+    }
+
+    #[test]
+    fn build_menu_items_script_supports_nested_paths() {
+        let script = build_menu_items_script(&["Editor", "Performance"]);
+        assert!(script.contains("menu bar item \"Editor\" of menu bar 1"));
+        assert!(script.contains("menu item \"Performance\" of currentMenu"));
+    }
+
+    #[test]
+    fn parse_windows_output_decodes_window_rows() {
+        let raw = record(&[
+            "Trace A",
+            "/tmp/Trace A.gputrace",
+            "AXWindow",
+            "AXStandardWindow",
+            "true",
+            "true",
+            "false",
+        ]);
+        let windows = parse_windows_output(&raw).unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].title, "Trace A");
+        assert_eq!(
+            windows[0].document.as_deref(),
+            Some("/tmp/Trace A.gputrace")
+        );
+        assert!(windows[0].focused);
+        assert!(windows[0].main);
+        assert!(!windows[0].modal);
+    }
+
+    #[test]
+    fn parse_window_snapshot_output_decodes_counts_and_status() {
+        let raw = record(&[
+            "Trace A", "", "AXWindow", "", "false", "true", "false", "12", "3", "1", "running",
+        ]);
+        let snapshot = parse_window_snapshot_output(&raw).unwrap().unwrap();
+        assert_eq!(snapshot.window.title, "Trace A");
+        assert_eq!(snapshot.button_count, 12);
+        assert_eq!(snapshot.tab_count, 3);
+        assert_eq!(snapshot.toolbar_count, 1);
+        assert_eq!(snapshot.status, XcodeAutomationStatus::Running);
+    }
+
+    #[test]
+    fn parse_buttons_output_decodes_optional_description() {
+        let raw = record(&["Trace A", "Replay", "", "true"]);
+        let buttons = parse_buttons_output(&raw).unwrap();
+        assert_eq!(buttons.len(), 1);
+        assert_eq!(buttons[0].name, "Replay");
+        assert_eq!(buttons[0].description, None);
+        assert!(buttons[0].enabled);
+    }
+
+    #[test]
+    fn parse_tabs_output_decodes_selection() {
+        let raw = record(&[
+            "Trace A",
+            "AXRadioButton",
+            "AXTabButton",
+            "Counters",
+            "true",
+            "true",
+        ]);
+        let tabs = parse_tabs_output(&raw).unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].name, "Counters");
+        assert!(tabs[0].selected);
+        assert_eq!(tabs[0].subrole.as_deref(), Some("AXTabButton"));
+    }
+
+    #[test]
+    fn parse_menu_items_output_splits_menu_path() {
+        let raw = record(&["Editor>Performance", "Counters", "true", "false"]);
+        let items = parse_menu_items_output(&raw).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].menu_path, vec!["Editor", "Performance"]);
+        assert_eq!(items[0].title, "Counters");
+        assert!(items[0].enabled);
+        assert!(!items[0].has_submenu);
+    }
+
+    #[test]
+    fn parse_ui_elements_output_decodes_tree_paths() {
+        let raw = record(&[
+            "Window>AXGroup(Editor)>AXButton(Replay)",
+            "AXButton",
+            "Replay",
+            "",
+            "replayButton",
+            "true",
+        ]);
+        let elements = parse_ui_elements_output(&raw).unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(
+            elements[0].path,
+            vec!["Window", "AXGroup(Editor)", "AXButton(Replay)"]
+        );
+        assert_eq!(elements[0].identifier.as_deref(), Some("replayButton"));
+        assert_eq!(elements[0].enabled, Some(true));
+    }
+
+    #[test]
+    fn parse_records_rejects_wrong_column_count() {
+        let err = parse_records("one\u{1f}two", 3).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn parse_window_snapshot_output_handles_missing_window() {
+        assert_eq!(
+            parse_window_snapshot_output("missing-window").unwrap(),
+            None
+        );
+        assert_eq!(parse_window_snapshot_output("not-running").unwrap(), None);
     }
 }
