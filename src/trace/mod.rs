@@ -60,6 +60,38 @@ pub struct TraceSummary {
 
 pub type PipelineFunctionMap = BTreeMap<u64, String>;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandBuffer {
+    pub index: usize,
+    pub timestamp: u64,
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComputeEncoder {
+    pub index: usize,
+    pub address: u64,
+    pub label: String,
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchCall {
+    pub index: usize,
+    pub offset: usize,
+    pub encoder_id: Option<u64>,
+    pub grid_size: [u32; 3],
+    pub group_size: [u32; 3],
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KernelStat {
+    pub name: String,
+    pub pipeline_addr: u64,
+    pub dispatch_count: usize,
+    pub encoder_labels: BTreeMap<String, usize>,
+}
+
 impl TraceBundle {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -136,6 +168,120 @@ impl TraceBundle {
             collect_pipeline_mappings_from_data(&data, &label_map, &mut result)?;
         }
         Ok(result)
+    }
+
+    pub fn command_buffers(&self) -> Result<Vec<CommandBuffer>> {
+        let data = self.capture_data()?;
+        Ok(parse_command_buffers(&data))
+    }
+
+    pub fn compute_encoders(&self) -> Result<Vec<ComputeEncoder>> {
+        let capture = self.capture_data()?;
+        let mut encoders = parse_compute_encoders(&capture);
+        if encoders.is_empty() {
+            for resource in &self.device_resources {
+                let data = fs::read(&resource.path)?;
+                encoders.extend(parse_compute_encoders(&data));
+            }
+        }
+        dedupe_encoders(encoders)
+    }
+
+    pub fn dispatch_calls(&self) -> Result<Vec<DispatchCall>> {
+        let capture = self.capture_data()?;
+        let records = MTSPRecord::parse_stream(&capture)?;
+        let mut dispatches = Vec::new();
+        for record in records {
+            if record.record_type != RecordType::C3ul {
+                continue;
+            }
+            let dispatch = record.parse_dispatch_record()?;
+            dispatches.push(DispatchCall {
+                index: dispatches.len(),
+                offset: record.offset,
+                encoder_id: Some(dispatch.encoder_id),
+                grid_size: dispatch.grid_size,
+                group_size: dispatch.group_size,
+            });
+        }
+        Ok(dispatches)
+    }
+
+    pub fn analyze_kernels(&self) -> Result<BTreeMap<String, KernelStat>> {
+        let pipeline_map = self.pipeline_function_map()?;
+        let encoders = self.compute_encoders()?;
+        let dispatches = self.dispatch_calls()?;
+        let mut stats = BTreeMap::new();
+
+        for (addr, name) in &pipeline_map {
+            stats.entry(name.clone()).or_insert_with(|| KernelStat {
+                name: name.clone(),
+                pipeline_addr: *addr,
+                dispatch_count: 0,
+                encoder_labels: BTreeMap::new(),
+            });
+        }
+
+        let encoder_by_addr: BTreeMap<u64, &ComputeEncoder> = encoders
+            .iter()
+            .map(|encoder| (encoder.address, encoder))
+            .collect();
+        let encoder_pipeline_map =
+            collect_encoder_pipeline_map(&self.capture_data()?, &pipeline_map)?;
+
+        for dispatch in dispatches {
+            let encoder = dispatch
+                .encoder_id
+                .and_then(|encoder_id| encoder_by_addr.get(&encoder_id).copied());
+
+            let name = dispatch
+                .encoder_id
+                .and_then(|encoder_id| encoder_pipeline_map.get(&encoder_id))
+                .cloned()
+                .or_else(|| encoder.map(|encoder| encoder.label.clone()))
+                .unwrap_or_else(|| "unknown".to_owned());
+
+            let pipeline_addr = dispatch
+                .encoder_id
+                .and_then(|encoder_id| {
+                    encoder_pipeline_map
+                        .iter()
+                        .find_map(|(candidate, kernel_name)| {
+                            (*candidate == encoder_id).then_some(kernel_name)
+                        })
+                })
+                .and_then(|kernel_name| {
+                    pipeline_map
+                        .iter()
+                        .find_map(|(addr, candidate)| (candidate == kernel_name).then_some(*addr))
+                })
+                .unwrap_or_default();
+
+            let stat = stats.entry(name.clone()).or_insert_with(|| KernelStat {
+                name: name.clone(),
+                pipeline_addr,
+                dispatch_count: 0,
+                encoder_labels: BTreeMap::new(),
+            });
+            stat.dispatch_count += 1;
+            if let Some(encoder) = encoder
+                && !encoder.label.is_empty()
+            {
+                *stat
+                    .encoder_labels
+                    .entry(encoder.label.clone())
+                    .or_default() += 1;
+            }
+        }
+
+        if stats
+            .get("unknown")
+            .is_some_and(|entry| entry.dispatch_count == 0)
+        {
+            stats.remove("unknown");
+        }
+
+        Ok(stats)
     }
 }
 
@@ -274,4 +420,133 @@ fn collect_pipeline_mappings_from_data(
         }
     }
     Ok(())
+}
+
+fn parse_command_buffers(data: &[u8]) -> Vec<CommandBuffer> {
+    let marker = b"CUUU";
+    let mut command_buffers = Vec::new();
+    let mut offset = 0usize;
+    while let Some(pos) = find_bytes_from(data, marker, offset) {
+        if pos + 12 <= data.len() {
+            command_buffers.push(CommandBuffer {
+                index: command_buffers.len(),
+                timestamp: u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap()),
+                offset: pos,
+            });
+        }
+        offset = pos + 4;
+    }
+    command_buffers
+}
+
+fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
+    let mut encoders = Vec::new();
+    let marker = b"CS\0\0";
+    let mut offset = 0usize;
+    while let Some(pos) = find_bytes_from(data, marker, offset) {
+        let address_start = pos + 4;
+        let label_start = pos + 12;
+        if address_start + 8 > data.len() || label_start >= data.len() {
+            break;
+        }
+        let address =
+            u64::from_le_bytes(data[address_start..address_start + 8].try_into().unwrap());
+        let label = read_c_string_bytes(data, label_start).unwrap_or_default();
+        if !label.is_empty() {
+            encoders.push(ComputeEncoder {
+                index: encoders.len(),
+                address,
+                label,
+                offset: pos,
+            });
+        }
+        offset = pos + 4;
+    }
+    encoders
+}
+
+fn dedupe_encoders(mut encoders: Vec<ComputeEncoder>) -> Result<Vec<ComputeEncoder>> {
+    encoders.sort_by_key(|encoder| (encoder.offset, encoder.address));
+    encoders.dedup_by(|left, right| left.offset == right.offset && left.address == right.address);
+    for (index, encoder) in encoders.iter_mut().enumerate() {
+        encoder.index = index;
+    }
+    Ok(encoders)
+}
+
+fn collect_encoder_pipeline_map(
+    data: &[u8],
+    pipeline_map: &PipelineFunctionMap,
+) -> Result<BTreeMap<u64, String>> {
+    let records = MTSPRecord::parse_stream(data)?;
+    let mut result = BTreeMap::new();
+    for record in records {
+        if record.record_type != RecordType::Ct {
+            continue;
+        }
+        let ct = record.parse_ct_record()?;
+        if let Some(name) = pipeline_map.get(&ct.pipeline_addr) {
+            result.insert(ct.function_addr, name.clone());
+        }
+    }
+    Ok(result)
+}
+
+fn find_bytes_from(data: &[u8], needle: &[u8], offset: usize) -> Option<usize> {
+    data.get(offset..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|relative| offset + relative)
+}
+
+fn read_c_string_bytes(data: &[u8], offset: usize) -> Option<String> {
+    let tail = data.get(offset..)?;
+    let end = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(tail.len());
+    if end == 0 {
+        return None;
+    }
+    let value = &tail[..end];
+    if value
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    {
+        Some(String::from_utf8_lossy(value).into_owned())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_command_buffer_markers() {
+        let mut data = vec![0u8; 64];
+        data[8..12].copy_from_slice(b"CUUU");
+        data[12..20].copy_from_slice(&42u64.to_le_bytes());
+        data[24..28].copy_from_slice(b"CUUU");
+        data[28..36].copy_from_slice(&99u64.to_le_bytes());
+
+        let buffers = parse_command_buffers(&data);
+        assert_eq!(buffers.len(), 2);
+        assert_eq!(buffers[0].timestamp, 42);
+        assert_eq!(buffers[1].timestamp, 99);
+    }
+
+    #[test]
+    fn parses_compute_encoders_from_cs_records() {
+        let mut data = vec![0u8; 64];
+        data[8..12].copy_from_slice(b"CS\0\0");
+        data[12..20].copy_from_slice(&0x1234u64.to_le_bytes());
+        data[20..27].copy_from_slice(b"Kernel\0");
+
+        let encoders = parse_compute_encoders(&data);
+        assert_eq!(encoders.len(), 1);
+        assert_eq!(encoders[0].address, 0x1234);
+        assert_eq!(encoders[0].label, "Kernel");
+    }
 }
