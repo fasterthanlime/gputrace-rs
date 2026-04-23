@@ -64,6 +64,10 @@ enum BuffersCommand {
         trace: PathBuf,
         #[arg(short, long, default_value = "table")]
         format: String,
+        #[arg(long, default_value = "size")]
+        sort: String,
+        #[arg(long)]
+        min_size: Option<String>,
     },
     Inspect {
         trace: PathBuf,
@@ -124,11 +128,21 @@ pub fn run() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         CommandSet::Buffers(args) => match args.command {
-            BuffersCommand::List { trace, format } => {
+            BuffersCommand::List {
+                trace,
+                format,
+                sort,
+                min_size,
+            } => {
                 let trace = TraceBundle::open(trace)?;
-                let report = buffers::analyze(&trace)?;
+                let options = buffers::BufferListOptions {
+                    sort_by: Some(sort),
+                    min_size: min_size.as_deref().map(buffers::parse_size).transpose()?,
+                };
+                let report = buffers::analyze_with_options(&trace, &options)?;
                 match format.as_str() {
                     "table" | "text" => print!("{}", buffers::format_table(&report)),
+                    "csv" => print!("{}", buffers::format_csv(&report)),
                     "markdown" => print!("{}", buffers::markdown_report(&report)),
                     "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                     _ => {

@@ -7,6 +7,12 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::trace::TraceBundle;
 
+#[derive(Debug, Clone, Default)]
+pub struct BufferListOptions {
+    pub sort_by: Option<String>,
+    pub min_size: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BufferInventory {
     pub total_buffers: usize,
@@ -68,15 +74,20 @@ pub struct BufferInspection {
 }
 
 pub fn analyze(trace: &TraceBundle) -> Result<BufferInventory> {
+    analyze_with_options(trace, &BufferListOptions::default())
+}
+
+pub fn analyze_with_options(
+    trace: &TraceBundle,
+    options: &BufferListOptions,
+) -> Result<BufferInventory> {
     let address_map = collect_buffer_addresses(trace)?;
     let binding_map = collect_binding_summaries(trace)?;
     let mut entries = scan_buffer_files(trace, &address_map, &binding_map)?;
-    entries.sort_by(|left, right| {
-        right
-            .size
-            .cmp(&left.size)
-            .then_with(|| left.filename.cmp(&right.filename))
-    });
+    if let Some(min_size) = options.min_size {
+        entries.retain(|entry| entry.size >= min_size);
+    }
+    sort_buffers(&mut entries, options.sort_by.as_deref().unwrap_or("size"))?;
 
     Ok(BufferInventory {
         total_buffers: entries.len(),
@@ -181,6 +192,26 @@ pub fn format_diff(report: &BufferInventoryDiff) -> String {
                 change.right_bindings
             ));
         }
+    }
+    out
+}
+
+pub fn format_csv(report: &BufferInventory) -> String {
+    let mut out = String::new();
+    out.push_str("id,filename,size,address,aliases,binding_count\n");
+    for buffer in &report.buffers {
+        out.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            escape_csv(&buffer.id),
+            escape_csv(&buffer.filename),
+            buffer.size,
+            buffer
+                .address
+                .map(|address| format!("0x{address:x}"))
+                .unwrap_or_default(),
+            buffer.aliases.len(),
+            buffer.binding_count
+        ));
     }
     out
 }
@@ -516,6 +547,51 @@ fn scan_buffer_files(
     Ok(buffers)
 }
 
+pub fn parse_size(input: &str) -> Result<u64> {
+    let value = input.trim().to_ascii_uppercase();
+    let (number, multiplier) = if let Some(prefix) = value.strip_suffix("KB") {
+        (prefix, 1024)
+    } else if let Some(prefix) = value.strip_suffix("MB") {
+        (prefix, 1024 * 1024)
+    } else if let Some(prefix) = value.strip_suffix("GB") {
+        (prefix, 1024 * 1024 * 1024)
+    } else if let Some(prefix) = value.strip_suffix('B') {
+        (prefix, 1)
+    } else {
+        (value.as_str(), 1)
+    };
+    let number = number.trim();
+    let parsed = number.parse::<u64>().map_err(|_| {
+        Error::InvalidInput(format!(
+            "invalid size: {input} (expected values like 4096, 16KB, 8MB, 1GB)"
+        ))
+    })?;
+    Ok(parsed.saturating_mul(multiplier))
+}
+
+fn sort_buffers(buffers: &mut [BufferInfo], sort_by: &str) -> Result<()> {
+    match sort_by {
+        "size" => buffers.sort_by(|left, right| {
+            right
+                .size
+                .cmp(&left.size)
+                .then_with(|| left.filename.cmp(&right.filename))
+        }),
+        "id" => buffers.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.filename.cmp(&right.filename))
+        }),
+        "name" => buffers.sort_by(|left, right| left.filename.cmp(&right.filename)),
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "unknown sort key: {other} (expected size, id, or name)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_buffer_path(trace_path: &Path, buffer_name: &str) -> Result<(String, PathBuf, bool)> {
     let path = trace_path.join(buffer_name);
     let meta = fs::symlink_metadata(&path).map_err(|error| {
@@ -697,6 +773,14 @@ fn truncate(value: &str, width: usize) -> String {
     format!("{}...", &value[..keep])
 }
 
+fn escape_csv(value: &str) -> String {
+    if value.contains([',', '"', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,5 +859,12 @@ mod tests {
         let rendered = format_f32(&data);
         assert!(rendered.contains("1.5"));
         assert!(rendered.contains("-2"));
+    }
+
+    #[test]
+    fn parses_sizes() {
+        assert_eq!(parse_size("1KB").unwrap(), 1024);
+        assert_eq!(parse_size("2 MB").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_size("64").unwrap(), 64);
     }
 }
