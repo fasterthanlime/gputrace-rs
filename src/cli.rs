@@ -1314,7 +1314,17 @@ fn format_xcode_permissions(result: &automation::XcodePermissionReport) -> Strin
 }
 
 fn format_xcode_status(status: &automation::XcodeWindowStatus) -> String {
-    format!("status: {:?}\nraw: {}\n", status.status, status.raw)
+    let mut out = format!("status: {:?}\nraw: {}\n", status.status, status.raw.trim());
+    if let Some(tab) = &status.current_tab {
+        out.push_str(&format!("tab: {tab}\n"));
+    }
+    if !status.available_actions.is_empty() {
+        out.push_str(&format!(
+            "actions: {}\n",
+            status.available_actions.join(", ")
+        ));
+    }
+    out
 }
 
 fn format_xcode_tabs(tabs: &[automation::XcodeTabInfo]) -> String {

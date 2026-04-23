@@ -68,6 +68,8 @@ impl XcodeAutomationStatus {
 pub struct XcodeWindowStatus {
     pub status: XcodeAutomationStatus,
     pub raw: String,
+    pub current_tab: Option<String>,
+    pub available_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -540,9 +542,28 @@ pub fn wait_for_status(
 pub fn get_window_status(trace_path: Option<&Path>) -> Result<XcodeWindowStatus> {
     let script = build_status_script(trace_path);
     let raw = run_osascript(&script)?;
+    let current_tab = list_tabs(trace_path)?
+        .into_iter()
+        .find(|tab| tab.selected)
+        .map(|tab| tab.name);
+    let mut available_actions = list_buttons(trace_path)?
+        .into_iter()
+        .filter(|button| button.enabled)
+        .map(|button| button.name)
+        .filter(|name| {
+            matches!(
+                name.as_str(),
+                "Replay" | "Profile" | "Capture GPU workload" | "Show Performance" | "Export"
+            )
+        })
+        .collect::<Vec<_>>();
+    available_actions.sort();
+    available_actions.dedup();
     Ok(XcodeWindowStatus {
         status: parse_status(&raw),
         raw,
+        current_tab,
+        available_actions,
     })
 }
 
