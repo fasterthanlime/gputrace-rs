@@ -2,6 +2,7 @@ use serde::Serialize;
 use std::path::Path;
 
 use crate::analysis::{AnalysisReport, analyze};
+use crate::counter_export;
 use crate::error::Result;
 use crate::trace::TraceBundle;
 
@@ -13,6 +14,7 @@ pub struct DiffReport {
     pub buffer_lifecycle_changes: Vec<BufferLifecycleChange>,
     pub kernel_changes: Vec<KernelChange>,
     pub kernel_timing_changes: Vec<KernelTimingChange>,
+    pub counter_metric_changes: Vec<CounterMetricChange>,
     pub summary: Vec<String>,
 }
 
@@ -66,6 +68,19 @@ pub struct BufferLifecycleChange {
     pub dispatch_span_delta: isize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CounterMetricChange {
+    pub name: String,
+    pub left_execution_cost_percent: Option<f64>,
+    pub right_execution_cost_percent: Option<f64>,
+    pub left_alu_utilization_percent: Option<f64>,
+    pub right_alu_utilization_percent: Option<f64>,
+    pub left_last_level_cache_percent: Option<f64>,
+    pub right_last_level_cache_percent: Option<f64>,
+    pub left_device_memory_bandwidth_gbps: Option<f64>,
+    pub right_device_memory_bandwidth_gbps: Option<f64>,
+}
+
 pub fn diff_paths(left: impl AsRef<Path>, right: impl AsRef<Path>) -> Result<DiffReport> {
     let left = TraceBundle::open(left)?;
     let right = TraceBundle::open(right)?;
@@ -79,6 +94,7 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
     let buffer_lifecycle_changes = diff_buffer_lifecycles(&left_report, &right_report);
     let kernel_changes = diff_kernel_stats(&left_report, &right_report);
     let kernel_timing_changes = diff_kernel_timing_stats(&left_report, &right_report);
+    let counter_metric_changes = diff_counter_metrics(left, right);
     let mut summary = Vec::new();
     let added_buffers = buffer_changes
         .iter()
@@ -211,6 +227,20 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
             change.duration_delta_ns
         ));
     }
+    if let Some(change) = counter_metric_changes.first() {
+        summary.push(format!(
+            "Largest profiler metric delta: {} (exec {} -> {}, alu {} -> {}, llc {} -> {}, dev_bw {} -> {})",
+            change.name,
+            format_option_f64(change.left_execution_cost_percent),
+            format_option_f64(change.right_execution_cost_percent),
+            format_option_f64(change.left_alu_utilization_percent),
+            format_option_f64(change.right_alu_utilization_percent),
+            format_option_f64(change.left_last_level_cache_percent),
+            format_option_f64(change.right_last_level_cache_percent),
+            format_option_f64(change.left_device_memory_bandwidth_gbps),
+            format_option_f64(change.right_device_memory_bandwidth_gbps),
+        ));
+    }
     if summary.is_empty() {
         summary.push("No high-level differences detected yet.".to_owned());
     }
@@ -222,8 +252,164 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
         buffer_lifecycle_changes,
         kernel_changes,
         kernel_timing_changes,
+        counter_metric_changes,
         summary,
     }
+}
+
+fn diff_counter_metrics(left: &TraceBundle, right: &TraceBundle) -> Vec<CounterMetricChange> {
+    let left_report = match counter_export::report(left) {
+        Ok(report) => report,
+        Err(_) => return Vec::new(),
+    };
+    let right_report = match counter_export::report(right) {
+        Ok(report) => report,
+        Err(_) => return Vec::new(),
+    };
+
+    let left_map = aggregate_counter_metrics(&left_report);
+    let right_map = aggregate_counter_metrics(&right_report);
+    let mut names = std::collections::BTreeSet::new();
+    names.extend(left_map.keys().cloned());
+    names.extend(right_map.keys().cloned());
+
+    let mut changes = Vec::new();
+    for name in names {
+        let left_metrics = left_map.get(&name).copied().unwrap_or_default();
+        let right_metrics = right_map.get(&name).copied().unwrap_or_default();
+        if metrics_equal(left_metrics, right_metrics) {
+            continue;
+        }
+        changes.push(CounterMetricChange {
+            name,
+            left_execution_cost_percent: left_metrics.execution_cost_percent,
+            right_execution_cost_percent: right_metrics.execution_cost_percent,
+            left_alu_utilization_percent: left_metrics.alu_utilization_percent,
+            right_alu_utilization_percent: right_metrics.alu_utilization_percent,
+            left_last_level_cache_percent: left_metrics.last_level_cache_percent,
+            right_last_level_cache_percent: right_metrics.last_level_cache_percent,
+            left_device_memory_bandwidth_gbps: left_metrics.device_memory_bandwidth_gbps,
+            right_device_memory_bandwidth_gbps: right_metrics.device_memory_bandwidth_gbps,
+        });
+    }
+    changes.sort_by(|left, right| {
+        aggregate_change_magnitude(right)
+            .partial_cmp(&aggregate_change_magnitude(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    changes
+}
+
+fn aggregate_counter_metrics(
+    report: &counter_export::CounterExportReport,
+) -> std::collections::BTreeMap<String, CounterAggregate> {
+    let mut sums = std::collections::BTreeMap::<
+        String,
+        (f64, usize, f64, usize, f64, usize, f64, usize),
+    >::new();
+    for row in &report.rows {
+        let Some(name) = row.kernel_name.clone() else {
+            continue;
+        };
+        let entry = sums.entry(name).or_default();
+        if let Some(value) = row.execution_cost_percent {
+            entry.0 += value;
+            entry.1 += 1;
+        }
+        if let Some(value) = row.alu_utilization_percent {
+            entry.2 += value;
+            entry.3 += 1;
+        }
+        if let Some(value) = row.last_level_cache_percent {
+            entry.4 += value;
+            entry.5 += 1;
+        }
+        if let Some(value) = row.device_memory_bandwidth_gbps {
+            entry.6 += value;
+            entry.7 += 1;
+        }
+    }
+
+    sums.into_iter()
+        .map(|(name, sums)| {
+            (
+                name,
+                CounterAggregate {
+                    execution_cost_percent: average_option(sums.0, sums.1),
+                    alu_utilization_percent: average_option(sums.2, sums.3),
+                    last_level_cache_percent: average_option(sums.4, sums.5),
+                    device_memory_bandwidth_gbps: average_option(sums.6, sums.7),
+                },
+            )
+        })
+        .collect()
+}
+
+#[derive(Default, Clone, Copy)]
+struct CounterAggregate {
+    execution_cost_percent: Option<f64>,
+    alu_utilization_percent: Option<f64>,
+    last_level_cache_percent: Option<f64>,
+    device_memory_bandwidth_gbps: Option<f64>,
+}
+
+fn average_option(sum: f64, count: usize) -> Option<f64> {
+    (count > 0).then(|| sum / count as f64)
+}
+
+fn metrics_equal(left: CounterAggregate, right: CounterAggregate) -> bool {
+    approx_option_eq(left.execution_cost_percent, right.execution_cost_percent)
+        && approx_option_eq(left.alu_utilization_percent, right.alu_utilization_percent)
+        && approx_option_eq(
+            left.last_level_cache_percent,
+            right.last_level_cache_percent,
+        )
+        && approx_option_eq(
+            left.device_memory_bandwidth_gbps,
+            right.device_memory_bandwidth_gbps,
+        )
+}
+
+fn approx_option_eq(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => (left - right).abs() < f64::EPSILON,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn aggregate_change_magnitude(change: &CounterMetricChange) -> f64 {
+    option_delta(
+        change.left_execution_cost_percent,
+        change.right_execution_cost_percent,
+    )
+    .abs()
+        + option_delta(
+            change.left_alu_utilization_percent,
+            change.right_alu_utilization_percent,
+        )
+        .abs()
+        + option_delta(
+            change.left_last_level_cache_percent,
+            change.right_last_level_cache_percent,
+        )
+        .abs()
+        + option_delta(
+            change.left_device_memory_bandwidth_gbps,
+            change.right_device_memory_bandwidth_gbps,
+        )
+        .abs()
+}
+
+fn option_delta(left: Option<f64>, right: Option<f64>) -> f64 {
+    right.unwrap_or_default() - left.unwrap_or_default()
+}
+
+fn format_option_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".to_owned())
 }
 
 fn diff_buffer_stats(left: &AnalysisReport, right: &AnalysisReport) -> Vec<BufferChange> {

@@ -26,6 +26,7 @@ fn top_level_help_lists_current_analysis_commands() {
         "fences",
         "api-calls",
         "dump-records",
+        "export-counters",
         "profiler",
         "mtlb-functions",
         "xcode-windows",
@@ -67,6 +68,16 @@ fn timeline_help_mentions_raw_and_export_formats() {
     assert!(help.contains("<TRACE>"));
     assert!(help.contains("--raw"));
     assert!(help.contains("--format <FORMAT>"));
+}
+
+#[test]
+fn export_counters_help_mentions_trace_and_formats() {
+    let help = render_help(&["export-counters"]);
+
+    assert!(help.contains("export-counters"));
+    assert!(help.contains("<TRACE>"));
+    assert!(help.contains("--format <FORMAT>"));
+    assert!(help.contains("[default: csv]"));
 }
 
 #[test]

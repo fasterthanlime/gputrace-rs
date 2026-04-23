@@ -12,6 +12,7 @@ use crate::buffers;
 use crate::clear_buffers;
 use crate::commands;
 use crate::correlate;
+use crate::counter_export;
 use crate::diff;
 use crate::dump;
 use crate::error::Result;
@@ -42,6 +43,7 @@ enum CommandSet {
     ApiCalls(ApiCallsArgs),
     ClearBuffers(ClearBuffersArgs),
     DumpRecords(DumpRecordsArgs),
+    ExportCounters(ExportCountersArgs),
     Fences(FencesArgs),
     Mtlb(MtlbArgs),
     MtlbInventory(MtlbPathArgs),
@@ -161,6 +163,13 @@ struct DumpRecordsArgs {
     #[arg(long)]
     hex_preview: bool,
     #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ExportCountersArgs {
+    trace: PathBuf,
+    #[arg(short, long, default_value = "csv")]
     format: String,
 }
 
@@ -554,6 +563,16 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", dump::format_record_listing(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown dump-records format")),
+            }
+        }
+        CommandSet::ExportCounters(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = counter_export::report(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", counter_export::format_report(&report)),
+                "csv" => print!("{}", counter_export::format_csv(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown export-counters format")),
             }
         }
         CommandSet::Mtlb(args) => {

@@ -9,6 +9,7 @@ pub mod cli;
 pub mod commands;
 pub mod correlate;
 pub mod counter;
+pub mod counter_export;
 pub mod diff;
 pub mod dump;
 pub mod error;

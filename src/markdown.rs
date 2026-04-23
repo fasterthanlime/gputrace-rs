@@ -227,6 +227,27 @@ pub fn diff_report(report: &DiffReport) -> String {
             10,
         );
     }
+    if !report.counter_metric_changes.is_empty() {
+        push_section(
+            &mut out,
+            "Profiler Metric Changes",
+            report.counter_metric_changes.iter().map(|change| {
+                format!(
+                    "- `{}`: exec {} -> {}, ALU {} -> {}, LLC {} -> {}, Dev BW {} -> {}\n",
+                    change.name,
+                    option_metric(change.left_execution_cost_percent),
+                    option_metric(change.right_execution_cost_percent),
+                    option_metric(change.left_alu_utilization_percent),
+                    option_metric(change.right_alu_utilization_percent),
+                    option_metric(change.left_last_level_cache_percent),
+                    option_metric(change.right_last_level_cache_percent),
+                    option_metric(change.left_device_memory_bandwidth_gbps),
+                    option_metric(change.right_device_memory_bandwidth_gbps),
+                )
+            }),
+            10,
+        );
+    }
     if !report.buffer_changes.is_empty() {
         push_section(
             &mut out,
@@ -277,6 +298,12 @@ fn push_metric_block(out: &mut String, title: &str, metrics: &[(&str, String)]) 
         out.push_str(&format!("* {label}: `{value}`\n"));
     }
     out.push('\n');
+}
+
+fn option_metric(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".to_owned())
 }
 
 fn push_section(
@@ -493,6 +520,17 @@ mod tests {
                 left_percent_of_total: 10.0,
                 right_percent_of_total: 25.0,
             }],
+            counter_metric_changes: vec![crate::diff::CounterMetricChange {
+                name: "kernel".into(),
+                left_execution_cost_percent: Some(40.0),
+                right_execution_cost_percent: Some(55.0),
+                left_alu_utilization_percent: Some(35.0),
+                right_alu_utilization_percent: Some(48.0),
+                left_last_level_cache_percent: Some(2.0),
+                right_last_level_cache_percent: Some(6.0),
+                left_device_memory_bandwidth_gbps: Some(4.0),
+                right_device_memory_bandwidth_gbps: Some(9.0),
+            }],
             kernel_changes: (0..11)
                 .map(|index| KernelChange {
                     name: format!("kernel_{index}"),
@@ -508,8 +546,10 @@ mod tests {
         assert!(rendered.contains("## Inputs"));
         assert!(rendered.contains("## Summary"));
         assert!(rendered.contains("## Kernel Changes"));
+        assert!(rendered.contains("## Profiler Metric Changes"));
         assert!(rendered.contains("## Buffer Changes"));
         assert!(rendered.contains("## Buffer Lifetime Changes"));
+        assert!(rendered.contains("`kernel`: exec 40.00 -> 55.00, ALU 35.00 -> 48.00"));
         assert!(rendered.contains(
             "`buf` [changed]: uses 1 -> 3 (+2), encoders 1 -> 2, command buffers 1 -> 2"
         ));
