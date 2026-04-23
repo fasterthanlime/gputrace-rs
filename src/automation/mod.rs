@@ -1459,29 +1459,75 @@ fn build_target_window_clause(
     missing_result: &str,
     return_when_empty: bool,
 ) -> String {
-    let title_filter = trace_path
-        .and_then(Path::file_name)
-        .map(applescript_string_literal);
+    let title_filter = trace_path.and_then(Path::file_name).and_then(OsStr::to_str);
+    let base_filter = trace_path.and_then(Path::file_stem).and_then(OsStr::to_str);
 
     match title_filter {
-        Some(filter) => format!(
-            r#"
-        set targetWindow to missing value
+        Some(filter) => {
+            let filter = applescript_string_literal(OsStr::new(filter));
+            let base_match = match base_filter {
+                Some(base) if Some(base) != title_filter => {
+                    let base = applescript_string_literal(OsStr::new(base));
+                    format!(
+                        r#"
+        if (count of matchingWindows) is 0 then
+            repeat with candidateWindow in allWindows
+                try
+                    set windowName to my ascii_lowercase(my element_name(candidateWindow))
+                    set documentName to my ascii_lowercase(my attribute_text(candidateWindow, "AXDocument"))
+                    if windowName contains {base} or documentName contains {base} then
+                        set end of matchingWindows to candidateWindow
+                    end if
+                end try
+            end repeat
+        end if
+"#
+                    )
+                }
+                _ => String::new(),
+            };
+            format!(
+                r#"
+        set allWindows to {{}}
         repeat with candidateWindow in windows
             try
-                set windowName to my element_name(candidateWindow)
-                set documentName to my attribute_text(candidateWindow, "AXDocument")
+                set end of allWindows to candidateWindow
+            end try
+        end repeat
+
+        set matchingWindows to {{}}
+        repeat with candidateWindow in allWindows
+            try
+                set windowName to my ascii_lowercase(my element_name(candidateWindow))
+                set documentName to my ascii_lowercase(my attribute_text(candidateWindow, "AXDocument"))
                 if windowName contains {filter} or documentName contains {filter} then
-                    set targetWindow to candidateWindow
-                    exit repeat
+                    set end of matchingWindows to candidateWindow
                 end if
             end try
         end repeat
+
+{base_match}
+
+        if (count of matchingWindows) is 0 then
+            repeat with candidateWindow in allWindows
+                try
+                    set windowName to my element_name(candidateWindow)
+                    if my is_source_editor_window(windowName) then
+                        -- Skip likely source editors during trace-window fallback.
+                    else if my has_gpu_trace_ui(candidateWindow) then
+                        set end of matchingWindows to candidateWindow
+                    end if
+                end try
+            end repeat
+        end if
+
+        set targetWindow to my preferred_trace_window(matchingWindows)
         if targetWindow is missing value then
             return "{missing_result}"
         end if
 "#
-        ),
+            )
+        }
         None if return_when_empty => format!(
             r#"
         if (count of windows) is 0 then
@@ -1567,6 +1613,72 @@ on element_text(elementRef)
         end try
     end try
 end element_text
+
+on ascii_lowercase(valueText)
+    try
+        return do shell script "printf %s " & quoted form of valueText & " | tr '[:upper:]' '[:lower:]'"
+    on error
+        return valueText
+    end try
+end ascii_lowercase
+
+on is_source_editor_window(titleText)
+    set titleLower to my ascii_lowercase(titleText)
+    repeat with suffixText in {".swift", ".m", ".mm", ".c", ".cpp", ".h", ".hpp", ".metal", ".py", ".js", ".ts"}
+        if titleLower ends with suffixText then
+            return true
+        end if
+    end repeat
+    return false
+end is_source_editor_window
+
+on has_gpu_trace_ui(candidateWindow)
+    repeat with buttonName in {"Replay", "Profile", "Export", "Show Performance"}
+        if my window_has_button(candidateWindow, buttonName) then
+            return true
+        end if
+    end repeat
+    return false
+end has_gpu_trace_ui
+
+on preferred_trace_window(candidateWindows)
+    if (count of candidateWindows) is 0 then
+        return missing value
+    end if
+    if (count of candidateWindows) is 1 then
+        return item 1 of candidateWindows
+    end if
+
+    repeat with candidateWindow in candidateWindows
+        if my window_has_button(candidateWindow, "Replay") then
+            return candidateWindow
+        end if
+        if my window_has_button(candidateWindow, "Export") then
+            return candidateWindow
+        end if
+        if my window_has_button(candidateWindow, "Show Performance") then
+            return candidateWindow
+        end if
+    end repeat
+
+    return item 1 of candidateWindows
+end preferred_trace_window
+
+on window_has_button(candidateWindow, buttonName)
+    try
+        set allElements to entire contents of candidateWindow
+    on error
+        return false
+    end try
+    repeat with elem in allElements
+        try
+            if my role_text(elem) is "AXButton" and my element_name(elem) is buttonName then
+                return true
+            end if
+        end try
+    end repeat
+    return false
+end window_has_button
 
 on role_text(elementRef)
     try
@@ -1990,6 +2102,8 @@ mod tests {
         let script = build_status_script(Some(Path::new("/tmp/My Trace.gputrace")));
         assert!(script.contains("My Trace.gputrace"));
         assert!(script.contains("targetWindow"));
+        assert!(script.contains("preferred_trace_window"));
+        assert!(script.contains("has_gpu_trace_ui"));
     }
 
     #[test]
@@ -2004,6 +2118,8 @@ mod tests {
         assert!(script.contains("AXDocument"));
         assert!(script.contains("AXSubrole"));
         assert!(script.contains("join_records"));
+        assert!(script.contains("window_has_button"));
+        assert!(script.contains("is_source_editor_window"));
     }
 
     #[test]
