@@ -7,6 +7,7 @@ use regex::Regex;
 use serde::Serialize;
 use walkdir::WalkDir;
 
+use crate::counter;
 use crate::error::{Error, Result};
 use crate::profiler;
 use crate::trace::TraceBundle;
@@ -34,6 +35,9 @@ pub struct ShaderEntry {
     pub avg_sampling_density: Option<f64>,
     pub occupancy_percent: Option<f64>,
     pub occupancy_confidence: Option<f64>,
+    pub alu_utilization_percent: Option<f64>,
+    pub last_level_cache_percent: Option<f64>,
+    pub device_memory_bandwidth_gbps: Option<f64>,
     pub temporary_register_count: Option<i64>,
     pub spilled_bytes: Option<i64>,
     pub threadgroup_memory: Option<i64>,
@@ -99,6 +103,7 @@ struct ShaderSourceIndex {
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderReport> {
     let index = ShaderSourceIndex::build(search_paths)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    let limiter_metrics = counter::extract_limiters_for_trace(&trace.path);
     let dispatches = trace.dispatch_calls()?;
     let mut simd_groups_by_name = BTreeMap::<String, u64>::new();
     let mut total_simd_groups = 0u64;
@@ -121,6 +126,7 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
     let mut density_sum_by_name = BTreeMap::<String, f64>::new();
     let mut density_count_by_name = BTreeMap::<String, usize>::new();
     let mut occupancy_by_name = BTreeMap::<String, (f64, f64, usize)>::new();
+    let mut limiter_by_name = BTreeMap::<String, (f64, f64, f64, usize)>::new();
     let mut pipeline_stats_by_addr = BTreeMap::<u64, profiler::ProfilerPipelineStats>::new();
     let mut pipeline_stats_by_name = BTreeMap::<String, profiler::ProfilerPipelineStats>::new();
     let mut total_duration_ns = 0u64;
@@ -161,6 +167,23 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 entry.0 += occupancy.occupancy_percent;
                 entry.1 += occupancy.confidence;
                 entry.2 += 1;
+            }
+        }
+        for limiter in &limiter_metrics {
+            for dispatch in summary
+                .dispatches
+                .iter()
+                .filter(|dispatch| dispatch.encoder_index == limiter.encoder_index)
+            {
+                let name = dispatch
+                    .function_name
+                    .clone()
+                    .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
+                let entry = limiter_by_name.entry(name).or_default();
+                entry.0 += limiter.alu_utilization.unwrap_or(0.0);
+                entry.1 += limiter.last_level_cache.unwrap_or(0.0);
+                entry.2 += limiter.device_memory_bandwidth_gbps.unwrap_or(0.0);
+                entry.3 += 1;
             }
         }
         for pipeline in &summary.pipelines {
@@ -211,6 +234,16 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                     ))
                 },
             );
+            let limiter =
+                limiter_by_name
+                    .get(&kernel_name)
+                    .and_then(|(alu_sum, llc_sum, bw_sum, count)| {
+                        (*count > 0).then_some((
+                            alu_sum / *count as f64,
+                            llc_sum / *count as f64,
+                            bw_sum / *count as f64,
+                        ))
+                    });
             let pipeline_stats = pipeline_stats_by_addr
                 .get(&kernel.pipeline_addr)
                 .cloned()
@@ -232,6 +265,9 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 avg_sampling_density,
                 occupancy_percent: occupancy.map(|(value, _)| value),
                 occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
+                alu_utilization_percent: limiter.map(|(alu, _, _)| alu),
+                last_level_cache_percent: limiter.map(|(_, llc, _)| llc),
+                device_memory_bandwidth_gbps: limiter.map(|(_, _, bw)| bw),
                 temporary_register_count: pipeline_stats
                     .as_ref()
                     .map(|stats| stats.temporary_register_count),
@@ -442,6 +478,11 @@ pub fn format_report(report: &ShaderReport) -> String {
         .shaders
         .iter()
         .any(|shader| shader.occupancy_percent.is_some());
+    let has_counter_metrics = report.shaders.iter().any(|shader| {
+        shader.alu_utilization_percent.is_some()
+            || shader.last_level_cache_percent.is_some()
+            || shader.device_memory_bandwidth_gbps.is_some()
+    });
     let has_simd_groups = report.shaders.iter().any(|shader| shader.simd_groups > 0);
     if has_profiler_timing {
         out.push_str(&format!(
@@ -464,6 +505,9 @@ pub fn format_report(report: &ShaderReport) -> String {
         if has_occupancy {
             out.push_str(&format!(" {:>8}", "Occ %"));
         }
+        if has_counter_metrics {
+            out.push_str(&format!(" {:>8} {:>8} {:>10}", "ALU %", "LLC %", "Dev BW"));
+        }
         out.push_str("  Source\n");
     } else {
         out.push_str(&format!(
@@ -481,6 +525,9 @@ pub fn format_report(report: &ShaderReport) -> String {
         }
         if has_occupancy {
             out.push_str(&format!(" {:>8}", "Occ %"));
+        }
+        if has_counter_metrics {
+            out.push_str(&format!(" {:>8} {:>8} {:>10}", "ALU %", "LLC %", "Dev BW"));
         }
         out.push_str("  Source\n");
     }
@@ -560,6 +607,23 @@ pub fn format_report(report: &ShaderReport) -> String {
                         .unwrap_or_else(|| "-".to_owned())
                 ));
             }
+            if has_counter_metrics {
+                out.push_str(&format!(
+                    " {:>8} {:>8} {:>10}",
+                    shader
+                        .alu_utilization_percent
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .last_level_cache_percent
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .device_memory_bandwidth_gbps
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned())
+                ));
+            }
             out.push_str(&format!("  {source}\n"));
         } else {
             out.push_str(&format!(
@@ -612,6 +676,23 @@ pub fn format_report(report: &ShaderReport) -> String {
                         .unwrap_or_else(|| "-".to_owned())
                 ));
             }
+            if has_counter_metrics {
+                out.push_str(&format!(
+                    " {:>8} {:>8} {:>10}",
+                    shader
+                        .alu_utilization_percent
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .last_level_cache_percent
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .device_memory_bandwidth_gbps
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned())
+                ));
+            }
             out.push_str(&format!("  {source}\n"));
         }
     }
@@ -620,28 +701,30 @@ pub fn format_report(report: &ShaderReport) -> String {
 
 pub fn format_csv(report: &ShaderReport) -> String {
     let mut out = String::new();
-    out.push_str("name,pipeline_addr,dispatch_count,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
+    out.push_str("name,pipeline_addr,dispatch_count,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
     for shader in &report.shaders {
         let source_file = shader
             .source_file
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        out.push_str(&format!(
-            "\"{}\",0x{:x},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\"{}\",{}\n",
-            shader.name.replace('"', "\"\""),
-            shader.pipeline_addr,
-            shader.dispatch_count,
-            shader.simd_groups,
+        let columns = vec![
+            format!("\"{}\"", shader.name.replace('"', "\"\"")),
+            format!("0x{:x}", shader.pipeline_addr),
+            shader.dispatch_count.to_string(),
+            shader.simd_groups.to_string(),
             option_csv(shader.simd_percent_of_total),
             option_csv(shader.total_duration_ns),
             option_csv(shader.percent_of_total),
             option_csv(shader.execution_cost_percent),
-            shader.execution_cost_samples,
-            shader.sample_count,
+            shader.execution_cost_samples.to_string(),
+            shader.sample_count.to_string(),
             option_csv(shader.avg_sampling_density),
             option_csv(shader.occupancy_percent),
             option_csv(shader.occupancy_confidence),
+            option_csv(shader.alu_utilization_percent),
+            option_csv(shader.last_level_cache_percent),
+            option_csv(shader.device_memory_bandwidth_gbps),
             option_csv(shader.temporary_register_count),
             option_csv(shader.spilled_bytes),
             option_csv(shader.threadgroup_memory),
@@ -649,9 +732,11 @@ pub fn format_csv(report: &ShaderReport) -> String {
             option_csv(shader.alu_instruction_count),
             option_csv(shader.branch_instruction_count),
             option_csv(shader.compilation_time_ms),
-            source_file.replace('"', "\"\""),
+            format!("\"{}\"", source_file.replace('"', "\"\"")),
             option_csv(shader.source_line),
-        ));
+        ];
+        out.push_str(&columns.join(","));
+        out.push('\n');
     }
     out
 }
@@ -1088,6 +1173,9 @@ mod tests {
                 avg_sampling_density: Some(0.2),
                 occupancy_percent: Some(37.5),
                 occupancy_confidence: Some(0.8),
+                alu_utilization_percent: Some(61.0),
+                last_level_cache_percent: Some(0.04),
+                device_memory_bandwidth_gbps: Some(8.2),
                 temporary_register_count: Some(48),
                 spilled_bytes: Some(256),
                 threadgroup_memory: Some(4096),
@@ -1109,6 +1197,8 @@ mod tests {
         assert!(output.contains("Samples"));
         assert!(output.contains("Samples/us"));
         assert!(output.contains("Occ %"));
+        assert!(output.contains("ALU %"));
+        assert!(output.contains("Dev BW"));
         assert!(output.contains("Regs"));
         assert!(output.contains("Spills"));
         assert!(output.contains("Compile ms"));
@@ -1116,6 +1206,8 @@ mod tests {
         assert!(output.contains("48.00"));
         assert!(output.contains("55.00"));
         assert!(output.contains("37.50"));
+        assert!(output.contains("61.00"));
+        assert!(output.contains("8.20"));
         assert!(output.contains("48"));
         assert!(output.contains("256"));
     }
@@ -1140,6 +1232,9 @@ mod tests {
                 avg_sampling_density: Some(0.2),
                 occupancy_percent: Some(37.5),
                 occupancy_confidence: Some(0.8),
+                alu_utilization_percent: Some(61.0),
+                last_level_cache_percent: Some(0.04),
+                device_memory_bandwidth_gbps: Some(8.2),
                 temporary_register_count: Some(48),
                 spilled_bytes: Some(256),
                 threadgroup_memory: Some(4096),
@@ -1154,6 +1249,8 @@ mod tests {
 
         let output = format_csv(&report);
         assert!(output.contains("simd_groups"));
+        assert!(output.contains("alu_utilization_percent"));
+        assert!(output.contains("device_memory_bandwidth_gbps"));
         assert!(output.contains("simd_percent_of_total"));
         assert!(output.contains("\"kernel\",0x1234,2,96,48"));
         assert!(output.contains("\"/tmp/kernel.metal\",42"));

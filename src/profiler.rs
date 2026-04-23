@@ -364,11 +364,19 @@ pub fn format_report(report: &ProfilerReport) -> String {
         out.push_str("-----------------------\n");
         for limiter in report.limiter_metrics.iter().take(8) {
             out.push_str(&format!(
-                "  - encoder {}: occ_mgr={} instr={} int_complex={} f32={} l1={}\n",
+                "  - encoder {}: occ_mgr={} alu={} launch={} instr={} int_complex={} ctrl={} f32={} l1={} llc={} dev_bw={} l1r_bw={} l1w_bw={}\n",
                 limiter.encoder_index,
                 limiter
                     .occupancy_manager
                     .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
+                    .alu_utilization
+                    .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
+                    .compute_shader_launch
+                    .map(|value| format!("{value:.3}%"))
                     .unwrap_or_else(|| "-".to_owned()),
                 limiter
                     .instruction_throughput
@@ -379,12 +387,32 @@ pub fn format_report(report: &ProfilerReport) -> String {
                     .map(|value| format!("{value:.2}%"))
                     .unwrap_or_else(|| "-".to_owned()),
                 limiter
+                    .control_flow
+                    .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
                     .f32_limiter
                     .map(|value| format!("{value:.2}%"))
                     .unwrap_or_else(|| "-".to_owned()),
                 limiter
                     .l1_cache
                     .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
+                    .last_level_cache
+                    .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
+                    .device_memory_bandwidth_gbps
+                    .map(|value| format!("{value:.2} GB/s"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
+                    .buffer_l1_read_bandwidth_gbps
+                    .map(|value| format!("{value:.2} GB/s"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
+                    .buffer_l1_write_bandwidth_gbps
+                    .map(|value| format!("{value:.2} GB/s"))
                     .unwrap_or_else(|| "-".to_owned())
             ));
         }
@@ -1844,10 +1872,17 @@ mod tests {
             limiter_metrics: vec![counter::CounterLimiter {
                 encoder_index: 0,
                 occupancy_manager: Some(72.0),
+                alu_utilization: Some(61.0),
+                compute_shader_launch: Some(0.18),
                 instruction_throughput: Some(1.2),
                 integer_complex: Some(2.4),
+                control_flow: Some(0.09),
                 f32_limiter: Some(6.5),
                 l1_cache: Some(0.8),
+                last_level_cache: Some(0.04),
+                device_memory_bandwidth_gbps: Some(8.2),
+                buffer_l1_read_bandwidth_gbps: Some(2.3),
+                buffer_l1_write_bandwidth_gbps: Some(0.7),
             }],
             timeline_file_count: 1,
             counter_file_count: 2,

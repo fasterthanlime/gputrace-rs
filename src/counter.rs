@@ -11,10 +11,17 @@ use crate::profiler;
 pub struct CounterLimiter {
     pub encoder_index: usize,
     pub occupancy_manager: Option<f64>,
+    pub alu_utilization: Option<f64>,
+    pub compute_shader_launch: Option<f64>,
     pub instruction_throughput: Option<f64>,
     pub integer_complex: Option<f64>,
+    pub control_flow: Option<f64>,
     pub f32_limiter: Option<f64>,
     pub l1_cache: Option<f64>,
+    pub last_level_cache: Option<f64>,
+    pub device_memory_bandwidth_gbps: Option<f64>,
+    pub buffer_l1_read_bandwidth_gbps: Option<f64>,
+    pub buffer_l1_write_bandwidth_gbps: Option<f64>,
 }
 
 pub fn extract_limiters(profiler_dir: &Path) -> Vec<CounterLimiter> {
@@ -49,10 +56,17 @@ pub fn extract_limiters(profiler_dir: &Path) -> Vec<CounterLimiter> {
                     .or_insert_with(|| CounterLimiter {
                         encoder_index,
                         occupancy_manager: None,
+                        alu_utilization: None,
+                        compute_shader_launch: None,
                         instruction_throughput: None,
                         integer_complex: None,
+                        control_flow: None,
                         f32_limiter: None,
                         l1_cache: None,
+                        last_level_cache: None,
+                        device_memory_bandwidth_gbps: None,
+                        buffer_l1_read_bandwidth_gbps: None,
+                        buffer_l1_write_bandwidth_gbps: None,
                     });
                 continue;
             }
@@ -65,34 +79,24 @@ pub fn extract_limiters(profiler_dir: &Path) -> Vec<CounterLimiter> {
             let Some(record) = data.get(*offset..(*offset + record_size)) else {
                 continue;
             };
-            let values = extract_float_values(record, 0.001, 100.0, 10);
-            if values.is_empty() {
-                continue;
-            }
             let limiter = encoder_limiters
                 .entry(encoder_index)
                 .or_insert_with(|| CounterLimiter {
                     encoder_index,
                     occupancy_manager: None,
+                    alu_utilization: None,
+                    compute_shader_launch: None,
                     instruction_throughput: None,
                     integer_complex: None,
+                    control_flow: None,
                     f32_limiter: None,
                     l1_cache: None,
+                    last_level_cache: None,
+                    device_memory_bandwidth_gbps: None,
+                    buffer_l1_read_bandwidth_gbps: None,
+                    buffer_l1_write_bandwidth_gbps: None,
                 });
-            for value in values {
-                if (50.0..=100.0).contains(&value) && limiter.occupancy_manager.is_none() {
-                    limiter.occupancy_manager = Some(value);
-                } else if (0.01..=5.0).contains(&value) && limiter.instruction_throughput.is_none()
-                {
-                    limiter.instruction_throughput = Some(value);
-                } else if (0.01..=5.0).contains(&value) && limiter.integer_complex.is_none() {
-                    limiter.integer_complex = Some(value);
-                } else if (0.01..=10.0).contains(&value) && limiter.f32_limiter.is_none() {
-                    limiter.f32_limiter = Some(value);
-                } else if (0.01..=5.0).contains(&value) && limiter.l1_cache.is_none() {
-                    limiter.l1_cache = Some(value);
-                }
-            }
+            classify_record_metrics(record, limiter);
         }
     }
 
@@ -103,6 +107,94 @@ pub fn extract_limiters_for_trace(path: &Path) -> Vec<CounterLimiter> {
     profiler::find_profiler_directory(path)
         .map(|dir| extract_limiters(&dir))
         .unwrap_or_default()
+}
+
+fn classify_record_metrics(record: &[u8], limiter: &mut CounterLimiter) {
+    let percent_values = extract_float_values(record, 0.001, 100.0, 64);
+    let bandwidth_values = extract_float_values(record, 0.1, 20.0, 24);
+
+    let mut high_values = percent_values
+        .iter()
+        .copied()
+        .filter(|value| (10.0..=100.0).contains(value))
+        .collect::<Vec<_>>();
+    high_values.sort_by(|left, right| right.partial_cmp(left).unwrap());
+    for value in high_values {
+        if limiter.occupancy_manager.is_none() && value >= 50.0 {
+            limiter.occupancy_manager = Some(value);
+            continue;
+        }
+        if limiter.alu_utilization.is_none() {
+            limiter.alu_utilization = Some(value);
+        }
+    }
+
+    let mut tiny_values = percent_values
+        .iter()
+        .copied()
+        .filter(|value| (0.001..=0.25).contains(value))
+        .collect::<Vec<_>>();
+    tiny_values.sort_by(|left, right| right.partial_cmp(left).unwrap());
+    for value in tiny_values {
+        if limiter.compute_shader_launch.is_none() {
+            limiter.compute_shader_launch = Some(value);
+            continue;
+        }
+        if limiter.l1_cache.is_none() {
+            limiter.l1_cache = Some(value);
+            continue;
+        }
+        if limiter.last_level_cache.is_none() {
+            limiter.last_level_cache = Some(value);
+            continue;
+        }
+        if limiter.control_flow.is_none() {
+            limiter.control_flow = Some(value);
+        }
+    }
+
+    let mut medium_values = percent_values
+        .iter()
+        .copied()
+        .filter(|value| (0.25..=10.0).contains(value))
+        .collect::<Vec<_>>();
+    medium_values.sort_by(|left, right| right.partial_cmp(left).unwrap());
+    for value in medium_values {
+        if limiter.f32_limiter.is_none() && value >= 4.0 {
+            limiter.f32_limiter = Some(value);
+            continue;
+        }
+        if limiter.integer_complex.is_none() && value >= 1.0 {
+            limiter.integer_complex = Some(value);
+            continue;
+        }
+        if limiter.instruction_throughput.is_none() {
+            limiter.instruction_throughput = Some(value);
+            continue;
+        }
+        if limiter.control_flow.is_none() {
+            limiter.control_flow = Some(value);
+        }
+    }
+
+    let mut bandwidth_candidates = bandwidth_values
+        .into_iter()
+        .filter(|value| value.is_finite() && *value >= 0.1)
+        .collect::<Vec<_>>();
+    bandwidth_candidates.sort_by(|left, right| right.partial_cmp(left).unwrap());
+    for value in bandwidth_candidates {
+        if limiter.device_memory_bandwidth_gbps.is_none() && value >= 1.0 {
+            limiter.device_memory_bandwidth_gbps = Some(value);
+            continue;
+        }
+        if limiter.buffer_l1_read_bandwidth_gbps.is_none() {
+            limiter.buffer_l1_read_bandwidth_gbps = Some(value);
+            continue;
+        }
+        if limiter.buffer_l1_write_bandwidth_gbps.is_none() {
+            limiter.buffer_l1_write_bandwidth_gbps = Some(value);
+        }
+    }
 }
 
 fn find_record_starts(data: &[u8]) -> Vec<usize> {
@@ -154,16 +246,25 @@ mod tests {
 
         let mut data = vec![0u8; 2400];
         data[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
-        data.extend_from_slice(&sample_record(&[72.0, 1.2, 2.4, 6.5, 0.8]));
+        data.extend_from_slice(&sample_record(&[
+            72.0, 58.0, 0.18, 0.12, 0.09, 0.04, 6.5, 2.4, 1.2, 8.2, 2.3, 0.7,
+        ]));
         fs::write(&path, data).unwrap();
 
         let limiters = extract_limiters(dir.path());
         assert_eq!(limiters.len(), 1);
         assert_eq!(limiters[0].encoder_index, 0);
         assert_eq!(limiters[0].occupancy_manager, Some(72.0));
-        assert!((limiters[0].instruction_throughput.unwrap() - 1.2).abs() < 0.001);
-        assert!((limiters[0].integer_complex.unwrap() - 2.4).abs() < 0.001);
-        assert!((limiters[0].f32_limiter.unwrap() - 6.5).abs() < 0.001);
-        assert!((limiters[0].l1_cache.unwrap() - 0.8).abs() < 0.001);
+        assert_eq!(limiters[0].alu_utilization, Some(58.0));
+        assert!((limiters[0].compute_shader_launch.unwrap() - 0.18).abs() < 0.001);
+        assert!((limiters[0].l1_cache.unwrap() - 0.12).abs() < 0.001);
+        assert!((limiters[0].last_level_cache.unwrap() - 0.09).abs() < 0.001);
+        assert!((limiters[0].control_flow.unwrap() - 0.04).abs() < 0.001);
+        assert!((limiters[0].f32_limiter.unwrap() - 8.2).abs() < 0.001);
+        assert!((limiters[0].integer_complex.unwrap() - 6.5).abs() < 0.001);
+        assert!((limiters[0].instruction_throughput.unwrap() - 2.4).abs() < 0.001);
+        assert!((limiters[0].device_memory_bandwidth_gbps.unwrap() - 8.2).abs() < 0.001);
+        assert!((limiters[0].buffer_l1_read_bandwidth_gbps.unwrap() - 6.5).abs() < 0.001);
+        assert!((limiters[0].buffer_l1_write_bandwidth_gbps.unwrap() - 2.4).abs() < 0.001);
     }
 }

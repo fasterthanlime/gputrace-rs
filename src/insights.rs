@@ -143,7 +143,8 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
     if let Some(summary) = &profiler_summary {
         let mut pipeline_stats_by_name = BTreeMap::new();
         let mut occupancy_by_name = BTreeMap::<String, (f64, f64, usize)>::new();
-        let mut limiter_by_name = BTreeMap::<String, (f64, f64, f64, f64, f64, usize)>::new();
+        let mut limiter_by_name =
+            BTreeMap::<String, (f64, f64, f64, f64, f64, f64, f64, f64, usize)>::new();
         for pipeline in &summary.pipelines {
             if let (Some(name), Some(stats)) = (&pipeline.function_name, &pipeline.stats) {
                 pipeline_stats_by_name
@@ -183,7 +184,10 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                 entry.2 += limiter.integer_complex.unwrap_or(0.0);
                 entry.3 += limiter.f32_limiter.unwrap_or(0.0);
                 entry.4 += limiter.l1_cache.unwrap_or(0.0);
-                entry.5 += 1;
+                entry.5 += limiter.control_flow.unwrap_or(0.0);
+                entry.6 += limiter.last_level_cache.unwrap_or(0.0);
+                entry.7 += limiter.device_memory_bandwidth_gbps.unwrap_or(0.0);
+                entry.8 += 1;
             }
         }
 
@@ -337,8 +341,17 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                 });
             }
 
-            if let Some((occ_mgr_sum, instr_sum, int_sum, f32_sum, l1_sum, count)) =
-                limiter_by_name.get(&kernel.name)
+            if let Some((
+                occ_mgr_sum,
+                instr_sum,
+                int_sum,
+                f32_sum,
+                l1_sum,
+                control_sum,
+                llc_sum,
+                dev_bw_sum,
+                count,
+            )) = limiter_by_name.get(&kernel.name)
                 && *count > 0
             {
                 let occ_mgr = occ_mgr_sum / *count as f64;
@@ -346,6 +359,9 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                 let integer_complex = int_sum / *count as f64;
                 let f32 = f32_sum / *count as f64;
                 let l1 = l1_sum / *count as f64;
+                let control_flow = control_sum / *count as f64;
+                let llc = llc_sum / *count as f64;
+                let device_bw = dev_bw_sum / *count as f64;
 
                 if occ_mgr >= 60.0 {
                     insights.push(PerformanceInsight {
@@ -405,6 +421,67 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                         impact: Some(
                             "Suggests memory locality, not pure ALU work, is constraining this shader."
                                 .to_owned(),
+                        ),
+                    });
+                }
+
+                if control_flow >= 2.0 {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Bottleneck,
+                        severity: InsightSeverity::Medium,
+                        shader_name: Some(kernel.name.clone()),
+                        title: format!("{} shows control-flow pressure", kernel.name),
+                        description: format!(
+                            "{} averages {:.2}% control-flow limiter pressure in counter samples.",
+                            kernel.name, control_flow
+                        ),
+                        recommendations: vec![
+                            "Inspect hot branches with `shader-hotspots` to reduce divergence.".to_owned(),
+                            "Prefer branchless or more uniform paths when the algorithm allows it.".to_owned(),
+                        ],
+                        impact: Some(
+                            "Suggests branch divergence or serialized control flow is constraining throughput."
+                                .to_owned(),
+                        ),
+                    });
+                }
+
+                if llc >= 2.0 {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Bottleneck,
+                        severity: InsightSeverity::Medium,
+                        shader_name: Some(kernel.name.clone()),
+                        title: format!("{} shows last-level cache pressure", kernel.name),
+                        description: format!(
+                            "{} averages {:.2}% last-level-cache limiter pressure in counter samples.",
+                            kernel.name, llc
+                        ),
+                        recommendations: vec![
+                            "Check whether working sets exceed L1 and spill into broader memory traffic.".to_owned(),
+                            "Use `buffer-access` and `shader-hotspots` to inspect large-stride reads.".to_owned(),
+                        ],
+                        impact: Some(
+                            "Suggests cache residency beyond L1 is limiting throughput.".to_owned(),
+                        ),
+                    });
+                }
+
+                if device_bw >= 5.0 && l1 >= 1.0 {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Bottleneck,
+                        severity: InsightSeverity::Medium,
+                        shader_name: Some(kernel.name.clone()),
+                        title: format!("{} is driving notable device-memory bandwidth", kernel.name),
+                        description: format!(
+                            "{} averages {:.2} GB/s of inferred device-memory bandwidth with {:.2}% L1 pressure.",
+                            kernel.name, device_bw, l1
+                        ),
+                        recommendations: vec![
+                            "Reduce redundant global-memory traffic before micro-optimizing arithmetic.".to_owned(),
+                            "Consider staging hot data into threadgroup memory if occupancy stays acceptable.".to_owned(),
+                        ],
+                        impact: Some(
+                            "Points to memory-system pressure rather than pure ALU throughput.".to_owned(),
                         ),
                     });
                 }
