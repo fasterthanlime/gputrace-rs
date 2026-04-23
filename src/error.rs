@@ -14,6 +14,8 @@ pub enum Error {
     InvalidTrace(&'static str),
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

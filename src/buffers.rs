@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::trace::TraceBundle;
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,6 +53,18 @@ pub struct BufferInventoryChange {
     pub right_aliases: usize,
     pub left_bindings: usize,
     pub right_bindings: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferInspection {
+    pub requested_name: String,
+    pub resolved_name: String,
+    pub resolved_path: PathBuf,
+    pub resolved_from_symlink: bool,
+    pub file_size: usize,
+    pub shown_bytes: usize,
+    pub format: String,
+    pub rendered: String,
 }
 
 pub fn analyze(trace: &TraceBundle) -> Result<BufferInventory> {
@@ -230,6 +243,60 @@ pub fn markdown_diff(report: &BufferInventoryDiff) -> String {
                 change.right_bindings
             ));
         }
+    }
+    out
+}
+
+pub fn inspect(
+    trace: &TraceBundle,
+    buffer_name: &str,
+    num_bytes: usize,
+    format: &str,
+) -> Result<BufferInspection> {
+    let (resolved_name, resolved_path, resolved_from_symlink) =
+        resolve_buffer_path(&trace.path, buffer_name)?;
+    let data = fs::read(&resolved_path)?;
+    let shown_bytes = num_bytes.min(data.len());
+    let slice = &data[..shown_bytes];
+    let rendered = match format {
+        "hex" => format_hex_dump(slice),
+        "float32" => format_f32(slice),
+        "int32" => format_i32(slice),
+        "uint32" => format_u32(slice),
+        "float16" => format_f16(slice),
+        _ => {
+            return Err(Error::InvalidInput(format!(
+                "unknown inspect format: {format} (expected hex, float32, int32, uint32, float16)"
+            )));
+        }
+    };
+    Ok(BufferInspection {
+        requested_name: buffer_name.to_owned(),
+        resolved_name,
+        resolved_path,
+        resolved_from_symlink,
+        file_size: data.len(),
+        shown_bytes,
+        format: format.to_owned(),
+        rendered,
+    })
+}
+
+pub fn format_inspection(report: &BufferInspection) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Buffer: {}\n", report.requested_name));
+    if report.resolved_from_symlink {
+        out.push_str(&format!("Resolved: {}\n", report.resolved_name));
+    }
+    out.push_str(&format!("Path: {}\n", report.resolved_path.display()));
+    out.push_str(&format!("Size: {} bytes\n", report.file_size));
+    out.push_str(&format!(
+        "Showing: {} bytes as {}\n\n",
+        report.shown_bytes, report.format
+    ));
+    out.push_str(&report.rendered);
+    if !report.rendered.ends_with('\n') {
+        out.push('\n');
     }
     out
 }
@@ -449,6 +516,149 @@ fn scan_buffer_files(
     Ok(buffers)
 }
 
+fn resolve_buffer_path(trace_path: &Path, buffer_name: &str) -> Result<(String, PathBuf, bool)> {
+    let path = trace_path.join(buffer_name);
+    let meta = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::InvalidInput(format!("buffer not found: {buffer_name}"))
+        } else {
+            error.into()
+        }
+    })?;
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(&path)?;
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            trace_path.join(&target)
+        };
+        let resolved_name = resolved
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(buffer_name)
+            .to_owned();
+        Ok((resolved_name, resolved, true))
+    } else {
+        Ok((buffer_name.to_owned(), path, false))
+    }
+}
+
+fn format_hex_dump(data: &[u8]) -> String {
+    const BYTES_PER_LINE: usize = 16;
+    let mut out = String::new();
+    for offset in (0..data.len()).step_by(BYTES_PER_LINE) {
+        let end = (offset + BYTES_PER_LINE).min(data.len());
+        let line = &data[offset..end];
+        out.push_str(&format!("{offset:08x}  "));
+        for i in 0..8 {
+            if let Some(byte) = line.get(i) {
+                out.push_str(&format!("{byte:02x} "));
+            } else {
+                out.push_str("   ");
+            }
+        }
+        out.push(' ');
+        for i in 8..16 {
+            if let Some(byte) = line.get(i) {
+                out.push_str(&format!("{byte:02x} "));
+            } else {
+                out.push_str("   ");
+            }
+        }
+        out.push_str(" |");
+        for byte in line {
+            let ch = if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            };
+            out.push(ch);
+        }
+        out.push_str("|\n");
+    }
+    out
+}
+
+fn format_f32(data: &[u8]) -> String {
+    format_u32_chunks(data, 4, |chunk| {
+        format!(
+            "{:12.6}",
+            f32::from_bits(u32::from_le_bytes(chunk.try_into().unwrap()))
+        )
+    })
+}
+
+fn format_i32(data: &[u8]) -> String {
+    format_u32_chunks(data, 4, |chunk| {
+        format!("{:12}", i32::from_le_bytes(chunk.try_into().unwrap()))
+    })
+}
+
+fn format_u32(data: &[u8]) -> String {
+    format_u32_chunks(data, 4, |chunk| {
+        format!("{:12}", u32::from_le_bytes(chunk.try_into().unwrap()))
+    })
+}
+
+fn format_f16(data: &[u8]) -> String {
+    format_u32_chunks(data, 2, |chunk| {
+        format!(
+            "{:12.6}",
+            half_to_f32(u16::from_le_bytes(chunk.try_into().unwrap()))
+        )
+    })
+}
+
+fn format_u32_chunks<F>(data: &[u8], stride: usize, render: F) -> String
+where
+    F: Fn(&[u8]) -> String,
+{
+    let values_per_line = 8;
+    let mut out = String::new();
+    let mut count = 0usize;
+    for offset in (0..data.len()).step_by(stride) {
+        if offset + stride > data.len() {
+            break;
+        }
+        if count.is_multiple_of(values_per_line) {
+            if count > 0 {
+                out.push('\n');
+            }
+            out.push_str(&format!("[{count:04}] "));
+        }
+        out.push_str(&render(&data[offset..offset + stride]));
+        out.push(' ');
+        count += 1;
+    }
+    if data.len() % stride != 0 {
+        out.push_str(&format!(
+            "\n\nWarning: trailing {} byte(s) ignored\n",
+            data.len() % stride
+        ));
+    } else if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 0x1) as u32;
+    let exponent = ((bits >> 10) & 0x1f) as u32;
+    let mantissa = (bits & 0x03ff) as u32;
+    let f32_bits = if exponent == 0 {
+        if mantissa == 0 {
+            sign << 31
+        } else {
+            sign << 31
+        }
+    } else if exponent == 0x1f {
+        (sign << 31) | 0x7f80_0000 | (mantissa << 13)
+    } else {
+        (sign << 31) | ((exponent + 112) << 23) | (mantissa << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
 fn is_bufferish(name: &str) -> bool {
     name.starts_with("MTLBuffer-") || name.starts_with("MTLHeap-")
 }
@@ -545,5 +755,25 @@ mod tests {
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].name, "MTLBuffer-1-0");
         assert_eq!(diff.changed[0].size_delta, 32);
+    }
+
+    #[test]
+    fn formats_hex_dump() {
+        let rendered = format_hex_dump(b"hello world");
+        assert!(rendered.contains("68 65 6c 6c 6f"));
+        assert!(rendered.contains("|hello world|"));
+    }
+
+    #[test]
+    fn formats_float32_chunks() {
+        let data = [
+            0f32.to_le_bytes().to_vec(),
+            1.5f32.to_le_bytes().to_vec(),
+            (-2.0f32).to_le_bytes().to_vec(),
+        ]
+        .concat();
+        let rendered = format_f32(&data);
+        assert!(rendered.contains("1.5"));
+        assert!(rendered.contains("-2"));
     }
 }

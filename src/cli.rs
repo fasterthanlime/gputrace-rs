@@ -65,6 +65,16 @@ enum BuffersCommand {
         #[arg(short, long, default_value = "table")]
         format: String,
     },
+    Inspect {
+        trace: PathBuf,
+        buffer: String,
+        #[arg(long, default_value_t = 256)]
+        bytes: usize,
+        #[arg(long = "inspect-format", default_value = "hex")]
+        inspect_format: String,
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
     Diff {
         left: PathBuf,
         right: PathBuf,
@@ -123,6 +133,23 @@ pub fn run() -> Result<()> {
                     "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                     _ => {
                         return Err(crate::Error::Unsupported("unknown buffers list format"));
+                    }
+                }
+            }
+            BuffersCommand::Inspect {
+                trace,
+                buffer,
+                bytes,
+                inspect_format,
+                format,
+            } => {
+                let trace = TraceBundle::open(trace)?;
+                let report = buffers::inspect(&trace, &buffer, bytes, &inspect_format)?;
+                match format.as_str() {
+                    "text" | "table" => print!("{}", buffers::format_inspection(&report)),
+                    "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                    _ => {
+                        return Err(crate::Error::Unsupported("unknown buffers inspect format"));
                     }
                 }
             }
