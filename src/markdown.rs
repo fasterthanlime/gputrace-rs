@@ -180,6 +180,10 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
 }
 
 pub fn diff_report(report: &DiffReport) -> String {
+    diff_report_with_limit(report, 10)
+}
+
+pub fn diff_report_with_limit(report: &DiffReport, limit: usize) -> String {
     let mut out = String::new();
     out.push_str("# Trace Diff\n\n");
     push_metric_block(
@@ -194,7 +198,7 @@ pub fn diff_report(report: &DiffReport) -> String {
         &mut out,
         "Summary",
         report.summary.iter().map(String::as_str),
-        10,
+        limit,
     );
     if !report.kernel_changes.is_empty() {
         push_section(
@@ -206,7 +210,7 @@ pub fn diff_report(report: &DiffReport) -> String {
                     change.name, change.left_dispatches, change.right_dispatches, change.delta
                 )
             }),
-            10,
+            limit,
         );
     }
     if !report.kernel_timing_changes.is_empty() {
@@ -224,7 +228,7 @@ pub fn diff_report(report: &DiffReport) -> String {
                     change.right_percent_of_total
                 )
             }),
-            10,
+            limit,
         );
     }
     if !report.counter_metric_changes.is_empty() {
@@ -263,7 +267,7 @@ pub fn diff_report(report: &DiffReport) -> String {
                     option_metric(change.right_buffer_l1_write_bandwidth_gbps),
                 )
             }),
-            10,
+            limit,
         );
     }
     if !report.buffer_changes.is_empty() {
@@ -284,7 +288,7 @@ pub fn diff_report(report: &DiffReport) -> String {
                 change.right_command_buffers
                 )
             }),
-            10,
+            limit,
         );
     }
     if !report.buffer_lifecycle_changes.is_empty() {
@@ -304,7 +308,7 @@ pub fn diff_report(report: &DiffReport) -> String {
                     change.dispatch_span_delta
                 )
             }),
-            10,
+            limit,
         );
     }
     out
@@ -592,5 +596,8 @@ mod tests {
             "`buf` [changed]: uses 1 -> 3 (+2), encoders 1 -> 2, command buffers 1 -> 2"
         ));
         assert!(rendered.contains("_Showing 10 of 11 entries._"));
+
+        let limited = diff_report_with_limit(&report, 3);
+        assert!(limited.contains("_Showing 3 of 11 entries._"));
     }
 }

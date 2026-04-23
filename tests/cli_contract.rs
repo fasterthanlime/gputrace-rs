@@ -391,6 +391,19 @@ fn dump_records_help_keeps_filters() {
 }
 
 #[test]
+fn diff_help_keeps_markdown_and_format_outputs() {
+    let help = render_help(&["diff"]);
+
+    assert!(help.contains("<LEFT>"));
+    assert!(help.contains("<RIGHT>"));
+    assert!(help.contains("--markdown"));
+    assert!(help.contains("--json"));
+    assert!(help.contains("--md-out <MD_OUT>"));
+    assert!(help.contains("--format <FORMAT>"));
+    assert!(help.contains("--limit <LIMIT>"));
+}
+
+#[test]
 fn buffers_help_lists_subcommands() {
     let help = render_help(&["buffers"]);
 
@@ -471,6 +484,18 @@ fn important_top_level_commands_parse_their_existing_contracts() {
         ],
         vec!["gputrace", "fences", "trace.gputrace", "--format", "json"],
         vec!["gputrace", "profiler", "trace.gputrace", "--format", "json"],
+        vec![
+            "gputrace",
+            "diff",
+            "left.gputrace",
+            "right.gputrace",
+            "--format",
+            "markdown",
+            "--md-out",
+            "diff.md",
+            "--limit",
+            "5",
+        ],
         vec![
             "gputrace",
             "mtlb-inventory",

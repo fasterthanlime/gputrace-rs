@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 use std::{io, io::Write};
 
@@ -113,6 +114,14 @@ struct DiffArgs {
     right: PathBuf,
     #[arg(long)]
     markdown: bool,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    md_out: Option<PathBuf>,
+    #[arg(short, long)]
+    format: Option<String>,
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
 }
 
 #[derive(Debug, Args)]
@@ -1096,10 +1105,24 @@ pub fn run() -> Result<()> {
         }
         CommandSet::Diff(args) => {
             let report = diff::diff_paths(args.left, args.right)?;
-            if args.markdown {
-                print!("{}", markdown::diff_report(&report));
-            } else {
+            if let Some(path) = args.md_out.as_ref() {
+                fs::write(path, markdown::diff_report_with_limit(&report, args.limit))?;
+            }
+
+            let format =
+                args.format
+                    .as_deref()
+                    .unwrap_or(if args.markdown { "markdown" } else { "json" });
+            if args.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                match format {
+                    "markdown" | "md" | "text" => {
+                        print!("{}", markdown::diff_report_with_limit(&report, args.limit));
+                    }
+                    "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                    _ => return Err(crate::Error::Unsupported("unknown diff format")),
+                }
             }
         }
         CommandSet::Markdown(args) => match args.command {
