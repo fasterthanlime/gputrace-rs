@@ -3,6 +3,7 @@ pub mod apicalls;
 pub mod automation;
 pub mod buffer_timeline;
 pub mod buffers;
+pub mod clear_buffers;
 pub mod cli;
 pub mod commands;
 pub mod correlate;
