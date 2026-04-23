@@ -26,14 +26,27 @@ pub struct KernelChange {
 #[derive(Debug, Clone, Serialize)]
 pub struct BufferChange {
     pub name: String,
+    pub status: BufferChangeStatus,
     pub left_uses: usize,
     pub right_uses: usize,
+    pub left_encoders: usize,
+    pub right_encoders: usize,
+    pub left_command_buffers: usize,
+    pub right_command_buffers: usize,
     pub delta: isize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum BufferChangeStatus {
+    Added,
+    Removed,
+    Changed,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BufferLifecycleChange {
     pub name: String,
+    pub status: BufferChangeStatus,
     pub left_command_buffer_span: usize,
     pub right_command_buffer_span: usize,
     pub command_buffer_span_delta: isize,
@@ -55,6 +68,14 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
     let buffer_lifecycle_changes = diff_buffer_lifecycles(&left_report, &right_report);
     let kernel_changes = diff_kernel_stats(&left_report, &right_report);
     let mut summary = Vec::new();
+    let added_buffers = buffer_changes
+        .iter()
+        .filter(|change| change.status == BufferChangeStatus::Added)
+        .count();
+    let removed_buffers = buffer_changes
+        .iter()
+        .filter(|change| change.status == BufferChangeStatus::Removed)
+        .count();
 
     if left_report.trace.capture_len != right_report.trace.capture_len {
         summary.push(format!(
@@ -104,10 +125,29 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
             left_report.buffer_count, right_report.buffer_count
         ));
     }
+    if left_report.shared_buffer_count != right_report.shared_buffer_count {
+        summary.push(format!(
+            "Shared buffer count changed: {} -> {}",
+            left_report.shared_buffer_count, right_report.shared_buffer_count
+        ));
+    }
+    if added_buffers > 0 || removed_buffers > 0 {
+        summary.push(format!(
+            "Buffer inventory changed: {added_buffers} added, {removed_buffers} removed"
+        ));
+    }
     if let Some(change) = buffer_changes.first() {
         summary.push(format!(
-            "Largest buffer use delta: {} ({} -> {}, delta {:+})",
-            change.name, change.left_uses, change.right_uses, change.delta
+            "Largest buffer use delta: {} [{}] ({} -> {}, delta {:+})",
+            change.name,
+            match change.status {
+                BufferChangeStatus::Added => "added",
+                BufferChangeStatus::Removed => "removed",
+                BufferChangeStatus::Changed => "changed",
+            },
+            change.left_uses,
+            change.right_uses,
+            change.delta
         ));
     }
     if let Some(change) = buffer_lifecycle_changes.first() {
@@ -152,25 +192,44 @@ fn diff_buffer_stats(left: &AnalysisReport, right: &AnalysisReport) -> Vec<Buffe
     let left_map: std::collections::BTreeMap<_, _> = left
         .buffer_stats
         .iter()
-        .map(|stat| (stat.name.as_str(), stat.use_count))
+        .map(|stat| (stat.name.as_str(), stat))
         .collect();
     let right_map: std::collections::BTreeMap<_, _> = right
         .buffer_stats
         .iter()
-        .map(|stat| (stat.name.as_str(), stat.use_count))
+        .map(|stat| (stat.name.as_str(), stat))
         .collect();
 
     let mut changes = Vec::new();
     for name in names {
-        let left_uses = left_map.get(name.as_str()).copied().unwrap_or_default();
-        let right_uses = right_map.get(name.as_str()).copied().unwrap_or_default();
-        if left_uses == right_uses {
+        let left_stat = left_map.get(name.as_str()).copied();
+        let right_stat = right_map.get(name.as_str()).copied();
+        let left_uses = left_stat.map_or(0, |stat| stat.use_count);
+        let right_uses = right_stat.map_or(0, |stat| stat.use_count);
+        let left_encoders = left_stat.map_or(0, |stat| stat.encoder_count);
+        let right_encoders = right_stat.map_or(0, |stat| stat.encoder_count);
+        let left_command_buffers = left_stat.map_or(0, |stat| stat.command_buffer_count);
+        let right_command_buffers = right_stat.map_or(0, |stat| stat.command_buffer_count);
+        if left_uses == right_uses
+            && left_encoders == right_encoders
+            && left_command_buffers == right_command_buffers
+        {
             continue;
         }
+        let status = match (left_stat, right_stat) {
+            (None, Some(_)) => BufferChangeStatus::Added,
+            (Some(_), None) => BufferChangeStatus::Removed,
+            _ => BufferChangeStatus::Changed,
+        };
         changes.push(BufferChange {
             name,
+            status,
             left_uses,
             right_uses,
+            left_encoders,
+            right_encoders,
+            left_command_buffers,
+            right_command_buffers,
             delta: right_uses as isize - left_uses as isize,
         });
     }
@@ -243,30 +302,22 @@ fn diff_buffer_lifecycles(
     let left_map: std::collections::BTreeMap<_, _> = left
         .buffer_lifecycles
         .iter()
-        .map(|stat| {
-            (
-                stat.name.as_str(),
-                (stat.command_buffer_span, stat.dispatch_span),
-            )
-        })
+        .map(|stat| (stat.name.as_str(), stat))
         .collect();
     let right_map: std::collections::BTreeMap<_, _> = right
         .buffer_lifecycles
         .iter()
-        .map(|stat| {
-            (
-                stat.name.as_str(),
-                (stat.command_buffer_span, stat.dispatch_span),
-            )
-        })
+        .map(|stat| (stat.name.as_str(), stat))
         .collect();
 
     let mut changes = Vec::new();
     for name in names {
-        let (left_command_buffer_span, left_dispatch_span) =
-            left_map.get(name.as_str()).copied().unwrap_or_default();
-        let (right_command_buffer_span, right_dispatch_span) =
-            right_map.get(name.as_str()).copied().unwrap_or_default();
+        let left_stat = left_map.get(name.as_str()).copied();
+        let right_stat = right_map.get(name.as_str()).copied();
+        let left_command_buffer_span = left_stat.map_or(0, |stat| stat.command_buffer_span);
+        let left_dispatch_span = left_stat.map_or(0, |stat| stat.dispatch_span);
+        let right_command_buffer_span = right_stat.map_or(0, |stat| stat.command_buffer_span);
+        let right_dispatch_span = right_stat.map_or(0, |stat| stat.dispatch_span);
         if left_command_buffer_span == right_command_buffer_span
             && left_dispatch_span == right_dispatch_span
         {
@@ -275,8 +326,14 @@ fn diff_buffer_lifecycles(
         let command_buffer_span_delta =
             right_command_buffer_span as isize - left_command_buffer_span as isize;
         let dispatch_span_delta = right_dispatch_span as isize - left_dispatch_span as isize;
+        let status = match (left_stat, right_stat) {
+            (None, Some(_)) => BufferChangeStatus::Added,
+            (Some(_), None) => BufferChangeStatus::Removed,
+            _ => BufferChangeStatus::Changed,
+        };
         changes.push(BufferLifecycleChange {
             name,
+            status,
             left_command_buffer_span,
             right_command_buffer_span,
             command_buffer_span_delta,
@@ -305,6 +362,7 @@ fn diff_buffer_lifecycles(
 mod tests {
     use super::*;
     use crate::analysis::BufferLifecycle;
+    use crate::analysis::BufferStat;
     use crate::trace::{KernelStat, TraceSummary};
 
     #[test]
@@ -327,6 +385,10 @@ mod tests {
             pipeline_function_count: 0,
             kernel_count: 2,
             buffer_count: 0,
+            shared_buffer_count: 0,
+            single_use_buffer_count: 0,
+            short_lived_buffer_count: 0,
+            long_lived_buffer_count: 0,
             kernel_stats: vec![
                 KernelStat {
                     name: "a".into(),
@@ -394,8 +456,22 @@ mod tests {
             pipeline_function_count: 0,
             kernel_count: 0,
             buffer_count: 0,
+            shared_buffer_count: 0,
+            single_use_buffer_count: 0,
+            short_lived_buffer_count: 0,
+            long_lived_buffer_count: 0,
             kernel_stats: vec![],
-            buffer_stats: vec![],
+            buffer_stats: vec![BufferStat {
+                name: "a".into(),
+                address: Some(1),
+                kernel_count: 1,
+                use_count: 2,
+                dispatch_count: 2,
+                encoder_count: 1,
+                command_buffer_count: 1,
+                first_dispatch_index: 0,
+                last_dispatch_index: 1,
+            }],
             buffer_lifecycles: vec![
                 BufferLifecycle {
                     name: "a".into(),
@@ -408,6 +484,7 @@ mod tests {
                     dispatch_span: 2,
                     use_count: 2,
                     kernel_count: 1,
+                    encoder_count: 1,
                 },
                 BufferLifecycle {
                     name: "b".into(),
@@ -420,11 +497,36 @@ mod tests {
                     dispatch_span: 4,
                     use_count: 3,
                     kernel_count: 2,
+                    encoder_count: 2,
                 },
             ],
             findings: vec![],
         };
         let right = AnalysisReport {
+            buffer_stats: vec![
+                BufferStat {
+                    name: "a".into(),
+                    address: Some(1),
+                    kernel_count: 2,
+                    use_count: 5,
+                    dispatch_count: 5,
+                    encoder_count: 2,
+                    command_buffer_count: 3,
+                    first_dispatch_index: 0,
+                    last_dispatch_index: 5,
+                },
+                BufferStat {
+                    name: "c".into(),
+                    address: Some(3),
+                    kernel_count: 1,
+                    use_count: 1,
+                    dispatch_count: 1,
+                    encoder_count: 1,
+                    command_buffer_count: 1,
+                    first_dispatch_index: 7,
+                    last_dispatch_index: 7,
+                },
+            ],
             buffer_lifecycles: vec![
                 BufferLifecycle {
                     name: "a".into(),
@@ -437,6 +539,7 @@ mod tests {
                     dispatch_span: 6,
                     use_count: 4,
                     kernel_count: 2,
+                    encoder_count: 2,
                 },
                 BufferLifecycle {
                     name: "c".into(),
@@ -449,14 +552,21 @@ mod tests {
                     dispatch_span: 1,
                     use_count: 1,
                     kernel_count: 1,
+                    encoder_count: 1,
                 },
             ],
             ..left.clone()
         };
 
+        let buffer_changes = diff_buffer_stats(&left, &right);
+        assert_eq!(buffer_changes.len(), 2);
+        assert_eq!(buffer_changes[0].name, "a");
+        assert_eq!(buffer_changes[0].status, BufferChangeStatus::Changed);
+
         let changes = diff_buffer_lifecycles(&left, &right);
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0].name, "a");
+        assert_eq!(changes[0].status, BufferChangeStatus::Changed);
         assert_eq!(changes[0].command_buffer_span_delta, 2);
         assert_eq!(changes[0].dispatch_span_delta, 4);
     }

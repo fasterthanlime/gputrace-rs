@@ -1,6 +1,6 @@
 mod mtsp;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -127,6 +127,10 @@ pub struct BufferAccessStat {
     pub address: Option<u64>,
     pub use_count: usize,
     pub dispatch_count: usize,
+    pub encoder_count: usize,
+    pub command_buffer_count: usize,
+    pub first_dispatch_index: usize,
+    pub last_dispatch_index: usize,
     pub kernels: BTreeMap<String, usize>,
 }
 
@@ -141,6 +145,7 @@ pub struct BufferLifecycleStat {
     pub command_buffer_span: usize,
     pub dispatch_span: usize,
     pub use_count: usize,
+    pub encoder_count: usize,
     pub kernels: BTreeMap<String, usize>,
 }
 
@@ -383,6 +388,8 @@ impl TraceBundle {
     pub fn analyze_buffers(&self) -> Result<BTreeMap<String, BufferAccessStat>> {
         let regions = self.command_buffer_regions()?;
         let mut stats = BTreeMap::new();
+        let mut encoder_sets: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+        let mut command_buffer_sets: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
 
         for region in regions {
             for dispatch in region.dispatches {
@@ -402,13 +409,31 @@ impl TraceBundle {
                             address: Some(buffer.address),
                             use_count: 0,
                             dispatch_count: 0,
+                            encoder_count: 0,
+                            command_buffer_count: 0,
+                            first_dispatch_index: dispatch.index,
+                            last_dispatch_index: dispatch.index,
                             kernels: BTreeMap::new(),
                         });
                     entry.use_count += 1;
                     entry.dispatch_count += 1;
+                    entry.first_dispatch_index = entry.first_dispatch_index.min(dispatch.index);
+                    entry.last_dispatch_index = entry.last_dispatch_index.max(dispatch.index);
                     *entry.kernels.entry(kernel_name.clone()).or_default() += 1;
+                    command_buffer_sets
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(region.command_buffer.index);
+                    if let Some(encoder_id) = dispatch.encoder_id {
+                        encoder_sets.entry(name).or_default().insert(encoder_id);
+                    }
                 }
             }
+        }
+
+        for (name, entry) in &mut stats {
+            entry.encoder_count = encoder_sets.get(name).map_or(0, BTreeSet::len);
+            entry.command_buffer_count = command_buffer_sets.get(name).map_or(0, BTreeSet::len);
         }
 
         Ok(stats)
@@ -747,6 +772,7 @@ fn analyze_buffer_lifecycles_from_regions(
     regions: &[CommandBufferRegion],
 ) -> BTreeMap<String, BufferLifecycleStat> {
     let mut stats = BTreeMap::new();
+    let mut encoder_sets: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
 
     for region in regions {
         for dispatch in &region.dispatches {
@@ -771,6 +797,7 @@ fn analyze_buffer_lifecycles_from_regions(
                         command_buffer_span: 1,
                         dispatch_span: 1,
                         use_count: 0,
+                        encoder_count: 0,
                         kernels: BTreeMap::new(),
                     });
                 entry.first_command_buffer_index = entry
@@ -786,8 +813,15 @@ fn analyze_buffer_lifecycles_from_regions(
                 entry.dispatch_span = entry.last_dispatch_index - entry.first_dispatch_index + 1;
                 entry.use_count += 1;
                 *entry.kernels.entry(kernel_name.clone()).or_default() += 1;
+                if let Some(encoder_id) = dispatch.encoder_id {
+                    encoder_sets.entry(name).or_default().insert(encoder_id);
+                }
             }
         }
+    }
+
+    for (name, entry) in &mut stats {
+        entry.encoder_count = encoder_sets.get(name).map_or(0, BTreeSet::len);
     }
 
     stats

@@ -6,6 +6,10 @@ use crate::trace::{BufferLifecycleStat, TraceBundle};
 pub struct BufferTimelineReport {
     pub total_buffers: usize,
     pub total_allocations: usize,
+    pub shared_buffers: usize,
+    pub single_use_buffers: usize,
+    pub short_lived_buffers: usize,
+    pub long_lived_buffers: usize,
     pub average_command_buffer_lifetime: f64,
     pub average_dispatch_lifetime: f64,
     pub min_dispatch_index: usize,
@@ -25,6 +29,7 @@ pub struct BufferTimelineEntry {
     pub dispatch_span: usize,
     pub use_count: usize,
     pub kernel_count: usize,
+    pub encoder_count: usize,
 }
 
 pub fn analyze(trace: &TraceBundle) -> BufferTimelineReport {
@@ -43,6 +48,12 @@ pub fn analyze(trace: &TraceBundle) -> BufferTimelineReport {
 
     let total_buffers = buffers.len();
     let total_allocations = total_buffers;
+    let shared_buffers = buffers.iter().filter(|b| b.encoder_count > 1).count();
+    let single_use_buffers = buffers.iter().filter(|b| b.use_count == 1).count();
+    let short_lived_buffers = buffers
+        .iter()
+        .filter(|b| b.dispatch_span <= 2 && b.use_count <= 2)
+        .count();
     let average_command_buffer_lifetime = if total_buffers == 0 {
         0.0
     } else {
@@ -53,6 +64,13 @@ pub fn analyze(trace: &TraceBundle) -> BufferTimelineReport {
     } else {
         buffers.iter().map(|b| b.dispatch_span).sum::<usize>() as f64 / total_buffers as f64
     };
+    let long_lived_buffers = buffers
+        .iter()
+        .filter(|b| {
+            average_dispatch_lifetime > 0.0
+                && b.dispatch_span as f64 > average_dispatch_lifetime * 3.0
+        })
+        .count();
     let min_dispatch_index = buffers
         .iter()
         .map(|b| b.first_dispatch_index)
@@ -67,6 +85,10 @@ pub fn analyze(trace: &TraceBundle) -> BufferTimelineReport {
     BufferTimelineReport {
         total_buffers,
         total_allocations,
+        shared_buffers,
+        single_use_buffers,
+        short_lived_buffers,
+        long_lived_buffers,
         average_command_buffer_lifetime,
         average_dispatch_lifetime,
         min_dispatch_index,
@@ -96,6 +118,14 @@ pub fn format_summary(report: &BufferTimelineReport) -> String {
         report.average_dispatch_lifetime
     ));
     out.push_str(&format!(
+        "  Shared Buffers:        {}\n",
+        report.shared_buffers
+    ));
+    out.push_str(&format!(
+        "  Single-use Buffers:    {}\n",
+        report.single_use_buffers
+    ));
+    out.push_str(&format!(
         "  Dispatch Range:        {} - {} (span: {})\n\n",
         report.min_dispatch_index,
         report.max_dispatch_index,
@@ -114,12 +144,13 @@ pub fn format_summary(report: &BufferTimelineReport) -> String {
         .enumerate()
     {
         out.push_str(&format!(
-            "  [{}] {}: {} dispatches, {} command buffers, {} uses\n",
+            "  [{}] {}: {} dispatches, {} command buffers, {} uses, {} encoders\n",
             index + 1,
             display_name(buffer),
             buffer.dispatch_span,
             buffer.command_buffer_span,
-            buffer.use_count
+            buffer.use_count,
+            buffer.encoder_count
         ));
     }
     out.push('\n');
@@ -134,54 +165,46 @@ pub fn format_summary(report: &BufferTimelineReport) -> String {
         .enumerate()
     {
         out.push_str(&format!(
-            "  [{}] {}: {} uses across {} kernels\n",
+            "  [{}] {}: {} uses across {} kernels and {} encoders\n",
             index + 1,
             display_name(buffer),
             buffer.use_count,
-            buffer.kernel_count
+            buffer.kernel_count,
+            buffer.encoder_count
         ));
     }
     out.push('\n');
 
-    let short_lived = report
-        .buffers
-        .iter()
-        .filter(|buffer| buffer.dispatch_span <= 2 && buffer.use_count <= 2)
-        .count();
-    let single_use = report
-        .buffers
-        .iter()
-        .filter(|buffer| buffer.use_count == 1)
-        .count();
-    let long_lived = report
-        .buffers
-        .iter()
-        .filter(|buffer| {
-            buffer.dispatch_span as f64 > report.average_dispatch_lifetime * 3.0
-                && report.average_dispatch_lifetime > 0.0
-        })
-        .count();
-
     out.push_str("Optimization Insights:\n");
-    if short_lived > 0 {
+    if report.short_lived_buffers > 0 {
         out.push_str(&format!(
             "  - {} short-lived buffers detected; pooling may reduce churn\n",
-            short_lived
+            report.short_lived_buffers
         ));
     }
-    if single_use > 0 {
+    if report.single_use_buffers > 0 {
         out.push_str(&format!(
             "  - {} buffers are touched only once; review temporary allocations\n",
-            single_use
+            report.single_use_buffers
         ));
     }
-    if long_lived > 0 {
+    if report.shared_buffers > 0 {
+        out.push_str(&format!(
+            "  - {} buffers are shared across encoders; inspect synchronization and reuse\n",
+            report.shared_buffers
+        ));
+    }
+    if report.long_lived_buffers > 0 {
         out.push_str(&format!(
             "  - {} long-lived buffers span far more dispatches than average\n",
-            long_lived
+            report.long_lived_buffers
         ));
     }
-    if short_lived == 0 && single_use == 0 && long_lived == 0 {
+    if report.short_lived_buffers == 0
+        && report.single_use_buffers == 0
+        && report.shared_buffers == 0
+        && report.long_lived_buffers == 0
+    {
         out.push_str("  - No obvious lifecycle outliers detected\n");
     }
 
@@ -200,6 +223,10 @@ pub fn format_ascii(report: &BufferTimelineReport, width: usize) -> String {
         report.total_allocations
     ));
     out.push_str(&format!(
+        "  Shared Buffers:     {}\n",
+        report.shared_buffers
+    ));
+    out.push_str(&format!(
         "  Average Lifetime:   {:.1} dispatches\n",
         report.average_dispatch_lifetime
     ));
@@ -209,16 +236,17 @@ pub fn format_ascii(report: &BufferTimelineReport, width: usize) -> String {
     ));
 
     out.push_str(&format!(
-        "Buffer                  {:>6} {:>6} Timeline\n",
-        "uses", "kernels"
+        "Buffer                  {:>6} {:>6} {:>6} Timeline\n",
+        "uses", "kernels", "enc"
     ));
 
     for buffer in report.buffers.iter().take(20) {
         out.push_str(&format!(
-            "{:<22} {:>6} {:>6} {}\n",
+            "{:<22} {:>6} {:>6} {:>6} {}\n",
             truncate_label(&display_name(buffer), 22),
             buffer.use_count,
             buffer.kernel_count,
+            buffer.encoder_count,
             timeline_bar(
                 buffer.first_dispatch_index,
                 buffer.last_dispatch_index,
@@ -271,6 +299,7 @@ fn to_timeline_entry(buffer: BufferLifecycleStat) -> BufferTimelineEntry {
         dispatch_span: buffer.dispatch_span,
         use_count: buffer.use_count,
         kernel_count: buffer.kernels.len(),
+        encoder_count: buffer.encoder_count,
     }
 }
 
@@ -338,6 +367,10 @@ mod tests {
         let report = BufferTimelineReport {
             total_buffers: 1,
             total_allocations: 1,
+            shared_buffers: 0,
+            single_use_buffers: 0,
+            short_lived_buffers: 0,
+            long_lived_buffers: 0,
             average_command_buffer_lifetime: 2.0,
             average_dispatch_lifetime: 4.0,
             min_dispatch_index: 0,
@@ -353,6 +386,7 @@ mod tests {
                 dispatch_span: 5,
                 use_count: 2,
                 kernel_count: 1,
+                encoder_count: 1,
             }],
         };
 

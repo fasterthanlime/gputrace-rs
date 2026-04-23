@@ -40,7 +40,23 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
         report.pipeline_function_count
     ));
     out.push_str(&format!("* Kernels: `{}`\n\n", report.kernel_count));
-    out.push_str(&format!("* Buffers: `{}`\n\n", report.buffer_count));
+    out.push_str(&format!("* Buffers: `{}`\n", report.buffer_count));
+    out.push_str(&format!(
+        "* Shared buffers: `{}`\n",
+        report.shared_buffer_count
+    ));
+    out.push_str(&format!(
+        "* Single-use buffers: `{}`\n",
+        report.single_use_buffer_count
+    ));
+    out.push_str(&format!(
+        "* Short-lived buffers: `{}`\n",
+        report.short_lived_buffer_count
+    ));
+    out.push_str(&format!(
+        "* Long-lived buffers: `{}`\n\n",
+        report.long_lived_buffer_count
+    ));
     if report.findings.is_empty() {
         out.push_str("No findings yet.\n");
     } else {
@@ -63,8 +79,14 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
         out.push_str("\n## Buffers\n\n");
         for stat in report.buffer_stats.iter().take(10) {
             out.push_str(&format!(
-                "- `{}`: {} uses across {} kernels\n",
-                stat.name, stat.use_count, stat.kernel_count
+                "- `{}`: {} uses across {} kernels, {} encoders, {} command buffers, dispatches {}..{}\n",
+                stat.name,
+                stat.use_count,
+                stat.kernel_count,
+                stat.encoder_count,
+                stat.command_buffer_count,
+                stat.first_dispatch_index,
+                stat.last_dispatch_index
             ));
         }
     }
@@ -72,13 +94,14 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
         out.push_str("\n## Buffer Lifecycles\n\n");
         for stat in report.buffer_lifecycles.iter().take(10) {
             out.push_str(&format!(
-                "- `{}`: command buffers {}..{}, dispatches {}..{}, {} total uses\n",
+                "- `{}`: command buffers {}..{}, dispatches {}..{}, {} total uses, {} encoders\n",
                 stat.name,
                 stat.first_command_buffer_index,
                 stat.last_command_buffer_index,
                 stat.first_dispatch_index,
                 stat.last_dispatch_index,
-                stat.use_count
+                stat.use_count,
+                stat.encoder_count
             ));
         }
     }
@@ -106,8 +129,20 @@ pub fn diff_report(report: &DiffReport) -> String {
         out.push_str("\n## Buffer Changes\n\n");
         for change in report.buffer_changes.iter().take(10) {
             out.push_str(&format!(
-                "- `{}`: {} -> {} ({:+})\n",
-                change.name, change.left_uses, change.right_uses, change.delta
+                "- `{}` [{}]: uses {} -> {} ({:+}), encoders {} -> {}, command buffers {} -> {}\n",
+                change.name,
+                match change.status {
+                    crate::diff::BufferChangeStatus::Added => "added",
+                    crate::diff::BufferChangeStatus::Removed => "removed",
+                    crate::diff::BufferChangeStatus::Changed => "changed",
+                },
+                change.left_uses,
+                change.right_uses,
+                change.delta,
+                change.left_encoders,
+                change.right_encoders,
+                change.left_command_buffers,
+                change.right_command_buffers
             ));
         }
     }
@@ -115,8 +150,13 @@ pub fn diff_report(report: &DiffReport) -> String {
         out.push_str("\n## Buffer Lifetime Changes\n\n");
         for change in report.buffer_lifecycle_changes.iter().take(10) {
             out.push_str(&format!(
-                "- `{}`: command buffers {} -> {} ({:+}), dispatches {} -> {} ({:+})\n",
+                "- `{}` [{}]: command buffers {} -> {} ({:+}), dispatches {} -> {} ({:+})\n",
                 change.name,
+                match change.status {
+                    crate::diff::BufferChangeStatus::Added => "added",
+                    crate::diff::BufferChangeStatus::Removed => "removed",
+                    crate::diff::BufferChangeStatus::Changed => "changed",
+                },
                 change.left_command_buffer_span,
                 change.right_command_buffer_span,
                 change.command_buffer_span_delta,
