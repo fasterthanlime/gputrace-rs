@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::error::Result;
+use crate::profiler;
 use crate::trace::TraceBundle;
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +44,10 @@ pub struct KernelTiming {
 }
 
 pub fn report(trace: &TraceBundle) -> Result<TimingReport> {
+    if let Ok(summary) = profiler::stream_data_summary(&trace.path) {
+        return Ok(report_from_profiler(trace, &summary));
+    }
+
     let command_buffers = trace.command_buffers()?;
     let regions = trace.command_buffer_regions()?;
 
@@ -158,10 +163,107 @@ pub fn report(trace: &TraceBundle) -> Result<TimingReport> {
     })
 }
 
+fn report_from_profiler(
+    trace: &TraceBundle,
+    summary: &profiler::ProfilerStreamDataSummary,
+) -> TimingReport {
+    let command_buffers = trace.command_buffers().unwrap_or_default();
+
+    let command_buffer_timings = command_buffers
+        .iter()
+        .enumerate()
+        .map(|(index, cb)| CommandBufferTiming {
+            index: cb.index,
+            timestamp_ns: cb.timestamp,
+            duration_ns: command_buffers
+                .get(index + 1)
+                .and_then(|next| next.timestamp.checked_sub(cb.timestamp)),
+            encoder_count: 0,
+            dispatch_count: 0,
+        })
+        .collect::<Vec<_>>();
+
+    let encoders = summary
+        .encoder_timings
+        .iter()
+        .map(|encoder| EncoderTiming {
+            label: format!("encoder {}", encoder.index),
+            address: encoder.index as u64,
+            dispatch_count: summary
+                .dispatches
+                .iter()
+                .filter(|dispatch| dispatch.encoder_index == encoder.index)
+                .count(),
+            synthetic_duration_ns: encoder.duration_micros.saturating_mul(1_000),
+        })
+        .collect::<Vec<_>>();
+
+    let mut kernel_stats = BTreeMap::<String, KernelTiming>::new();
+    for dispatch in &summary.dispatches {
+        let name = dispatch
+            .function_name
+            .clone()
+            .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
+        let kernel = kernel_stats
+            .entry(name.clone())
+            .or_insert_with(|| KernelTiming {
+                name,
+                dispatch_count: 0,
+                synthetic_duration_ns: 0,
+                percent_of_total: 0.0,
+            });
+        kernel.dispatch_count += 1;
+        kernel.synthetic_duration_ns = kernel
+            .synthetic_duration_ns
+            .saturating_add(dispatch.duration_us.saturating_mul(1_000));
+    }
+
+    let total_duration_ns = summary.total_time_us.saturating_mul(1_000);
+    let mut kernels = kernel_stats.into_values().collect::<Vec<_>>();
+    for kernel in &mut kernels {
+        if total_duration_ns > 0 {
+            kernel.percent_of_total =
+                (kernel.synthetic_duration_ns as f64 / total_duration_ns as f64) * 100.0;
+        }
+    }
+    kernels.sort_by(|left, right| {
+        right
+            .synthetic_duration_ns
+            .cmp(&left.synthetic_duration_ns)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let mut encoders = encoders;
+    encoders.sort_by(|left, right| {
+        right
+            .synthetic_duration_ns
+            .cmp(&left.synthetic_duration_ns)
+            .then_with(|| left.label.cmp(&right.label))
+    });
+
+    TimingReport {
+        synthetic: false,
+        total_duration_ns,
+        command_buffer_count: command_buffer_timings.len(),
+        encoder_count: encoders.len(),
+        dispatch_count: summary.dispatches.len(),
+        command_buffers: command_buffer_timings,
+        encoders,
+        kernels,
+    }
+}
+
 pub fn format_report(report: &TimingReport) -> String {
     let mut out = String::new();
-    out.push_str("Synthetic timing report\n");
-    out.push_str("Derived from command-buffer timestamps and dispatch attribution.\n\n");
+    if report.synthetic {
+        out.push_str("Synthetic timing report\n");
+        out.push_str("Derived from command-buffer timestamps and dispatch attribution.\n\n");
+    } else {
+        out.push_str("Profiler-backed timing report\n");
+        out.push_str(
+            "Kernel, dispatch, and encoder timing come from streamData; command-buffer rows still use trace timestamps when available.\n\n",
+        );
+    }
     out.push_str(&format!(
         "total={} ns, command_buffers={}, encoders={}, dispatches={}\n\n",
         report.total_duration_ns,
