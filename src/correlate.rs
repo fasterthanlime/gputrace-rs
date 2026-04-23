@@ -34,6 +34,13 @@ pub struct CorrelatedShader {
     pub execution_cost_samples: usize,
     pub sample_count: usize,
     pub avg_sampling_density: f64,
+    pub occupancy_percent: Option<f64>,
+    pub occupancy_confidence: Option<f64>,
+    pub temporary_register_count: Option<i64>,
+    pub spilled_bytes: Option<i64>,
+    pub threadgroup_memory: Option<i64>,
+    pub instruction_count: Option<i64>,
+    pub compilation_time_ms: Option<f64>,
     pub encoder_count: usize,
     pub buffer_count: usize,
     pub source_file: Option<PathBuf>,
@@ -123,6 +130,13 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
             execution_cost_samples,
             sample_count,
             avg_sampling_density,
+            occupancy_percent: source.and_then(|shader| shader.occupancy_percent),
+            occupancy_confidence: source.and_then(|shader| shader.occupancy_confidence),
+            temporary_register_count: source.and_then(|shader| shader.temporary_register_count),
+            spilled_bytes: source.and_then(|shader| shader.spilled_bytes),
+            threadgroup_memory: source.and_then(|shader| shader.threadgroup_memory),
+            instruction_count: source.and_then(|shader| shader.instruction_count),
+            compilation_time_ms: source.and_then(|shader| shader.compilation_time_ms),
             encoder_count: kernel_stat
                 .map(|value| value.encoder_labels.len())
                 .unwrap_or(0),
@@ -218,10 +232,38 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
         ));
         if verbose {
             out.push_str(&format!(
-                "           avg={} ns samples/us={:.3} exec_samples={} encoders={} buffers={} correlation={}\n",
+                "           avg={} ns samples/us={:.3} exec_samples={} occ={} occ_conf={} regs={} spills={} tgmem={} inst={} compile_ms={} encoders={} buffers={} correlation={}\n",
                 shader.synthetic_avg_duration_ns,
                 shader.avg_sampling_density,
                 shader.execution_cost_samples,
+                shader
+                    .occupancy_percent
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .occupancy_confidence
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .temporary_register_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .spilled_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .threadgroup_memory
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .instruction_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .compilation_time_ms
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_owned()),
                 shader.encoder_count,
                 shader.buffer_count,
                 shader.correlation_method
@@ -265,6 +307,13 @@ mod tests {
                 execution_cost_samples: 3,
                 sample_count: 4,
                 avg_sampling_density: 0.2,
+                occupancy_percent: Some(41.0),
+                occupancy_confidence: Some(0.9),
+                temporary_register_count: Some(64),
+                spilled_bytes: Some(512),
+                threadgroup_memory: Some(8192),
+                instruction_count: Some(2048),
+                compilation_time_ms: Some(4.5),
                 encoder_count: 1,
                 buffer_count: 2,
                 source_file: Some(PathBuf::from("/tmp/kernel.metal")),
@@ -280,5 +329,8 @@ mod tests {
         assert!(output.contains("samples/us=0.200"));
         assert!(output.contains("75.00"));
         assert!(output.contains("exec_samples=3"));
+        assert!(output.contains("occ=41.00"));
+        assert!(output.contains("regs=64"));
+        assert!(output.contains("spills=512"));
     }
 }

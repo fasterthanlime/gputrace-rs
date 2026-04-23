@@ -30,6 +30,15 @@ pub struct ShaderEntry {
     pub execution_cost_samples: usize,
     pub sample_count: usize,
     pub avg_sampling_density: Option<f64>,
+    pub occupancy_percent: Option<f64>,
+    pub occupancy_confidence: Option<f64>,
+    pub temporary_register_count: Option<i64>,
+    pub spilled_bytes: Option<i64>,
+    pub threadgroup_memory: Option<i64>,
+    pub instruction_count: Option<i64>,
+    pub alu_instruction_count: Option<i64>,
+    pub branch_instruction_count: Option<i64>,
+    pub compilation_time_ms: Option<f64>,
     pub source_file: Option<PathBuf>,
     pub source_line: Option<usize>,
 }
@@ -68,6 +77,9 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
     let mut sample_count_by_name = BTreeMap::<String, usize>::new();
     let mut density_sum_by_name = BTreeMap::<String, f64>::new();
     let mut density_count_by_name = BTreeMap::<String, usize>::new();
+    let mut occupancy_by_name = BTreeMap::<String, (f64, f64, usize)>::new();
+    let mut pipeline_stats_by_addr = BTreeMap::<u64, profiler::ProfilerPipelineStats>::new();
+    let mut pipeline_stats_by_name = BTreeMap::<String, profiler::ProfilerPipelineStats>::new();
     let mut total_duration_ns = 0u64;
     if let Some(summary) = &profiler_summary {
         total_duration_ns = summary.total_time_us.saturating_mul(1_000);
@@ -91,6 +103,34 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 .unwrap_or_else(|| format!("pipeline_{}", cost.pipeline_id));
             *execution_cost_by_name.entry(name.clone()).or_default() += cost.cost_percent;
             *execution_cost_samples_by_name.entry(name).or_default() += cost.sample_count;
+        }
+        for occupancy in &summary.occupancies {
+            for dispatch in summary
+                .dispatches
+                .iter()
+                .filter(|dispatch| dispatch.encoder_index == occupancy.encoder_index)
+            {
+                let name = dispatch
+                    .function_name
+                    .clone()
+                    .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
+                let entry = occupancy_by_name.entry(name).or_default();
+                entry.0 += occupancy.occupancy_percent;
+                entry.1 += occupancy.confidence;
+                entry.2 += 1;
+            }
+        }
+        for pipeline in &summary.pipelines {
+            if let Some(stats) = &pipeline.stats {
+                if pipeline.pipeline_address != 0 {
+                    pipeline_stats_by_addr.insert(pipeline.pipeline_address, stats.clone());
+                }
+                if let Some(name) = &pipeline.function_name {
+                    pipeline_stats_by_name
+                        .entry(name.clone())
+                        .or_insert_with(|| stats.clone());
+                }
+            }
         }
     }
 
@@ -117,6 +157,18 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                         .get(&kernel_name)
                         .map(|sum| *sum / count as f64)
                 });
+            let occupancy = occupancy_by_name.get(&kernel_name).and_then(
+                |(occupancy_sum, confidence_sum, count)| {
+                    (*count > 0).then_some((
+                        occupancy_sum / *count as f64,
+                        confidence_sum / *count as f64,
+                    ))
+                },
+            );
+            let pipeline_stats = pipeline_stats_by_addr
+                .get(&kernel.pipeline_addr)
+                .cloned()
+                .or_else(|| pipeline_stats_by_name.get(&kernel_name).cloned());
             ShaderEntry {
                 name: kernel_name.clone(),
                 pipeline_addr: kernel.pipeline_addr,
@@ -130,6 +182,25 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                     .unwrap_or(0),
                 sample_count: sample_count_by_name.get(&kernel_name).copied().unwrap_or(0),
                 avg_sampling_density,
+                occupancy_percent: occupancy.map(|(value, _)| value),
+                occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
+                temporary_register_count: pipeline_stats
+                    .as_ref()
+                    .map(|stats| stats.temporary_register_count),
+                spilled_bytes: pipeline_stats.as_ref().map(|stats| stats.spilled_bytes),
+                threadgroup_memory: pipeline_stats
+                    .as_ref()
+                    .map(|stats| stats.threadgroup_memory),
+                instruction_count: pipeline_stats.as_ref().map(|stats| stats.instruction_count),
+                alu_instruction_count: pipeline_stats
+                    .as_ref()
+                    .map(|stats| stats.alu_instruction_count),
+                branch_instruction_count: pipeline_stats
+                    .as_ref()
+                    .map(|stats| stats.branch_instruction_count),
+                compilation_time_ms: pipeline_stats
+                    .as_ref()
+                    .map(|stats| stats.compilation_time_ms),
                 source_file,
                 source_line,
             }
@@ -209,9 +280,17 @@ pub fn format_report(report: &ShaderReport) -> String {
         .shaders
         .iter()
         .any(|shader| shader.total_duration_ns.is_some());
+    let has_pipeline_stats = report
+        .shaders
+        .iter()
+        .any(|shader| shader.instruction_count.is_some());
+    let has_occupancy = report
+        .shaders
+        .iter()
+        .any(|shader| shader.occupancy_percent.is_some());
     if has_profiler_timing {
         out.push_str(&format!(
-            "{:<36} {:<18} {:>10} {:>14} {:>8} {:>8} {:>8} {:>10}  {}\n",
+            "{:<32} {:<18} {:>10} {:>14} {:>8} {:>8} {:>8} {:>10}",
             "Name",
             "Pipeline State",
             "Dispatches",
@@ -220,13 +299,32 @@ pub fn format_report(report: &ShaderReport) -> String {
             "Exec %",
             "Samples",
             "Samples/us",
-            "Source"
         ));
+        if has_pipeline_stats {
+            out.push_str(&format!(
+                " {:>6} {:>8} {:>8} {:>8} {:>10}",
+                "Regs", "Spills", "TGMem", "Inst", "Compile ms"
+            ));
+        }
+        if has_occupancy {
+            out.push_str(&format!(" {:>8}", "Occ %"));
+        }
+        out.push_str("  Source\n");
     } else {
         out.push_str(&format!(
-            "{:<36} {:<18} {:>10}  {}\n",
-            "Name", "Pipeline State", "Dispatches", "Source"
+            "{:<32} {:<18} {:>10}",
+            "Name", "Pipeline State", "Dispatches"
         ));
+        if has_pipeline_stats {
+            out.push_str(&format!(
+                " {:>6} {:>8} {:>8} {:>8} {:>10}",
+                "Regs", "Spills", "TGMem", "Inst", "Compile ms"
+            ));
+        }
+        if has_occupancy {
+            out.push_str(&format!(" {:>8}", "Occ %"));
+        }
+        out.push_str("  Source\n");
     }
     for shader in &report.shaders {
         let source = match (&shader.source_file, shader.source_line) {
@@ -235,7 +333,7 @@ pub fn format_report(report: &ShaderReport) -> String {
         };
         if has_profiler_timing {
             out.push_str(&format!(
-                "{:<36} 0x{:<16x} {:>10} {:>14} {:>7} {:>8} {:>8} {:>10}  {}\n",
+                "{:<32} 0x{:<16x} {:>10} {:>14} {:>7} {:>8} {:>8} {:>10}",
                 truncate(&shader.name, 36),
                 shader.pipeline_addr,
                 shader.dispatch_count,
@@ -256,16 +354,84 @@ pub fn format_report(report: &ShaderReport) -> String {
                     .avg_sampling_density
                     .map(|value| format!("{value:.3}"))
                     .unwrap_or_else(|| "-".to_owned()),
-                source
             ));
+            if has_pipeline_stats {
+                out.push_str(&format!(
+                    " {:>6} {:>8} {:>8} {:>8} {:>10}",
+                    shader
+                        .temporary_register_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .spilled_bytes
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .threadgroup_memory
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .instruction_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .compilation_time_ms
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned())
+                ));
+            }
+            if has_occupancy {
+                out.push_str(&format!(
+                    " {:>8}",
+                    shader
+                        .occupancy_percent
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned())
+                ));
+            }
+            out.push_str(&format!("  {source}\n"));
         } else {
             out.push_str(&format!(
-                "{:<36} 0x{:<16x} {:>10}  {}\n",
+                "{:<32} 0x{:<16x} {:>10}",
                 truncate(&shader.name, 36),
                 shader.pipeline_addr,
                 shader.dispatch_count,
-                source
             ));
+            if has_pipeline_stats {
+                out.push_str(&format!(
+                    " {:>6} {:>8} {:>8} {:>8} {:>10}",
+                    shader
+                        .temporary_register_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .spilled_bytes
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .threadgroup_memory
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .instruction_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    shader
+                        .compilation_time_ms
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned())
+                ));
+            }
+            if has_occupancy {
+                out.push_str(&format!(
+                    " {:>8}",
+                    shader
+                        .occupancy_percent
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned())
+                ));
+            }
+            out.push_str(&format!("  {source}\n"));
         }
     }
     out
@@ -448,6 +614,15 @@ mod tests {
                 execution_cost_samples: 11,
                 sample_count: 4,
                 avg_sampling_density: Some(0.2),
+                occupancy_percent: Some(37.5),
+                occupancy_confidence: Some(0.8),
+                temporary_register_count: Some(48),
+                spilled_bytes: Some(256),
+                threadgroup_memory: Some(4096),
+                instruction_count: Some(1024),
+                alu_instruction_count: Some(800),
+                branch_instruction_count: Some(16),
+                compilation_time_ms: Some(3.5),
                 source_file: Some(PathBuf::from("/tmp/kernel.metal")),
                 source_line: Some(42),
             }],
@@ -459,7 +634,14 @@ mod tests {
         assert!(output.contains("Exec %"));
         assert!(output.contains("Samples"));
         assert!(output.contains("Samples/us"));
+        assert!(output.contains("Occ %"));
+        assert!(output.contains("Regs"));
+        assert!(output.contains("Spills"));
+        assert!(output.contains("Compile ms"));
         assert!(output.contains("60.00"));
         assert!(output.contains("55.00"));
+        assert!(output.contains("37.50"));
+        assert!(output.contains("48"));
+        assert!(output.contains("256"));
     }
 }

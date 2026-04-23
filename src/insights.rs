@@ -1,6 +1,8 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use crate::analysis;
+use crate::counter;
 use crate::error::{Error, Result};
 use crate::profiler;
 use crate::timing;
@@ -139,8 +141,53 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
     }
 
     if let Some(summary) = &profiler_summary {
-        let mut sample_totals =
-            std::collections::BTreeMap::<String, (usize, u64, usize, f64)>::new();
+        let mut pipeline_stats_by_name = BTreeMap::new();
+        let mut occupancy_by_name = BTreeMap::<String, (f64, f64, usize)>::new();
+        let mut limiter_by_name = BTreeMap::<String, (f64, f64, f64, f64, f64, usize)>::new();
+        for pipeline in &summary.pipelines {
+            if let (Some(name), Some(stats)) = (&pipeline.function_name, &pipeline.stats) {
+                pipeline_stats_by_name
+                    .entry(name.clone())
+                    .or_insert_with(|| stats.clone());
+            }
+        }
+        for occupancy in &summary.occupancies {
+            for dispatch in summary
+                .dispatches
+                .iter()
+                .filter(|dispatch| dispatch.encoder_index == occupancy.encoder_index)
+            {
+                let name = dispatch
+                    .function_name
+                    .clone()
+                    .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
+                let entry = occupancy_by_name.entry(name).or_default();
+                entry.0 += occupancy.occupancy_percent;
+                entry.1 += occupancy.confidence;
+                entry.2 += 1;
+            }
+        }
+        for limiter in counter::extract_limiters_for_trace(&trace.path) {
+            for dispatch in summary
+                .dispatches
+                .iter()
+                .filter(|dispatch| dispatch.encoder_index == limiter.encoder_index)
+            {
+                let name = dispatch
+                    .function_name
+                    .clone()
+                    .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
+                let entry = limiter_by_name.entry(name).or_default();
+                entry.0 += limiter.occupancy_manager.unwrap_or(0.0);
+                entry.1 += limiter.instruction_throughput.unwrap_or(0.0);
+                entry.2 += limiter.integer_complex.unwrap_or(0.0);
+                entry.3 += limiter.f32_limiter.unwrap_or(0.0);
+                entry.4 += limiter.l1_cache.unwrap_or(0.0);
+                entry.5 += 1;
+            }
+        }
+
+        let mut sample_totals = BTreeMap::<String, (usize, u64, usize, f64)>::new();
         let mut total_samples = 0usize;
         let mut total_duration_us = 0u64;
         for dispatch in &summary.dispatches {
@@ -184,6 +231,183 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                         "Suggests higher GPU utilization than duration alone would imply.".to_owned(),
                     ),
                 });
+            }
+        }
+
+        for kernel in &timing.kernels {
+            if let Some((occupancy_sum, confidence_sum, count)) =
+                occupancy_by_name.get(&kernel.name)
+                && *count > 0
+            {
+                let occupancy = occupancy_sum / *count as f64;
+                let confidence = confidence_sum / *count as f64;
+                if occupancy < 30.0 {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Optimization,
+                        severity: if occupancy < 15.0 {
+                            InsightSeverity::High
+                        } else {
+                            InsightSeverity::Medium
+                        },
+                        shader_name: Some(kernel.name.clone()),
+                        title: format!("{} shows low kernel occupancy", kernel.name),
+                        description: format!(
+                            "{} averages {:.1}% kernel occupancy with {:.2} confidence across profiler samples.",
+                            kernel.name, occupancy, confidence
+                        ),
+                        recommendations: vec![
+                            "Revisit threadgroup sizing before deeper micro-optimizations.".to_owned(),
+                            "Check register pressure and threadgroup memory for occupancy limiters.".to_owned(),
+                        ],
+                        impact: Some(
+                            "Low occupancy can leave GPU execution resources underutilized.".to_owned(),
+                        ),
+                    });
+                }
+            }
+
+            let Some(stats) = pipeline_stats_by_name.get(&kernel.name) else {
+                continue;
+            };
+
+            if stats.spilled_bytes >= 256 {
+                insights.push(PerformanceInsight {
+                    insight_type: InsightType::Optimization,
+                    severity: if stats.spilled_bytes >= 1024 {
+                        InsightSeverity::High
+                    } else {
+                        InsightSeverity::Medium
+                    },
+                    shader_name: Some(kernel.name.clone()),
+                    title: format!("{} shows register spilling", kernel.name),
+                    description: format!(
+                        "{} spills {} bytes and allocates {} registers, which is consistent with register-pressure losses.",
+                        kernel.name, stats.spilled_bytes, stats.temporary_register_count
+                    ),
+                    recommendations: vec![
+                        "Reduce live temporary values or split overly wide kernels.".to_owned(),
+                        "Check whether threadgroup size can be reduced without hurting occupancy.".to_owned(),
+                        "Use `shader-source` and `correlate` to inspect the hottest code path.".to_owned(),
+                    ],
+                    impact: Some(
+                        "Spilling can push hot values to memory and raise both latency and bandwidth pressure."
+                            .to_owned(),
+                    ),
+                });
+            }
+
+            if stats.temporary_register_count >= 96 && stats.spilled_bytes == 0 {
+                insights.push(PerformanceInsight {
+                    insight_type: InsightType::Info,
+                    severity: InsightSeverity::Medium,
+                    shader_name: Some(kernel.name.clone()),
+                    title: format!("{} uses a large register footprint", kernel.name),
+                    description: format!(
+                        "{} allocates {} registers even without reported spills.",
+                        kernel.name, stats.temporary_register_count
+                    ),
+                    recommendations: vec![
+                        "Treat threadgroup size and in-kernel temporary arrays as likely occupancy levers.".to_owned(),
+                        "Watch for occupancy losses when comparing variants of this shader.".to_owned(),
+                    ],
+                    impact: Some(
+                        "High register pressure can cap occupancy before spills become visible."
+                            .to_owned(),
+                    ),
+                });
+            }
+
+            if stats.threadgroup_memory >= 16 * 1024 {
+                insights.push(PerformanceInsight {
+                    insight_type: InsightType::Optimization,
+                    severity: InsightSeverity::Medium,
+                    shader_name: Some(kernel.name.clone()),
+                    title: format!("{} uses substantial threadgroup memory", kernel.name),
+                    description: format!(
+                        "{} reserves {} bytes of threadgroup memory.",
+                        kernel.name, stats.threadgroup_memory
+                    ),
+                    recommendations: vec![
+                        "Trim shared scratch usage or split phases if occupancy is lower than expected.".to_owned(),
+                        "Compare threadgroup memory against register pressure before increasing group size.".to_owned(),
+                    ],
+                    impact: Some(
+                        "Large threadgroup allocations can reduce active wave occupancy.".to_owned(),
+                    ),
+                });
+            }
+
+            if let Some((occ_mgr_sum, instr_sum, int_sum, f32_sum, l1_sum, count)) =
+                limiter_by_name.get(&kernel.name)
+                && *count > 0
+            {
+                let occ_mgr = occ_mgr_sum / *count as f64;
+                let instruction = instr_sum / *count as f64;
+                let integer_complex = int_sum / *count as f64;
+                let f32 = f32_sum / *count as f64;
+                let l1 = l1_sum / *count as f64;
+
+                if occ_mgr >= 60.0 {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Bottleneck,
+                        severity: InsightSeverity::High,
+                        shader_name: Some(kernel.name.clone()),
+                        title: format!("{} is occupancy-limited", kernel.name),
+                        description: format!(
+                            "{} shows {:.1}% occupancy-manager pressure in counter samples.",
+                            kernel.name, occ_mgr
+                        ),
+                        recommendations: vec![
+                            "Reduce register pressure or threadgroup memory before chasing smaller effects.".to_owned(),
+                            "Try smaller threadgroups if occupancy is low and the shader is spill-heavy.".to_owned(),
+                        ],
+                        impact: Some(
+                            "Suggests active-wave residency is constraining throughput.".to_owned(),
+                        ),
+                    });
+                }
+
+                if instruction >= 2.0 || f32 >= 2.0 {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Bottleneck,
+                        severity: InsightSeverity::Medium,
+                        shader_name: Some(kernel.name.clone()),
+                        title: format!("{} shows instruction throughput pressure", kernel.name),
+                        description: format!(
+                            "{} averages {:.2}% instruction-throughput, {:.2}% integer/complex, and {:.2}% F32 limiter pressure.",
+                            kernel.name, instruction, integer_complex, f32
+                        ),
+                        recommendations: vec![
+                            "Inspect the hot path for instruction-heavy loops or unnecessary precision.".to_owned(),
+                            "Compare specialized variants to see whether arithmetic intensity is worth the extra instructions.".to_owned(),
+                        ],
+                        impact: Some(
+                            "Indicates shader execution may be limited by arithmetic issue throughput."
+                                .to_owned(),
+                        ),
+                    });
+                }
+
+                if l1 >= 2.0 {
+                    insights.push(PerformanceInsight {
+                        insight_type: InsightType::Bottleneck,
+                        severity: InsightSeverity::Medium,
+                        shader_name: Some(kernel.name.clone()),
+                        title: format!("{} shows L1 cache pressure", kernel.name),
+                        description: format!(
+                            "{} averages {:.2}% L1-cache limiter pressure in counter samples.",
+                            kernel.name, l1
+                        ),
+                        recommendations: vec![
+                            "Inspect bound buffers and access stride for cache-unfriendly patterns.".to_owned(),
+                            "Consider staging hot working sets into threadgroup memory only if occupancy stays acceptable.".to_owned(),
+                        ],
+                        impact: Some(
+                            "Suggests memory locality, not pure ALU work, is constraining this shader."
+                                .to_owned(),
+                        ),
+                    });
+                }
             }
         }
     }

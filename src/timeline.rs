@@ -1005,6 +1005,7 @@ mod tests {
             function_names: vec![],
             pipelines: vec![],
             execution_costs: vec![],
+            occupancies: vec![],
             dispatches,
             encoder_timings: vec![],
             timeline: Some(timeline),

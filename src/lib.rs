@@ -8,6 +8,7 @@ pub mod clear_buffers;
 pub mod cli;
 pub mod commands;
 pub mod correlate;
+pub mod counter;
 pub mod diff;
 pub mod dump;
 pub mod error;

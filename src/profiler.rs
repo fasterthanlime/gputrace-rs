@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
+use std::mem;
 use std::path::{Path, PathBuf};
 
 use plist::{Dictionary, Uid, Value};
 use serde::Serialize;
 
+use crate::counter;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -15,11 +17,24 @@ pub struct ProfilerFileEntry {
     pub kind: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProfilerPipeline {
     pub pipeline_id: i64,
     pub pipeline_address: u64,
     pub function_name: Option<String>,
+    pub stats: Option<ProfilerPipelineStats>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProfilerPipelineStats {
+    pub temporary_register_count: i64,
+    pub uniform_register_count: i64,
+    pub spilled_bytes: i64,
+    pub threadgroup_memory: i64,
+    pub instruction_count: i64,
+    pub alu_instruction_count: i64,
+    pub branch_instruction_count: i64,
+    pub compilation_time_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -28,6 +43,14 @@ pub struct ProfilerExecutionCost {
     pub function_name: Option<String>,
     pub sample_count: usize,
     pub cost_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProfilerOccupancy {
+    pub encoder_index: usize,
+    pub occupancy_percent: f64,
+    pub sample_count: usize,
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -95,6 +118,7 @@ pub struct ProfilerStreamDataSummary {
     pub function_names: Vec<String>,
     pub pipelines: Vec<ProfilerPipeline>,
     pub execution_costs: Vec<ProfilerExecutionCost>,
+    pub occupancies: Vec<ProfilerOccupancy>,
     pub dispatches: Vec<ProfilerDispatch>,
     pub encoder_timings: Vec<ProfilerEncoderTiming>,
     pub timeline: Option<ProfilerTimelineInfo>,
@@ -110,6 +134,7 @@ pub struct ProfilerReport {
     pub profiler_directory: PathBuf,
     pub stream_data_present: bool,
     pub stream_data_summary: Option<ProfilerStreamDataSummary>,
+    pub limiter_metrics: Vec<counter::CounterLimiter>,
     pub timeline_file_count: usize,
     pub counter_file_count: usize,
     pub profiling_file_count: usize,
@@ -171,6 +196,7 @@ pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
     } else {
         None
     };
+    let limiter_metrics = counter::extract_limiters(&profiler_directory);
 
     let mut notes = Vec::new();
     if !stream_data_present {
@@ -193,6 +219,7 @@ pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
         profiler_directory,
         stream_data_present,
         stream_data_summary,
+        limiter_metrics,
         timeline_file_count,
         counter_file_count,
         profiling_file_count,
@@ -276,6 +303,52 @@ pub fn format_report(report: &ProfilerReport) -> String {
                 ));
             }
         }
+        if !summary.occupancies.is_empty() {
+            out.push_str("top encoder occupancies\n");
+            for occupancy in summary.occupancies.iter().take(5) {
+                out.push_str(&format!(
+                    "  - encoder {}: {:.2}% ({} samples, confidence {:.2})\n",
+                    occupancy.encoder_index,
+                    occupancy.occupancy_percent,
+                    occupancy.sample_count,
+                    occupancy.confidence
+                ));
+            }
+        }
+        let mut pipelines_with_stats = summary
+            .pipelines
+            .iter()
+            .filter_map(|pipeline| pipeline.stats.as_ref().map(|stats| (pipeline, stats)))
+            .collect::<Vec<_>>();
+        pipelines_with_stats.sort_by(|left, right| {
+            right
+                .1
+                .instruction_count
+                .cmp(&left.1.instruction_count)
+                .then_with(|| {
+                    right
+                        .1
+                        .temporary_register_count
+                        .cmp(&left.1.temporary_register_count)
+                })
+        });
+        if !pipelines_with_stats.is_empty() {
+            out.push_str("top pipeline compilation stats\n");
+            for (pipeline, stats) in pipelines_with_stats.into_iter().take(5) {
+                let name = pipeline
+                    .function_name
+                    .clone()
+                    .unwrap_or_else(|| format!("pipeline_{}", pipeline.pipeline_id));
+                out.push_str(&format!(
+                    "  - {name}: regs={} spills={} tgmem={} inst={} compile={:.2} ms\n",
+                    stats.temporary_register_count,
+                    stats.spilled_bytes,
+                    stats.threadgroup_memory,
+                    stats.instruction_count,
+                    stats.compilation_time_ms
+                ));
+            }
+        }
 
         let top = top_dispatch_functions(summary);
         if !top.is_empty() {
@@ -283,6 +356,37 @@ pub fn format_report(report: &ProfilerReport) -> String {
             for (name, count, time) in top.into_iter().take(5) {
                 out.push_str(&format!("  - {name}: {count} dispatches, {time} us\n"));
             }
+        }
+    }
+
+    if !report.limiter_metrics.is_empty() {
+        out.push_str("\ncounter limiter summary\n");
+        out.push_str("-----------------------\n");
+        for limiter in report.limiter_metrics.iter().take(8) {
+            out.push_str(&format!(
+                "  - encoder {}: occ_mgr={} instr={} int_complex={} f32={} l1={}\n",
+                limiter.encoder_index,
+                limiter
+                    .occupancy_manager
+                    .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
+                    .instruction_throughput
+                    .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
+                    .integer_complex
+                    .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
+                    .f32_limiter
+                    .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                limiter
+                    .l1_cache
+                    .map(|value| format!("{value:.2}%"))
+                    .unwrap_or_else(|| "-".to_owned())
+            ));
         }
     }
 
@@ -344,6 +448,7 @@ fn parse_stream_data(
     let execution_costs = profiler_dir
         .map(|dir| extract_execution_costs(dir, &pipelines))
         .unwrap_or_default();
+    let occupancies = profiler_dir.map(extract_occupancies).unwrap_or_default();
     let encoder_timings = extract_encoder_timings(objects, root);
     let mut dispatches = extract_dispatches(objects, root, &pipelines);
     let timeline = extract_timeline(objects, root);
@@ -362,6 +467,7 @@ fn parse_stream_data(
             .sum(),
         pipelines,
         execution_costs,
+        occupancies,
         dispatches,
         encoder_timings,
         timeline,
@@ -431,6 +537,98 @@ fn extract_execution_costs(
     costs
 }
 
+fn extract_occupancies(profiler_dir: &Path) -> Vec<ProfilerOccupancy> {
+    let Ok(entries) = fs::read_dir(profiler_dir) else {
+        return Vec::new();
+    };
+
+    let mut files = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let index = name
+                .strip_prefix("Profiling_f_")
+                .and_then(|rest| rest.strip_suffix(".raw"))
+                .and_then(|rest| rest.parse::<usize>().ok())?;
+            let path = entry.path();
+            path.is_file().then_some((index, path))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|(index, _)| *index);
+
+    files
+        .into_iter()
+        .filter_map(|(encoder_index, path)| {
+            let data = fs::read(path).ok()?;
+            let candidates = extract_occupancy_candidates(&data);
+            if candidates.is_empty() {
+                return None;
+            }
+            Some(ProfilerOccupancy {
+                encoder_index,
+                occupancy_percent: median(&candidates) * 100.0,
+                sample_count: candidates.len(),
+                confidence: occupancy_confidence(&candidates),
+            })
+        })
+        .collect()
+}
+
+fn extract_occupancy_candidates(data: &[u8]) -> Vec<f64> {
+    const MIN_OCCUPANCY: f32 = 0.0001;
+    const MAX_OCCUPANCY: f32 = 1.0;
+    const NOISE_THRESHOLD: usize = 20;
+
+    let mut value_frequency = BTreeMap::<u32, usize>::new();
+    for chunk in data.chunks_exact(mem::size_of::<u32>()) {
+        let bits = u32::from_le_bytes(chunk.try_into().unwrap());
+        let value = f32::from_bits(bits);
+        if value.is_finite() && (MIN_OCCUPANCY..=MAX_OCCUPANCY).contains(&value) {
+            *value_frequency.entry(bits).or_default() += 1;
+        }
+    }
+
+    value_frequency
+        .into_iter()
+        .filter(|(_, count)| *count <= NOISE_THRESHOLD)
+        .map(|(bits, _)| f32::from_bits(bits) as f64)
+        .collect()
+}
+
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    }
+}
+
+fn occupancy_confidence(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    let sample_confidence = (values.len() as f64 / 10.0).min(1.0);
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    let variance_confidence = 1.0 - (variance / 0.01).min(1.0);
+    0.7 * sample_confidence + 0.3 * variance_confidence
+}
+
 fn extract_function_names(objects: &[Value], root: &Dictionary) -> Vec<String> {
     ns_objects_from_root_key(objects, root, "strings")
         .into_iter()
@@ -498,6 +696,7 @@ fn extract_pipelines(
     pipeline_addresses: &[u64],
     pipeline_functions: &[Option<String>],
 ) -> Vec<ProfilerPipeline> {
+    let stats_map = extract_pipeline_stats(objects, root);
     let Some(uid) = root.get("pipelinePerformanceStatistics").and_then(as_uid) else {
         return pipeline_addresses
             .iter()
@@ -506,6 +705,7 @@ fn extract_pipelines(
                 pipeline_id: index as i64,
                 pipeline_address: *address,
                 function_name: pipeline_functions.get(index).cloned().flatten(),
+                stats: None,
             })
             .collect();
     };
@@ -537,7 +737,102 @@ fn extract_pipelines(
             pipeline_id,
             pipeline_address: pipeline_addresses.get(index).copied().unwrap_or_default(),
             function_name: pipeline_functions.get(index).cloned().flatten(),
+            stats: stats_map.get(&pipeline_id).cloned(),
         });
+    }
+
+    pipelines
+}
+
+fn extract_pipeline_stats(
+    objects: &[Value],
+    root: &Dictionary,
+) -> BTreeMap<i64, ProfilerPipelineStats> {
+    let Some(uid) = root.get("pipelinePerformanceStatistics").and_then(as_uid) else {
+        return BTreeMap::new();
+    };
+    let Some(stats_dict) = object_dictionary(objects, uid) else {
+        return BTreeMap::new();
+    };
+    let Some(keys) = stats_dict.get("NS.keys").and_then(Value::as_array) else {
+        return BTreeMap::new();
+    };
+    let Some(values) = stats_dict.get("NS.objects").and_then(Value::as_array) else {
+        return BTreeMap::new();
+    };
+    if keys.len() != values.len() {
+        return BTreeMap::new();
+    }
+
+    let mut pipelines = BTreeMap::new();
+    for (key, value) in keys.iter().zip(values.iter()) {
+        let pipeline_id = match resolve_value(objects, key).and_then(as_i64) {
+            Some(id) => id,
+            None => continue,
+        };
+        let Some(stats_value) = resolve_value(objects, value) else {
+            continue;
+        };
+        let Some(stat_dict) = stats_value.as_dictionary() else {
+            continue;
+        };
+        let Some(stat_keys) = stat_dict.get("NS.keys").and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(stat_values) = stat_dict.get("NS.objects").and_then(Value::as_array) else {
+            continue;
+        };
+        if stat_keys.len() != stat_values.len() {
+            continue;
+        }
+
+        let mut key_map = BTreeMap::<String, &Value>::new();
+        for (stat_key, stat_value) in stat_keys.iter().zip(stat_values.iter()) {
+            let Some(key_name) = resolve_value(objects, stat_key).and_then(Value::as_string) else {
+                continue;
+            };
+            if let Some(resolved) = resolve_value(objects, stat_value) {
+                key_map.insert(key_name.to_owned(), resolved);
+            }
+        }
+
+        pipelines.insert(
+            pipeline_id,
+            ProfilerPipelineStats {
+                temporary_register_count: key_map
+                    .get("Temporary register count")
+                    .and_then(|value| as_i64(value))
+                    .unwrap_or(0),
+                uniform_register_count: key_map
+                    .get("Uniform register count")
+                    .and_then(|value| as_i64(value))
+                    .unwrap_or(0),
+                spilled_bytes: key_map
+                    .get("Spilled bytes")
+                    .and_then(|value| as_i64(value))
+                    .unwrap_or(0),
+                threadgroup_memory: key_map
+                    .get("Threadgroup memory")
+                    .and_then(|value| as_i64(value))
+                    .unwrap_or(0),
+                instruction_count: key_map
+                    .get("Instruction count")
+                    .and_then(|value| as_i64(value))
+                    .unwrap_or(0),
+                alu_instruction_count: key_map
+                    .get("ALU instruction count")
+                    .and_then(|value| as_i64(value))
+                    .unwrap_or(0),
+                branch_instruction_count: key_map
+                    .get("Branch instruction count")
+                    .and_then(|value| as_i64(value))
+                    .unwrap_or(0),
+                compilation_time_ms: key_map
+                    .get("Compilation time in milliseconds")
+                    .and_then(|value| as_f64(value))
+                    .unwrap_or(0.0),
+            },
+        );
     }
 
     pipelines
@@ -1140,6 +1435,17 @@ fn as_i64(value: &Value) -> Option<i64> {
     }
 }
 
+fn as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Integer(value) => value
+            .as_signed()
+            .map(|v| v as f64)
+            .or_else(|| value.as_unsigned().map(|v| v as f64)),
+        Value::Real(value) => Some(*value),
+        _ => None,
+    }
+}
+
 fn read_u32(data: &[u8], offset: usize) -> u32 {
     data.get(offset..offset + 4)
         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
@@ -1462,12 +1768,28 @@ mod tests {
                     pipeline_id: 27,
                     pipeline_address: 0x1111,
                     function_name: Some("kernel_main".to_owned()),
+                    stats: Some(ProfilerPipelineStats {
+                        temporary_register_count: 32,
+                        uniform_register_count: 4,
+                        spilled_bytes: 128,
+                        threadgroup_memory: 2048,
+                        instruction_count: 640,
+                        alu_instruction_count: 512,
+                        branch_instruction_count: 12,
+                        compilation_time_ms: 2.5,
+                    }),
                 }],
                 execution_costs: vec![ProfilerExecutionCost {
                     pipeline_id: 27,
                     function_name: Some("kernel_main".to_owned()),
                     sample_count: 5,
                     cost_percent: 62.5,
+                }],
+                occupancies: vec![ProfilerOccupancy {
+                    encoder_index: 0,
+                    occupancy_percent: 37.5,
+                    sample_count: 4,
+                    confidence: 0.8,
                 }],
                 dispatches: vec![ProfilerDispatch {
                     index: 0,
@@ -1519,6 +1841,14 @@ mod tests {
                 num_encoders: 1,
                 total_time_us: 250,
             }),
+            limiter_metrics: vec![counter::CounterLimiter {
+                encoder_index: 0,
+                occupancy_manager: Some(72.0),
+                instruction_throughput: Some(1.2),
+                integer_complex: Some(2.4),
+                f32_limiter: Some(6.5),
+                l1_cache: Some(0.8),
+            }],
             timeline_file_count: 1,
             counter_file_count: 2,
             profiling_file_count: 1,
@@ -1540,5 +1870,9 @@ mod tests {
         assert!(text.contains("command_buffers=1"));
         assert!(text.contains("encoder_profiles=1"));
         assert!(text.contains("execution cost"));
+        assert!(text.contains("counter limiter summary"));
+        assert!(text.contains("occ_mgr=72.00%"));
+        assert!(text.contains("encoder 0: 37.50%"));
+        assert!(text.contains("regs=32"));
     }
 }
