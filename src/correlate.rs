@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::error::Result;
+use crate::profiler;
 use crate::shaders;
 use crate::timing;
 use crate::trace::TraceBundle;
@@ -29,6 +30,8 @@ pub struct CorrelatedShader {
     pub synthetic_total_duration_ns: u64,
     pub synthetic_avg_duration_ns: u64,
     pub synthetic_percent_of_total: f64,
+    pub sample_count: usize,
+    pub avg_sampling_density: f64,
     pub encoder_count: usize,
     pub buffer_count: usize,
     pub source_file: Option<PathBuf>,
@@ -38,6 +41,7 @@ pub struct CorrelatedShader {
 
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<CorrelationReport> {
     let timing = timing::report(trace)?;
+    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     let shader_report = shaders::report(trace, search_paths)?;
     let kernel_stats = trace.analyze_kernels()?;
 
@@ -49,6 +53,19 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
 
     let mut shaders = Vec::new();
     let mut correlated_sources = 0usize;
+    let mut sample_stats = BTreeMap::<String, (usize, f64, usize)>::new();
+    if let Some(summary) = &profiler_summary {
+        for dispatch in &summary.dispatches {
+            let name = dispatch
+                .function_name
+                .clone()
+                .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
+            let entry = sample_stats.entry(name).or_default();
+            entry.0 += dispatch.sample_count;
+            entry.1 += dispatch.sampling_density;
+            entry.2 += 1;
+        }
+    }
 
     for kernel in timing.kernels {
         let source = shader_lookup.get(&kernel.name);
@@ -68,6 +85,17 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
         } else {
             kernel.synthetic_duration_ns / execution_count as u64
         };
+        let (sample_count, avg_sampling_density) = sample_stats
+            .get(&kernel.name)
+            .map(|(samples, density_sum, count)| {
+                let avg = if *count == 0 {
+                    0.0
+                } else {
+                    *density_sum / *count as f64
+                };
+                (*samples, avg)
+            })
+            .unwrap_or((0, 0.0));
         shaders.push(CorrelatedShader {
             shader_name: kernel.name.clone(),
             pipeline_addr,
@@ -75,6 +103,8 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
             synthetic_total_duration_ns: kernel.synthetic_duration_ns,
             synthetic_avg_duration_ns,
             synthetic_percent_of_total: kernel.percent_of_total,
+            sample_count,
+            avg_sampling_density,
             encoder_count: kernel_stat
                 .map(|value| value.encoder_labels.len())
                 .unwrap_or(0),
@@ -135,7 +165,7 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
         report.total_duration_ns
     ));
     out.push_str(&format!(
-        "{:<36} {:>10} {:>16} {:>8} {:<18}  {}\n",
+        "{:<36} {:>10} {:>16} {:>8} {:>8} {:<18}  {}\n",
         "Shader",
         "Dispatches",
         if report.synthetic {
@@ -144,6 +174,7 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
             "Duration ns"
         },
         "%",
+        "Samples",
         "Pipeline",
         "Source"
     ));
@@ -153,18 +184,20 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
             _ => "-".to_owned(),
         };
         out.push_str(&format!(
-            "{:<36} {:>10} {:>16} {:>7.2} 0x{:<16x}  {}\n",
+            "{:<36} {:>10} {:>16} {:>7.2} {:>8} 0x{:<16x}  {}\n",
             truncate(&shader.shader_name, 36),
             shader.execution_count,
             shader.synthetic_total_duration_ns,
             shader.synthetic_percent_of_total,
+            shader.sample_count,
             shader.pipeline_addr,
             source
         ));
         if verbose {
             out.push_str(&format!(
-                "           avg={} ns encoders={} buffers={} correlation={}\n",
+                "           avg={} ns samples/us={:.3} encoders={} buffers={} correlation={}\n",
                 shader.synthetic_avg_duration_ns,
+                shader.avg_sampling_density,
                 shader.encoder_count,
                 shader.buffer_count,
                 shader.correlation_method
@@ -204,6 +237,8 @@ mod tests {
                 synthetic_total_duration_ns: 120,
                 synthetic_avg_duration_ns: 60,
                 synthetic_percent_of_total: 100.0,
+                sample_count: 4,
+                avg_sampling_density: 0.2,
                 encoder_count: 1,
                 buffer_count: 2,
                 source_file: Some(PathBuf::from("/tmp/kernel.metal")),
@@ -216,5 +251,6 @@ mod tests {
         assert!(output.contains("kernel"));
         assert!(output.contains("/tmp/kernel.metal:42"));
         assert!(output.contains("correlation=name"));
+        assert!(output.contains("samples/us=0.200"));
     }
 }

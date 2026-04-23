@@ -1001,6 +1001,7 @@ mod tests {
                     end_ticks: 320,
                 },
             ],
+            encoder_profiles: vec![],
             timebase_numer: 125,
             timebase_denom: 5,
             absolute_time: 99_999,

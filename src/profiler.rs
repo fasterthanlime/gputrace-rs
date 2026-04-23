@@ -22,7 +22,7 @@ pub struct ProfilerPipeline {
     pub function_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProfilerDispatch {
     pub index: usize,
     pub pipeline_index: usize,
@@ -31,6 +31,10 @@ pub struct ProfilerDispatch {
     pub encoder_index: usize,
     pub cumulative_us: u64,
     pub duration_us: u64,
+    pub sample_count: usize,
+    pub sampling_density: f64,
+    pub start_ticks: u64,
+    pub end_ticks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -52,12 +56,33 @@ pub struct ProfilerCommandBufferTimestamp {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProfilerTimelineInfo {
     pub command_buffer_timestamps: Vec<ProfilerCommandBufferTimestamp>,
+    pub encoder_profiles: Vec<ProfilerEncoderProfile>,
     pub timebase_numer: u64,
     pub timebase_denom: u64,
     pub absolute_time: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilerEncoderProfile {
+    pub index: usize,
+    pub source: String,
+    pub ring_buffer_index: usize,
+    pub sample_count: usize,
+    pub timestamps: Vec<GprwcntrTimestamp>,
+    pub start_ticks: u64,
+    pub end_ticks: u64,
+    pub duration_ns: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GprwcntrTimestamp {
+    pub timestamp: u64,
+    pub size: u64,
+    pub count: u64,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProfilerStreamDataSummary {
     pub function_names: Vec<String>,
     pub pipelines: Vec<ProfilerPipeline>,
@@ -70,7 +95,7 @@ pub struct ProfilerStreamDataSummary {
     pub total_time_us: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProfilerReport {
     pub input_path: PathBuf,
     pub profiler_directory: PathBuf,
@@ -218,8 +243,9 @@ pub fn format_report(report: &ProfilerReport) -> String {
         ));
         if let Some(timeline) = &summary.timeline {
             out.push_str(&format!(
-                "command_buffers={} timebase={}/{} absolute_time={}\n",
+                "command_buffers={} encoder_profiles={} timebase={}/{} absolute_time={}\n",
                 timeline.command_buffer_timestamps.len(),
+                timeline.encoder_profiles.len(),
                 timeline.timebase_numer,
                 timeline.timebase_denom,
                 timeline.absolute_time
@@ -288,8 +314,11 @@ fn parse_stream_data(path: &Path) -> Result<ProfilerStreamDataSummary> {
         extract_pipeline_info(objects, root, &function_names);
     let pipelines = extract_pipelines(objects, root, &pipeline_addresses, &pipeline_functions);
     let encoder_timings = extract_encoder_timings(objects, root);
-    let dispatches = extract_dispatches(objects, root, &pipelines);
+    let mut dispatches = extract_dispatches(objects, root, &pipelines);
     let timeline = extract_timeline(objects, root);
+    if let Some(timeline) = &timeline {
+        correlate_dispatch_samples(&mut dispatches, timeline);
+    }
 
     Ok(ProfilerStreamDataSummary {
         function_names,
@@ -502,6 +531,10 @@ fn extract_dispatches(
             encoder_index: read_u32(record, 24) as usize,
             cumulative_us,
             duration_us,
+            sample_count: 0,
+            sampling_density: 0.0,
+            start_ticks: 0,
+            end_ticks: 0,
         });
     }
     dispatches
@@ -517,24 +550,36 @@ fn extract_timeline(objects: &[Value], root: &Dictionary) -> Option<ProfilerTime
 fn parse_aps_timeline_data(blobs: &[Vec<u8>]) -> Option<ProfilerTimelineInfo> {
     let mut info = ProfilerTimelineInfo {
         command_buffer_timestamps: Vec::new(),
+        encoder_profiles: Vec::new(),
         timebase_numer: 1,
         timebase_denom: 1,
         absolute_time: 0,
     };
+    let mut found = false;
 
     for blob in blobs.iter().rev() {
         if blob.len() > 1000 && parse_timeline_metadata_blob(blob, &mut info) {
-            return Some(info);
+            found = true;
+            break;
         }
     }
 
-    for blob in blobs.iter().rev() {
-        if parse_timeline_metadata_blob(blob, &mut info) {
-            return Some(info);
+    if !found {
+        for blob in blobs.iter().rev() {
+            if parse_timeline_metadata_blob(blob, &mut info) {
+                found = true;
+                break;
+            }
         }
     }
 
-    None
+    if found {
+        info.encoder_profiles =
+            parse_encoder_profile_blobs(blobs, info.timebase_numer, info.timebase_denom);
+        Some(info)
+    } else {
+        None
+    }
 }
 
 fn parse_timeline_metadata_blob(data: &[u8], info: &mut ProfilerTimelineInfo) -> bool {
@@ -611,6 +656,205 @@ fn parse_command_buffer_timestamps(data: &[u8]) -> Vec<ProfilerCommandBufferTime
         });
     }
     timestamps
+}
+
+fn parse_encoder_profile_blobs(
+    blobs: &[Vec<u8>],
+    timebase_numer: u64,
+    timebase_denom: u64,
+) -> Vec<ProfilerEncoderProfile> {
+    let mut profiles = Vec::new();
+    let max_encoder_blob = blobs.len().min(12);
+    let mut encoder_index = 0usize;
+
+    for blob in blobs.iter().take(max_encoder_blob).skip(1) {
+        let Some((source, ring_buffer_index, shader_profiler_data)) =
+            extract_encoder_blob_data(blob)
+        else {
+            continue;
+        };
+        if source != "RDE_0" {
+            continue;
+        }
+        if let Some(mut profile) = parse_gprwcntr_blob(
+            &shader_profiler_data,
+            encoder_index,
+            timebase_numer,
+            timebase_denom,
+        ) {
+            profile.source = source;
+            profile.ring_buffer_index = ring_buffer_index;
+            profiles.push(profile);
+            encoder_index += 1;
+        }
+    }
+
+    profiles
+}
+
+fn extract_encoder_blob_data(data: &[u8]) -> Option<(String, usize, Vec<u8>)> {
+    let plist = Value::from_reader(Cursor::new(data)).ok()?;
+    let archive = plist.as_dictionary()?;
+    let objects = archive.get("$objects").and_then(Value::as_array)?;
+    let top = archive.get("$top").and_then(Value::as_dictionary)?;
+    let root_uid = top.get("root").and_then(as_uid)?;
+    let root = object_dictionary(objects, root_uid)?;
+    let keys = root.get("NS.keys").and_then(Value::as_array)?;
+    let values = root.get("NS.objects").and_then(Value::as_array)?;
+    if keys.len() != values.len() {
+        return None;
+    }
+
+    let mut source = None;
+    let mut ring_buffer_index = 0usize;
+    let mut shader_profiler_data = None;
+    for (key, value) in keys.iter().zip(values.iter()) {
+        let Some(key_uid) = as_uid(key) else {
+            continue;
+        };
+        let Some(key_name) = object(objects, key_uid).and_then(Value::as_string) else {
+            continue;
+        };
+        let Some(resolved) = resolve_value(objects, value) else {
+            continue;
+        };
+        match key_name {
+            "Source" => {
+                source = resolved.as_string().map(ToOwned::to_owned);
+            }
+            "RingBufferIndex" => {
+                ring_buffer_index =
+                    extract_scalar_u64(objects, resolved).unwrap_or_default() as usize;
+            }
+            "ShaderProfilerData" => {
+                shader_profiler_data = ns_data_from_value(resolved).map(ToOwned::to_owned);
+            }
+            _ => {}
+        }
+    }
+
+    Some((source?, ring_buffer_index, shader_profiler_data?))
+}
+
+fn parse_gprwcntr_blob(
+    data: &[u8],
+    encoder_index: usize,
+    timebase_numer: u64,
+    timebase_denom: u64,
+) -> Option<ProfilerEncoderProfile> {
+    if data.len() < 8 || &data[..8] != b"GPRWCNTR" {
+        return None;
+    }
+
+    let record_data = &data[8..];
+    let record_size = 168usize;
+    let sample_count = record_data.len() / record_size;
+    let mut timestamps = Vec::with_capacity(sample_count);
+    let mut min_timestamp = u64::MAX;
+    let mut max_timestamp = 0u64;
+
+    for chunk in record_data.chunks_exact(record_size) {
+        let timestamp = read_u64(chunk, 0);
+        let entry = GprwcntrTimestamp {
+            timestamp,
+            size: read_u64(chunk, 8),
+            count: read_u64(chunk, 16),
+            flags: read_u32(chunk, 24),
+        };
+        if entry.timestamp > 0 {
+            min_timestamp = min_timestamp.min(entry.timestamp);
+        }
+        max_timestamp = max_timestamp.max(entry.timestamp);
+        timestamps.push(entry);
+    }
+
+    let (start_ticks, end_ticks, duration_ns) = if min_timestamp == u64::MAX {
+        (0, 0, 0)
+    } else {
+        (
+            min_timestamp,
+            max_timestamp,
+            ticks_to_ns(
+                max_timestamp.saturating_sub(min_timestamp),
+                timebase_numer,
+                timebase_denom,
+            ),
+        )
+    };
+
+    Some(ProfilerEncoderProfile {
+        index: encoder_index,
+        source: String::new(),
+        ring_buffer_index: 0,
+        sample_count,
+        timestamps,
+        start_ticks,
+        end_ticks,
+        duration_ns,
+    })
+}
+
+fn correlate_dispatch_samples(
+    dispatches: &mut [ProfilerDispatch],
+    timeline: &ProfilerTimelineInfo,
+) {
+    if dispatches.is_empty() || timeline.command_buffer_timestamps.is_empty() {
+        return;
+    }
+
+    let mut sample_timestamps = timeline
+        .encoder_profiles
+        .iter()
+        .flat_map(|profile| profile.timestamps.iter().map(|entry| entry.timestamp))
+        .collect::<Vec<_>>();
+    sample_timestamps.sort_unstable();
+    sample_timestamps.dedup();
+    if sample_timestamps.is_empty() {
+        return;
+    }
+
+    let command_buffer = &timeline.command_buffer_timestamps[0];
+    let command_buffer_duration_ticks = command_buffer
+        .end_ticks
+        .saturating_sub(command_buffer.start_ticks);
+    let total_dispatch_us = dispatches
+        .last()
+        .map(|dispatch| dispatch.cumulative_us)
+        .unwrap_or_default();
+    if total_dispatch_us == 0 || timeline.timebase_numer == 0 {
+        return;
+    }
+
+    let ticks_per_us = (timeline.timebase_denom as f64 * 1_000.0) / timeline.timebase_numer as f64;
+    let scale = command_buffer_duration_ticks as f64 / total_dispatch_us as f64 / ticks_per_us;
+
+    for index in 0..dispatches.len() {
+        let start_us = if index == 0 {
+            0
+        } else {
+            dispatches[index - 1].cumulative_us
+        };
+        let end_us = dispatches[index].cumulative_us;
+        let start_ticks =
+            command_buffer.start_ticks + (start_us as f64 * ticks_per_us * scale) as u64;
+        let end_ticks = command_buffer.start_ticks + (end_us as f64 * ticks_per_us * scale) as u64;
+        let sample_count = sample_timestamps
+            .iter()
+            .filter(|timestamp| **timestamp >= start_ticks && **timestamp < end_ticks)
+            .count();
+
+        let dispatch = &mut dispatches[index];
+        dispatch.start_ticks = start_ticks;
+        dispatch.end_ticks = end_ticks;
+        dispatch.sample_count = sample_count;
+        if dispatch.duration_us > 0 {
+            dispatch.sampling_density = sample_count as f64 / dispatch.duration_us as f64;
+        }
+    }
+}
+
+fn ticks_to_ns(ticks: u64, numer: u64, denom: u64) -> u64 {
+    ticks.saturating_mul(numer.max(1)) / denom.max(1)
 }
 
 pub(crate) fn find_profiler_directory(path: &Path) -> Option<PathBuf> {
@@ -952,6 +1196,38 @@ mod tests {
         fs::read(path).unwrap()
     }
 
+    fn encoder_blob() -> Vec<u8> {
+        let mut shader_profiler_data = b"GPRWCNTR".to_vec();
+        let mut record = vec![0u8; 168];
+        record[0..8].copy_from_slice(&120_u64.to_le_bytes());
+        record[8..16].copy_from_slice(&4096_u64.to_le_bytes());
+        record[16..24].copy_from_slice(&6_u64.to_le_bytes());
+        record[24..28].copy_from_slice(&0xffff_ffff_u32.to_le_bytes());
+        shader_profiler_data.extend_from_slice(&record);
+
+        let blob = dict(&[
+            ("$top", dict(&[("root", uid(1))])),
+            (
+                "$objects",
+                Value::Array(vec![
+                    string("$null"),
+                    dict_uids(&[2, 3, 4], &[5, 6, 7]),
+                    string("Source"),
+                    string("RingBufferIndex"),
+                    string("ShaderProfilerData"),
+                    string("RDE_0"),
+                    integer(2),
+                    data(shader_profiler_data),
+                ]),
+            ),
+        ]);
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("encoder.plist");
+        blob.to_file_binary(&path).unwrap();
+        fs::read(path).unwrap()
+    }
+
     fn streamdata_fixture_with_timeline() -> Value {
         let mut fixture = streamdata_fixture();
         let objects = fixture
@@ -964,7 +1240,11 @@ mod tests {
             .as_dictionary_mut()
             .unwrap()
             .insert("APSTimelineData".to_owned(), uid(12));
-        objects.push(array(&[data(vec![0u8; 32]), data(timeline_blob())]));
+        objects.push(array(&[
+            data(vec![0u8; 32]),
+            data(encoder_blob()),
+            data(timeline_blob()),
+        ]));
         fixture
     }
 
@@ -1007,6 +1287,7 @@ mod tests {
             Some("kernel_main")
         );
         assert_eq!(summary.dispatches[0].duration_us, 90);
+        assert_eq!(summary.dispatches[0].sample_count, 0);
         assert!(summary.timeline.is_none());
     }
 
@@ -1024,10 +1305,17 @@ mod tests {
         assert_eq!(timeline.timebase_denom, 3);
         assert_eq!(timeline.absolute_time, 99_999);
         assert_eq!(timeline.command_buffer_timestamps.len(), 2);
+        assert_eq!(timeline.encoder_profiles.len(), 1);
+        assert_eq!(timeline.encoder_profiles[0].sample_count, 1);
+        assert_eq!(timeline.encoder_profiles[0].start_ticks, 120);
         assert_eq!(timeline.command_buffer_timestamps[0].start_ticks, 100);
         assert_eq!(timeline.command_buffer_timestamps[0].end_ticks, 160);
         assert_eq!(timeline.command_buffer_timestamps[1].start_ticks, 200);
         assert_eq!(timeline.command_buffer_timestamps[1].end_ticks, 320);
+        assert_eq!(summary.dispatches[0].sample_count, 1);
+        assert!(summary.dispatches[0].sampling_density > 0.0);
+        assert_eq!(summary.dispatches[0].start_ticks, 100);
+        assert_eq!(summary.dispatches[0].end_ticks, 160);
     }
 
     #[test]
@@ -1087,6 +1375,10 @@ mod tests {
                     encoder_index: 0,
                     cumulative_us: 90,
                     duration_us: 90,
+                    sample_count: 1,
+                    sampling_density: 0.011,
+                    start_ticks: 100,
+                    end_ticks: 160,
                 }],
                 encoder_timings: vec![ProfilerEncoderTiming {
                     index: 0,
@@ -1100,6 +1392,21 @@ mod tests {
                         index: 0,
                         start_ticks: 100,
                         end_ticks: 160,
+                    }],
+                    encoder_profiles: vec![ProfilerEncoderProfile {
+                        index: 0,
+                        source: "RDE_0".to_owned(),
+                        ring_buffer_index: 2,
+                        sample_count: 1,
+                        timestamps: vec![GprwcntrTimestamp {
+                            timestamp: 120,
+                            size: 4096,
+                            count: 6,
+                            flags: 0xffff_ffff,
+                        }],
+                        start_ticks: 120,
+                        end_ticks: 120,
+                        duration_ns: 0,
                     }],
                     timebase_numer: 125,
                     timebase_denom: 3,
@@ -1129,5 +1436,6 @@ mod tests {
         assert!(text.contains("streamData=present"));
         assert!(text.contains("kernel_main"));
         assert!(text.contains("command_buffers=1"));
+        assert!(text.contains("encoder_profiles=1"));
     }
 }
