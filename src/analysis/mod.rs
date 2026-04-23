@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use crate::buffers;
 use crate::trace::{BufferAccessStat, BufferLifecycleStat, KernelStat, TraceBundle, TraceSummary};
 
 #[derive(Debug, Clone, Serialize)]
@@ -16,9 +17,13 @@ pub struct AnalysisReport {
     pub single_use_buffer_count: usize,
     pub short_lived_buffer_count: usize,
     pub long_lived_buffer_count: usize,
+    pub buffer_inventory_count: usize,
+    pub buffer_inventory_bytes: u64,
+    pub buffer_inventory_aliases: usize,
     pub kernel_stats: Vec<KernelStat>,
     pub buffer_stats: Vec<BufferStat>,
     pub buffer_lifecycles: Vec<BufferLifecycle>,
+    pub largest_buffers: Vec<InventoryBuffer>,
     pub findings: Vec<String>,
 }
 
@@ -48,6 +53,14 @@ pub struct BufferLifecycle {
     pub use_count: usize,
     pub kernel_count: usize,
     pub encoder_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InventoryBuffer {
+    pub filename: String,
+    pub size: u64,
+    pub alias_count: usize,
+    pub binding_count: usize,
 }
 
 pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
@@ -123,6 +136,23 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
                 && buffer.dispatch_span as f64 > average_dispatch_lifetime * 3.0
         })
         .count();
+    let inventory = buffers::analyze(trace).ok();
+    let largest_buffers = inventory
+        .as_ref()
+        .map(|inventory| {
+            inventory
+                .buffers
+                .iter()
+                .take(10)
+                .map(|buffer| InventoryBuffer {
+                    filename: buffer.filename.clone(),
+                    size: buffer.size,
+                    alias_count: buffer.aliases.len(),
+                    binding_count: buffer.binding_count,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut findings = Vec::new();
 
     if summary.device_resource_count == 0 {
@@ -204,6 +234,21 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
             long_lived_buffer_count
         ));
     }
+    if let Some(inventory) = &inventory {
+        findings.push(format!(
+            "Bundle buffer inventory: {} files, {} bytes, {} aliases.",
+            inventory.total_buffers, inventory.total_bytes, inventory.total_aliases
+        ));
+        if let Some(largest) = inventory.buffers.first() {
+            findings.push(format!(
+                "Largest backing buffer: {} ({} bytes, {} aliases, {} bindings)",
+                largest.filename,
+                largest.size,
+                largest.aliases.len(),
+                largest.binding_count
+            ));
+        }
+    }
 
     AnalysisReport {
         trace: summary,
@@ -218,9 +263,13 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
         single_use_buffer_count,
         short_lived_buffer_count,
         long_lived_buffer_count,
+        buffer_inventory_count: inventory.as_ref().map_or(0, |inv| inv.total_buffers),
+        buffer_inventory_bytes: inventory.as_ref().map_or(0, |inv| inv.total_bytes),
+        buffer_inventory_aliases: inventory.as_ref().map_or(0, |inv| inv.total_aliases),
         kernel_stats,
         buffer_stats,
         buffer_lifecycles,
+        largest_buffers,
         findings,
     }
 }

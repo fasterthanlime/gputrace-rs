@@ -57,6 +57,18 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
         "* Long-lived buffers: `{}`\n\n",
         report.long_lived_buffer_count
     ));
+    out.push_str(&format!(
+        "* Inventory buffers: `{}`\n",
+        report.buffer_inventory_count
+    ));
+    out.push_str(&format!(
+        "* Inventory bytes: `{}`\n",
+        report.buffer_inventory_bytes
+    ));
+    out.push_str(&format!(
+        "* Inventory aliases: `{}`\n\n",
+        report.buffer_inventory_aliases
+    ));
     if report.findings.is_empty() {
         out.push_str("No findings yet.\n");
     } else {
@@ -102,6 +114,15 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
                 stat.last_dispatch_index,
                 stat.use_count,
                 stat.encoder_count
+            ));
+        }
+    }
+    if !report.largest_buffers.is_empty() {
+        out.push_str("\n## Largest Backing Buffers\n\n");
+        for buffer in report.largest_buffers.iter().take(10) {
+            out.push_str(&format!(
+                "- `{}`: {} bytes, {} aliases, {} bindings\n",
+                buffer.filename, buffer.size, buffer.alias_count, buffer.binding_count
             ));
         }
     }

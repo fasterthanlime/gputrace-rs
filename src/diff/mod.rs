@@ -125,6 +125,24 @@ pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
             left_report.buffer_count, right_report.buffer_count
         ));
     }
+    if left_report.buffer_inventory_count != right_report.buffer_inventory_count {
+        summary.push(format!(
+            "Backing buffer file count changed: {} -> {}",
+            left_report.buffer_inventory_count, right_report.buffer_inventory_count
+        ));
+    }
+    if left_report.buffer_inventory_bytes != right_report.buffer_inventory_bytes {
+        summary.push(format!(
+            "Backing buffer bytes changed: {} -> {}",
+            left_report.buffer_inventory_bytes, right_report.buffer_inventory_bytes
+        ));
+    }
+    if left_report.buffer_inventory_aliases != right_report.buffer_inventory_aliases {
+        summary.push(format!(
+            "Backing buffer alias count changed: {} -> {}",
+            left_report.buffer_inventory_aliases, right_report.buffer_inventory_aliases
+        ));
+    }
     if left_report.shared_buffer_count != right_report.shared_buffer_count {
         summary.push(format!(
             "Shared buffer count changed: {} -> {}",
@@ -389,6 +407,9 @@ mod tests {
             single_use_buffer_count: 0,
             short_lived_buffer_count: 0,
             long_lived_buffer_count: 0,
+            buffer_inventory_count: 0,
+            buffer_inventory_bytes: 0,
+            buffer_inventory_aliases: 0,
             kernel_stats: vec![
                 KernelStat {
                     name: "a".into(),
@@ -407,6 +428,7 @@ mod tests {
             ],
             buffer_stats: vec![],
             buffer_lifecycles: vec![],
+            largest_buffers: vec![],
             findings: vec![],
         };
         let right = AnalysisReport {
@@ -460,6 +482,9 @@ mod tests {
             single_use_buffer_count: 0,
             short_lived_buffer_count: 0,
             long_lived_buffer_count: 0,
+            buffer_inventory_count: 0,
+            buffer_inventory_bytes: 0,
+            buffer_inventory_aliases: 0,
             kernel_stats: vec![],
             buffer_stats: vec![BufferStat {
                 name: "a".into(),
@@ -500,6 +525,7 @@ mod tests {
                     encoder_count: 2,
                 },
             ],
+            largest_buffers: vec![],
             findings: vec![],
         };
         let right = AnalysisReport {
