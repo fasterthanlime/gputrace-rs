@@ -57,6 +57,64 @@ pub fn report(trace: &TraceBundle, filter: Option<&str>) -> Result<ApiCallsRepor
     Ok(report_from_regions(&regions, filter))
 }
 
+pub fn filter_command_buffer_report(
+    report: &ApiCallsReport,
+    command_buffer_index: usize,
+) -> ApiCallsReport {
+    let command_buffers = report
+        .command_buffers
+        .iter()
+        .filter(|command_buffer| command_buffer.index == command_buffer_index)
+        .cloned()
+        .collect::<Vec<_>>();
+    let calls = report
+        .calls
+        .iter()
+        .filter(|call| call.command_buffer_index == command_buffer_index)
+        .cloned()
+        .enumerate()
+        .map(|(sequence, mut call)| {
+            call.sequence = sequence;
+            call
+        })
+        .collect::<Vec<_>>();
+
+    report_with_filtered_rows(report, command_buffers, calls)
+}
+
+pub fn filter_call_kind_report(report: &ApiCallsReport, kind: &str) -> ApiCallsReport {
+    let calls = report
+        .calls
+        .iter()
+        .filter(|call| call.kind == kind)
+        .cloned()
+        .enumerate()
+        .map(|(sequence, mut call)| {
+            call.sequence = sequence;
+            call
+        })
+        .collect::<Vec<_>>();
+    let command_buffer_indexes = calls
+        .iter()
+        .map(|call| call.command_buffer_index)
+        .collect::<BTreeSet<_>>();
+    let command_buffers = report
+        .command_buffers
+        .iter()
+        .filter(|command_buffer| command_buffer_indexes.contains(&command_buffer.index))
+        .cloned()
+        .map(|mut command_buffer| {
+            command_buffer.call_count = calls
+                .iter()
+                .filter(|call| call.command_buffer_index == command_buffer.index)
+                .count();
+            command_buffer
+        })
+        .collect::<Vec<_>>();
+
+    report_with_filtered_rows(report, command_buffers, calls)
+}
+
 pub fn format_report(report: &ApiCallsReport) -> String {
     let mut out = String::new();
     out.push_str("Synthetic API-call report\n");
@@ -111,6 +169,26 @@ pub fn format_report(report: &ApiCallsReport) -> String {
     }
 
     out
+}
+
+fn report_with_filtered_rows(
+    report: &ApiCallsReport,
+    command_buffers: Vec<ApiCallCommandBuffer>,
+    calls: Vec<ApiCallEntry>,
+) -> ApiCallsReport {
+    ApiCallsReport {
+        synthetic: report.synthetic,
+        filter: report.filter.clone(),
+        total_command_buffers: command_buffers.len(),
+        total_dispatches: command_buffers
+            .iter()
+            .map(|command_buffer| command_buffer.dispatch_count)
+            .sum(),
+        matched_dispatches: calls.iter().filter(|call| call.kind == "dispatch").count(),
+        total_calls: calls.len(),
+        command_buffers,
+        calls,
+    }
 }
 
 fn report_from_regions(regions: &[CommandBufferRegion], filter: Option<&str>) -> ApiCallsReport {
@@ -452,7 +530,9 @@ fn format_dims(value: [u32; 3]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_report, report_from_regions};
+    use super::{
+        filter_call_kind_report, filter_command_buffer_report, format_report, report_from_regions,
+    };
     use crate::trace::{
         BoundBuffer, CommandBuffer, CommandBufferRegion, ComputeEncoder, DispatchCall,
         PipelineStateEvent,
@@ -513,6 +593,26 @@ mod tests {
         assert!(rendered.contains("Synthetic API-call report"));
         assert!(rendered.contains("honest approximation"));
         assert!(rendered.contains("dispatchThreadgroups"));
+    }
+
+    #[test]
+    fn filters_rendered_report_by_command_buffer_or_call_kind() {
+        let mut second = sample_region();
+        second.command_buffer.index = 4;
+        second.command_buffer.offset = 0x400;
+        second.end_offset = 0x4ff;
+        second.dispatches[0].kernel_name = Some("blur_kernel".into());
+
+        let report = report_from_regions(&[sample_region(), second], None);
+        let command_buffer = filter_command_buffer_report(&report, 4);
+        assert_eq!(command_buffer.total_command_buffers, 1);
+        assert_eq!(command_buffer.command_buffers[0].index, 4);
+        assert!(command_buffer.calls.iter().all(|call| call.sequence < 6));
+
+        let dispatches = filter_call_kind_report(&report, "dispatch");
+        assert_eq!(dispatches.total_command_buffers, 2);
+        assert_eq!(dispatches.total_calls, 2);
+        assert!(dispatches.calls.iter().all(|call| call.kind == "dispatch"));
     }
 
     fn sample_region() -> CommandBufferRegion {

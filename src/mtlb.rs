@@ -147,6 +147,32 @@ pub struct MTLBFunctionsReport {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MTLBExtractOptions {
+    pub output: Option<PathBuf>,
+    pub library: Option<String>,
+    pub all: bool,
+    pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MTLBExtractedFile {
+    pub library_name: String,
+    pub source_path: PathBuf,
+    pub output_path: PathBuf,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MTLBExtractReport {
+    pub root_path: PathBuf,
+    pub all: bool,
+    pub extracted_count: usize,
+    pub extracted_bytes: u64,
+    pub files: Vec<MTLBExtractedFile>,
+    pub notes: Vec<String>,
+}
+
 pub fn inspect_file(path: impl AsRef<Path>) -> Result<MTLBFileReport> {
     let path = path.as_ref().to_path_buf();
     let data = fs::read(&path)?;
@@ -192,6 +218,66 @@ pub fn functions(
         source.usage_counts.as_ref(),
         options,
     ))
+}
+
+pub fn extract(path: impl AsRef<Path>, options: &MTLBExtractOptions) -> Result<MTLBExtractReport> {
+    let source = load_source(path.as_ref())?;
+    let mut files = Vec::new();
+    let mut notes = source_notes(source.is_bundle, source.usage_counts.is_some());
+
+    if source.direct_files.is_empty() {
+        notes.push("no direct MTLB files found".to_owned());
+        return Ok(MTLBExtractReport {
+            root_path: source.root_path,
+            all: options.all,
+            extracted_count: 0,
+            extracted_bytes: 0,
+            files,
+            notes,
+        });
+    }
+
+    if options.all {
+        let output_dir = options.output_dir.as_ref().ok_or_else(|| {
+            Error::InvalidInput(
+                "must specify --output-dir when extracting all MTLB files".to_owned(),
+            )
+        })?;
+        fs::create_dir_all(output_dir)?;
+
+        for file in &source.direct_files {
+            let output_path = output_dir.join(format!("{}.metallib", file.file_name));
+            fs::copy(&file.path, &output_path)?;
+            files.push(MTLBExtractedFile {
+                library_name: file.file_name.clone(),
+                source_path: file.path.clone(),
+                output_path,
+                bytes: file.file_size,
+            });
+        }
+    } else {
+        let target = select_extract_target(&source.direct_files, options.library.as_deref())?;
+        let output_path = options
+            .output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("{}.metallib", target.file_name)));
+        fs::copy(&target.path, &output_path)?;
+        files.push(MTLBExtractedFile {
+            library_name: target.file_name.clone(),
+            source_path: target.path.clone(),
+            output_path,
+            bytes: target.file_size,
+        });
+    }
+
+    Ok(MTLBExtractReport {
+        root_path: source.root_path,
+        all: options.all,
+        extracted_count: files.len(),
+        extracted_bytes: files.iter().map(|file| file.bytes).sum(),
+        files,
+        notes,
+    })
 }
 
 pub fn scan_bundle(bundle_path: impl AsRef<Path>) -> Result<MTLBBundleReport> {
@@ -581,6 +667,39 @@ pub fn export_functions_json(report: &MTLBFunctionsReport) -> String {
     })
 }
 
+pub fn format_extract_report(report: &MTLBExtractReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Path: {}\n", report.root_path.display()));
+    out.push_str(&format!(
+        "Extracted: {} librar{} ({} bytes)\n",
+        report.extracted_count,
+        if report.extracted_count == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        report.extracted_bytes
+    ));
+    if !report.notes.is_empty() {
+        out.push_str("Notes:\n");
+        for note in &report.notes {
+            out.push_str(&format!("  - {note}\n"));
+        }
+    }
+    if !report.files.is_empty() {
+        out.push_str("\nFiles:\n");
+        for file in &report.files {
+            out.push_str(&format!(
+                "  - {} -> {} ({} bytes)\n",
+                file.library_name,
+                file.output_path.display(),
+                file.bytes
+            ));
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 struct MTLBSource {
     root_path: PathBuf,
@@ -619,6 +738,30 @@ fn load_source(path: &Path) -> Result<MTLBSource> {
         scan_error_count: 0,
         usage_counts: None,
     })
+}
+
+fn select_extract_target<'a>(
+    files: &'a [MTLBFileReport],
+    library: Option<&str>,
+) -> Result<&'a MTLBFileReport> {
+    if let Some(library) = library {
+        return files
+            .iter()
+            .find(|file| {
+                file.file_name == library
+                    || file
+                        .path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| stem == library)
+            })
+            .ok_or_else(|| Error::InvalidInput(format!("library not found: {library}")));
+    }
+
+    files
+        .iter()
+        .max_by_key(|file| file.file_size)
+        .ok_or_else(|| Error::InvalidInput("no MTLB files available for extraction".to_owned()))
 }
 
 fn approximate_usage_counts(bundle_path: &Path) -> Option<BTreeMap<String, usize>> {
@@ -1149,6 +1292,55 @@ mod tests {
         assert_eq!(report.direct_files[0].path, direct_path);
         assert_eq!(report.embedded_candidates[0].path, embedded_path);
         assert_eq!(report.embedded_candidates[0].magic_offsets, vec![64, 192]);
+    }
+
+    #[test]
+    fn extract_copies_selected_or_all_direct_libraries() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path().join("sample.gputrace");
+        fs::create_dir(&bundle).unwrap();
+
+        let small_path = bundle.join("small.mtlb");
+        fs::write(&small_path, sample_mtlb(&["small_kernel"], 128, 48, 72, 96)).unwrap();
+        let large_path = bundle.join("large.mtlb");
+        fs::write(
+            &large_path,
+            sample_mtlb(&["large_kernel"], 192, 48, 96, 160),
+        )
+        .unwrap();
+
+        let selected_output = dir.path().join("selected.metallib");
+        let selected = extract(
+            &bundle,
+            &MTLBExtractOptions {
+                output: Some(selected_output.clone()),
+                library: Some("small".to_owned()),
+                all: false,
+                output_dir: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.extracted_count, 1);
+        assert_eq!(selected.files[0].library_name, "small.mtlb");
+        assert_eq!(
+            fs::read(&selected_output).unwrap(),
+            fs::read(&small_path).unwrap()
+        );
+
+        let output_dir = dir.path().join("out");
+        let all = extract(
+            &bundle,
+            &MTLBExtractOptions {
+                output: None,
+                library: None,
+                all: true,
+                output_dir: Some(output_dir.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(all.extracted_count, 2);
+        assert!(output_dir.join("small.mtlb.metallib").is_file());
+        assert!(output_dir.join("large.mtlb.metallib").is_file());
     }
 
     #[test]

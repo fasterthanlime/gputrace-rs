@@ -25,6 +25,7 @@ fn top_level_help_lists_current_analysis_commands() {
         "timeline",
         "fences",
         "api-calls",
+        "dump",
         "dump-records",
         "export-counters",
         "validate-counters",
@@ -100,6 +101,65 @@ fn perfcounters_validate_alias_parses_to_validate_counters() {
         "--csv",
         "Counters.csv",
     ]);
+    assert!(cli.is_ok());
+}
+
+#[test]
+fn dump_help_matches_go_surface() {
+    let help = render_help(&["dump"]);
+
+    assert!(help.contains("<TRACE>"));
+    assert!(help.contains("--filter <FILTER>"));
+    assert!(help.contains("--buffers-only"));
+    assert!(help.contains("--dispatch-only"));
+    assert!(help.contains("--encoders-only"));
+    assert!(help.contains("--command-buffer <COMMAND_BUFFER>"));
+    assert!(help.contains("--json"));
+    assert!(help.contains("--full"));
+}
+
+#[test]
+fn mtlb_help_lists_go_subcommands() {
+    let help = render_help(&["mtlb"]);
+
+    for subcommand in [
+        "list",
+        "info",
+        "inventory",
+        "stats",
+        "functions",
+        "export-functions",
+        "extract",
+    ] {
+        assert!(
+            help.contains(subcommand),
+            "mtlb help should mention {subcommand}\n{help}"
+        );
+    }
+}
+
+#[test]
+fn mtlb_extract_help_mentions_selection_and_output_flags() {
+    let help = render_help(&["mtlb", "extract"]);
+
+    assert!(help.contains("<PATH>"));
+    assert!(help.contains("--output <OUTPUT>"));
+    assert!(help.contains("--library <LIBRARY>"));
+    assert!(help.contains("--all"));
+    assert!(help.contains("--output-dir <OUTPUT_DIR>"));
+    assert!(help.contains("--format <FORMAT>"));
+}
+
+#[test]
+fn mtlb_export_functions_defaults_to_csv() {
+    let help = render_help(&["mtlb", "export-functions"]);
+
+    assert!(help.contains("[default: csv]"));
+}
+
+#[test]
+fn timing_profiler_alias_parses() {
+    let cli = Cli::try_parse_from(["gputrace", "timing-profiler", "trace.gputrace", "--json"]);
     assert!(cli.is_ok());
 }
 

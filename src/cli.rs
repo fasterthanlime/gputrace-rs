@@ -43,6 +43,7 @@ enum CommandSet {
     AnalyzeUsage(AnalyzeUsageArgs),
     ApiCalls(ApiCallsArgs),
     ClearBuffers(ClearBuffersArgs),
+    Dump(DumpArgs),
     DumpRecords(DumpRecordsArgs),
     ExportCounters(ExportCountersArgs),
     #[command(alias = "perfcounters-validate")]
@@ -62,6 +63,8 @@ enum CommandSet {
     ShaderHotspots(ShaderHotspotsArgs),
     Correlate(CorrelateArgs),
     Timing(TimingArgs),
+    #[command(hide = true)]
+    TimingProfiler(TimingProfilerArgs),
     CommandBuffers(CommandBuffersArgs),
     BufferAccess(BufferAccessArgs),
     Tree(TreeArgs),
@@ -148,6 +151,25 @@ struct ClearBuffersArgs {
 }
 
 #[derive(Debug, Args)]
+struct DumpArgs {
+    trace: PathBuf,
+    #[arg(long)]
+    filter: Option<String>,
+    #[arg(long, default_value_t = false)]
+    buffers_only: bool,
+    #[arg(long, default_value_t = false)]
+    dispatch_only: bool,
+    #[arg(long, default_value_t = false)]
+    encoders_only: bool,
+    #[arg(long)]
+    command_buffer: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    json: bool,
+    #[arg(long, default_value_t = false)]
+    full: bool,
+}
+
+#[derive(Debug, Args)]
 struct VersionArgs {
     #[arg(long, default_value_t = false)]
     json: bool,
@@ -190,9 +212,22 @@ struct ValidateCountersArgs {
 
 #[derive(Debug, Args)]
 struct MtlbArgs {
-    path: PathBuf,
+    #[command(subcommand)]
+    command: Option<MtlbCommand>,
+    path: Option<PathBuf>,
     #[arg(short, long, default_value = "text")]
     format: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum MtlbCommand {
+    List(MtlbPathArgs),
+    Info(MtlbPathArgs),
+    Inventory(MtlbPathArgs),
+    Stats(MtlbPathArgs),
+    Functions(MtlbFunctionsArgs),
+    ExportFunctions(MtlbExportFunctionsArgs),
+    Extract(MtlbExtractArgs),
 }
 
 #[derive(Debug, Args)]
@@ -211,6 +246,34 @@ struct MtlbFunctionsArgs {
     used_only: bool,
     #[arg(long = "no-usage", default_value_t = false)]
     no_usage: bool,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct MtlbExportFunctionsArgs {
+    path: PathBuf,
+    #[arg(long)]
+    filter: Option<String>,
+    #[arg(long, default_value_t = false)]
+    used_only: bool,
+    #[arg(long = "no-usage", default_value_t = false)]
+    no_usage: bool,
+    #[arg(short, long, default_value = "csv")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct MtlbExtractArgs {
+    path: PathBuf,
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    #[arg(long)]
+    library: Option<String>,
+    #[arg(long, default_value_t = false)]
+    all: bool,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -306,6 +369,15 @@ struct TimelineArgs {
     format: String,
     #[arg(long, default_value_t = false)]
     raw: bool,
+}
+
+#[derive(Debug, Args)]
+struct TimingProfilerArgs {
+    trace: PathBuf,
+    #[arg(short, long, default_value_t = false)]
+    verbose: bool,
+    #[arg(long, default_value_t = false)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -572,6 +644,30 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+        CommandSet::Dump(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            if args.json {
+                let report = apicalls::report(&trace, args.filter.as_deref())?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if args.buffers_only {
+                let report = buffers::analyze(&trace)?;
+                print!("{}", buffers::format_table(&report));
+            } else if args.dispatch_only {
+                let report = apicalls::report(&trace, args.filter.as_deref())?;
+                let report = apicalls::filter_call_kind_report(&report, "dispatch");
+                print!("{}", apicalls::format_report(&report));
+            } else if args.encoders_only {
+                let report = commands::encoders(&trace)?;
+                print!("{}", commands::format_encoders(&report, args.full));
+            } else if let Some(command_buffer) = args.command_buffer {
+                let report = apicalls::report(&trace, args.filter.as_deref())?;
+                let filtered = apicalls::filter_command_buffer_report(&report, command_buffer);
+                print!("{}", apicalls::format_report(&filtered));
+            } else {
+                let report = apicalls::report(&trace, args.filter.as_deref())?;
+                print!("{}", apicalls::format_report(&report));
+            }
+        }
         CommandSet::DumpRecords(args) => {
             let trace = TraceBundle::open(args.trace)?;
             let filter = dump::DumpFilter {
@@ -623,26 +719,7 @@ pub fn run() -> Result<()> {
             }
         }
         CommandSet::Mtlb(args) => {
-            let metadata = std::fs::metadata(&args.path)?;
-            match (metadata.is_dir(), args.format.as_str()) {
-                (true, "text" | "table") => {
-                    let report = mtlb::scan_bundle(args.path)?;
-                    print!("{}", mtlb::format_bundle_report(&report));
-                }
-                (true, "json") => {
-                    let report = mtlb::scan_bundle(args.path)?;
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                }
-                (false, "text" | "table") => {
-                    let report = mtlb::inspect_file(args.path)?;
-                    print!("{}", mtlb::format_file_report(&report));
-                }
-                (false, "json") => {
-                    let report = mtlb::inspect_file(args.path)?;
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                }
-                _ => return Err(crate::Error::Unsupported("unknown mtlb format")),
-            }
+            run_mtlb_command(args)?;
         }
         CommandSet::MtlbInventory(args) => {
             let report = mtlb::inventory(args.path)?;
@@ -806,6 +883,22 @@ pub fn run() -> Result<()> {
                 "csv" => print!("{}", timing::format_csv(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown timing format")),
+            }
+        }
+        CommandSet::TimingProfiler(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = timing::report(&trace)?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", timing::format_report(&report));
+                if args.verbose {
+                    print!("\n=== Detailed Information ===\n");
+                    print!("Data Source: {}\n", trace.path.display());
+                    print!("Encoders with timing: {}\n", report.encoders.len());
+                    print!("Dispatches with timing: {}\n", report.dispatch_count);
+                    print!("Timing source: {}\n", report.source);
+                }
             }
         }
         CommandSet::CommandBuffers(args) => {
@@ -1247,6 +1340,135 @@ pub fn run() -> Result<()> {
                 })?;
                 print!("{}", format_xcode_export(&report));
             }
+        }
+    }
+    Ok(())
+}
+
+fn run_mtlb_command(args: MtlbArgs) -> Result<()> {
+    match args.command {
+        Some(MtlbCommand::List(args)) | Some(MtlbCommand::Inventory(args)) => {
+            print_mtlb_inventory(args.path, &args.format, "mtlb inventory")
+        }
+        Some(MtlbCommand::Info(args)) => print_mtlb_info(args.path, &args.format),
+        Some(MtlbCommand::Stats(args)) => print_mtlb_stats(args.path, &args.format, "mtlb stats"),
+        Some(MtlbCommand::Functions(args)) => print_mtlb_functions(
+            args.path,
+            args.filter,
+            args.used_only,
+            args.no_usage,
+            &args.format,
+            "mtlb functions",
+        ),
+        Some(MtlbCommand::ExportFunctions(args)) => print_mtlb_functions(
+            args.path,
+            args.filter,
+            args.used_only,
+            args.no_usage,
+            &args.format,
+            "mtlb export-functions",
+        ),
+        Some(MtlbCommand::Extract(args)) => {
+            let report = mtlb::extract(
+                args.path,
+                &mtlb::MTLBExtractOptions {
+                    output: args.output,
+                    library: args.library,
+                    all: args.all,
+                    output_dir: args.output_dir,
+                },
+            )?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", mtlb::format_extract_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown mtlb extract format")),
+            }
+            Ok(())
+        }
+        None => {
+            let path = args.path.ok_or_else(|| {
+                crate::Error::InvalidInput("mtlb requires a path or subcommand".to_owned())
+            })?;
+            print_mtlb_info(path, &args.format)
+        }
+    }
+}
+
+fn print_mtlb_info(path: PathBuf, format: &str) -> Result<()> {
+    let metadata = std::fs::metadata(&path).map_err(crate::Error::Io)?;
+    if metadata.is_dir() {
+        let report = mtlb::scan_bundle(path)?;
+        match format {
+            "text" | "table" => print!("{}", mtlb::format_bundle_report(&report)),
+            "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+            _ => return Err(crate::Error::Unsupported("unknown mtlb info format")),
+        }
+    } else {
+        let report = mtlb::inspect_file(path)?;
+        match format {
+            "text" | "table" => print!("{}", mtlb::format_file_report(&report)),
+            "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+            _ => return Err(crate::Error::Unsupported("unknown mtlb info format")),
+        }
+    }
+    Ok(())
+}
+
+fn print_mtlb_inventory(path: PathBuf, format: &str, command_name: &'static str) -> Result<()> {
+    let report = mtlb::inventory(path)?;
+    match format {
+        "text" | "table" => print!("{}", mtlb::format_inventory_report(&report)),
+        "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+        _ => {
+            return Err(crate::Error::Unsupported(match command_name {
+                "mtlb inventory" => "unknown mtlb inventory format",
+                _ => "unknown mtlb list format",
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn print_mtlb_stats(path: PathBuf, format: &str, command_name: &'static str) -> Result<()> {
+    let report = mtlb::stats(path)?;
+    match format {
+        "text" | "table" => print!("{}", mtlb::format_stats_report(&report)),
+        "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+        _ => {
+            return Err(crate::Error::Unsupported(match command_name {
+                "mtlb stats" => "unknown mtlb stats format",
+                _ => "unknown mtlb-stats format",
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn print_mtlb_functions(
+    path: PathBuf,
+    filter: Option<String>,
+    used_only: bool,
+    no_usage: bool,
+    format: &str,
+    command_name: &'static str,
+) -> Result<()> {
+    let report = mtlb::functions(
+        path,
+        &mtlb::MTLBFunctionsOptions {
+            filter,
+            used_only,
+            include_usage: !no_usage,
+        },
+    )?;
+    match format {
+        "text" | "table" => print!("{}", mtlb::format_functions_report(&report)),
+        "csv" => print!("{}", mtlb::export_functions_csv(&report)),
+        "json" => print!("{}", mtlb::export_functions_json(&report)),
+        _ => {
+            return Err(crate::Error::Unsupported(match command_name {
+                "mtlb export-functions" => "unknown mtlb export-functions format",
+                _ => "unknown mtlb functions format",
+            }));
         }
     }
     Ok(())
