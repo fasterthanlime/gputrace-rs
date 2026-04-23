@@ -51,8 +51,10 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
         out.push_str("\n## Kernels\n\n");
         for stat in report.kernel_stats.iter().take(10) {
             out.push_str(&format!(
-                "- `{}`: {} dispatches\n",
-                stat.name, stat.dispatch_count
+                "- `{}`: {} dispatches, {} buffers\n",
+                stat.name,
+                stat.dispatch_count,
+                stat.buffers.len()
             ));
         }
     }

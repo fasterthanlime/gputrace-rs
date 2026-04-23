@@ -82,6 +82,7 @@ pub struct DispatchCall {
     pub encoder_id: Option<u64>,
     pub pipeline_addr: Option<u64>,
     pub kernel_name: Option<String>,
+    pub buffers: Vec<BoundBuffer>,
     pub grid_size: [u32; 3],
     pub group_size: [u32; 3],
 }
@@ -92,6 +93,7 @@ pub struct KernelStat {
     pub pipeline_addr: u64,
     pub dispatch_count: usize,
     pub encoder_labels: BTreeMap<String, usize>,
+    pub buffers: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +111,14 @@ pub struct PipelineStateEvent {
     pub encoder_addr: u64,
     pub pipeline_addr: u64,
     pub function_addr: u64,
+    pub buffers: Vec<BoundBuffer>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BoundBuffer {
+    pub address: u64,
+    pub name: Option<String>,
+    pub index: usize,
 }
 
 impl TraceBundle {
@@ -221,6 +231,7 @@ impl TraceBundle {
                 encoder_id: Some(dispatch.encoder_id),
                 pipeline_addr: None,
                 kernel_name: None,
+                buffers: Vec::new(),
                 grid_size: dispatch.grid_size,
                 group_size: dispatch.group_size,
             });
@@ -232,7 +243,8 @@ impl TraceBundle {
         let capture = self.capture_data()?;
         let command_buffers = parse_command_buffers(&capture);
         let encoders = dedupe_encoders(parse_compute_encoders(&capture))?;
-        let pipeline_events = parse_pipeline_state_events(&capture)?;
+        let buffer_names = self.buffer_name_map()?;
+        let pipeline_events = parse_pipeline_state_events(&capture, &buffer_names)?;
         let dispatches = self.dispatch_calls()?;
         Ok(build_command_buffer_regions(
             &capture,
@@ -255,6 +267,7 @@ impl TraceBundle {
                 pipeline_addr: *addr,
                 dispatch_count: 0,
                 encoder_labels: BTreeMap::new(),
+                buffers: BTreeMap::new(),
             });
         }
 
@@ -302,6 +315,7 @@ impl TraceBundle {
                     pipeline_addr,
                     dispatch_count: 0,
                     encoder_labels: BTreeMap::new(),
+                    buffers: BTreeMap::new(),
                 });
                 stat.dispatch_count += 1;
                 if let Some(encoder) = encoder
@@ -311,6 +325,13 @@ impl TraceBundle {
                         .encoder_labels
                         .entry(encoder.label.clone())
                         .or_default() += 1;
+                }
+                for buffer in &dispatch.buffers {
+                    let key = buffer
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("0x{:x}", buffer.address));
+                    *stat.buffers.entry(key).or_default() += 1;
                 }
             }
         }
@@ -323,6 +344,17 @@ impl TraceBundle {
         }
 
         Ok(stats)
+    }
+
+    pub fn buffer_name_map(&self) -> Result<BTreeMap<u64, String>> {
+        let capture = self.capture_data()?;
+        let mut names = BTreeMap::new();
+        collect_buffer_names_from_data(&capture, &mut names)?;
+        for resource in &self.device_resources {
+            let data = fs::read(&resource.path)?;
+            collect_buffer_names_from_data(&data, &mut names)?;
+        }
+        Ok(names)
     }
 }
 
@@ -463,6 +495,18 @@ fn collect_pipeline_mappings_from_data(
     Ok(())
 }
 
+fn collect_buffer_names_from_data(data: &[u8], names: &mut BTreeMap<u64, String>) -> Result<()> {
+    let records = MTSPRecord::parse_stream(data)?;
+    for record in records {
+        if record.record_type != RecordType::CtU {
+            continue;
+        }
+        let ctu = record.parse_ctu_record()?;
+        names.insert(ctu.address, ctu.name);
+    }
+    Ok(())
+}
+
 fn parse_command_buffers(data: &[u8]) -> Vec<CommandBuffer> {
     let marker = b"CUUU";
     let mut command_buffers = Vec::new();
@@ -506,7 +550,10 @@ fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
     encoders
 }
 
-fn parse_pipeline_state_events(data: &[u8]) -> Result<Vec<PipelineStateEvent>> {
+fn parse_pipeline_state_events(
+    data: &[u8],
+    buffer_names: &BTreeMap<u64, String>,
+) -> Result<Vec<PipelineStateEvent>> {
     let records = MTSPRecord::parse_stream(data)?;
     let mut events = Vec::new();
     for record in records {
@@ -519,6 +566,15 @@ fn parse_pipeline_state_events(data: &[u8]) -> Result<Vec<PipelineStateEvent>> {
             encoder_addr: ct.function_addr,
             pipeline_addr: ct.pipeline_addr,
             function_addr: ct.function_addr,
+            buffers: ct
+                .resource_bindings
+                .into_iter()
+                .map(|binding| BoundBuffer {
+                    address: binding.address,
+                    name: buffer_names.get(&binding.address).cloned(),
+                    index: binding.index,
+                })
+                .collect(),
         });
     }
     Ok(events)
@@ -616,6 +672,7 @@ fn attribute_dispatches(
         if let Some(event) = event {
             dispatch.pipeline_addr = Some(event.pipeline_addr);
             dispatch.kernel_name = pipeline_map.get(&event.pipeline_addr).cloned();
+            dispatch.buffers = event.buffers.clone();
             if dispatch.encoder_id.is_none() {
                 dispatch.encoder_id = Some(event.encoder_addr);
             }
@@ -717,6 +774,7 @@ mod tests {
                 encoder_id: Some(1),
                 pipeline_addr: None,
                 kernel_name: None,
+                buffers: Vec::new(),
                 grid_size: [1, 1, 1],
                 group_size: [1, 1, 1],
             },
@@ -726,6 +784,7 @@ mod tests {
                 encoder_id: Some(2),
                 pipeline_addr: None,
                 kernel_name: None,
+                buffers: Vec::new(),
                 grid_size: [1, 1, 1],
                 group_size: [1, 1, 1],
             },
@@ -736,12 +795,22 @@ mod tests {
                 encoder_addr: 1,
                 pipeline_addr: 10,
                 function_addr: 1,
+                buffers: vec![BoundBuffer {
+                    address: 0xaa,
+                    name: Some("ba".into()),
+                    index: 0,
+                }],
             },
             PipelineStateEvent {
                 offset: 65,
                 encoder_addr: 2,
                 pipeline_addr: 20,
                 function_addr: 2,
+                buffers: vec![BoundBuffer {
+                    address: 0xbb,
+                    name: Some("bb".into()),
+                    index: 1,
+                }],
             },
         ];
         let mut pipeline_map = BTreeMap::new();
@@ -761,9 +830,17 @@ mod tests {
         assert_eq!(regions[0].pipeline_events.len(), 1);
         assert_eq!(regions[0].dispatches.len(), 1);
         assert_eq!(regions[0].dispatches[0].kernel_name.as_deref(), Some("ka"));
+        assert_eq!(
+            regions[0].dispatches[0].buffers[0].name.as_deref(),
+            Some("ba")
+        );
         assert_eq!(regions[1].encoders.len(), 1);
         assert_eq!(regions[1].pipeline_events.len(), 1);
         assert_eq!(regions[1].dispatches.len(), 1);
         assert_eq!(regions[1].dispatches[0].kernel_name.as_deref(), Some("kb"));
+        assert_eq!(
+            regions[1].dispatches[0].buffers[0].name.as_deref(),
+            Some("bb")
+        );
     }
 }

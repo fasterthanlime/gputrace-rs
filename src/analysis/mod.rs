@@ -65,6 +65,12 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
             "Top kernel: {} ({} dispatches)",
             top_kernel.name, top_kernel.dispatch_count
         ));
+        if !top_kernel.buffers.is_empty() {
+            findings.push(format!(
+                "Top kernel touches {} distinct bound buffers.",
+                top_kernel.buffers.len()
+            ));
+        }
     }
 
     AnalysisReport {
