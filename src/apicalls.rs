@@ -534,11 +534,13 @@ mod tests {
                         address: 0xb0,
                         name: Some("input".into()),
                         index: 0,
+                        usage: crate::trace::MTLResourceUsage::READ,
                     },
                     BoundBuffer {
                         address: 0xb1,
                         name: Some("output".into()),
                         index: 1,
+                        usage: crate::trace::MTLResourceUsage::WRITE,
                     },
                 ],
                 grid_size: [64, 1, 1],

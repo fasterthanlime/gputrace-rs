@@ -120,6 +120,7 @@ pub struct BoundBuffer {
     pub address: u64,
     pub name: Option<String>,
     pub index: usize,
+    pub usage: MTLResourceUsage,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -661,6 +662,7 @@ fn parse_pipeline_state_events(
                     address: binding.address,
                     name: buffer_names.get(&binding.address).cloned(),
                     index: binding.index,
+                    usage: binding.usage,
                 })
                 .collect(),
         });
@@ -946,6 +948,7 @@ mod tests {
                     address: 0xaa,
                     name: Some("ba".into()),
                     index: 0,
+                    usage: MTLResourceUsage::READ | MTLResourceUsage::WRITE,
                 }],
             },
             PipelineStateEvent {
@@ -957,6 +960,7 @@ mod tests {
                     address: 0xbb,
                     name: Some("bb".into()),
                     index: 1,
+                    usage: MTLResourceUsage::READ | MTLResourceUsage::WRITE,
                 }],
             },
         ];
@@ -1014,6 +1018,7 @@ mod tests {
                             address: 0xaa,
                             name: Some("ba".into()),
                             index: 0,
+                            usage: MTLResourceUsage::READ | MTLResourceUsage::WRITE,
                         }],
                         grid_size: [1, 1, 1],
                         group_size: [1, 1, 1],
@@ -1028,6 +1033,7 @@ mod tests {
                             address: 0xbb,
                             name: Some("bb".into()),
                             index: 1,
+                            usage: MTLResourceUsage::READ | MTLResourceUsage::WRITE,
                         }],
                         grid_size: [1, 1, 1],
                         group_size: [1, 1, 1],
@@ -1053,6 +1059,7 @@ mod tests {
                         address: 0xaa,
                         name: Some("ba".into()),
                         index: 0,
+                        usage: MTLResourceUsage::READ | MTLResourceUsage::WRITE,
                     }],
                     grid_size: [1, 1, 1],
                     group_size: [1, 1, 1],
