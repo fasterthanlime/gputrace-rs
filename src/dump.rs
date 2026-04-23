@@ -224,7 +224,7 @@ pub struct RecordDumpRow {
 }
 
 pub fn summarize_records(records: &[MTSPRecord]) -> RecordDumpSummary {
-    summarize_with_slice(records, records)
+    build_record_dump(records, DumpFilter::default()).summary
 }
 
 pub fn build_record_dump(records: &[MTSPRecord], filter: DumpFilter) -> RecordDumpReport {
@@ -639,28 +639,6 @@ fn summarize_with_entries(
         unique_addresses,
         unique_function_addresses,
     }
-}
-
-fn summarize_with_slice(
-    all_records: &[MTSPRecord],
-    shown_records: &[MTSPRecord],
-) -> RecordDumpSummary {
-    let entries = shown_records
-        .iter()
-        .enumerate()
-        .map(|(index, record)| RecordDumpEntry {
-            index,
-            record_type: record.record_type,
-            offset: record.offset,
-            size: record.size,
-            label: record.label.clone(),
-            address: record.address,
-            function_address: record.function_address,
-            parsed: parse_record_fields(record),
-            hex_preview: None,
-        })
-        .collect::<Vec<_>>();
-    summarize_with_entries(all_records, &entries)
 }
 
 fn matches_filter(record: &MTSPRecord, filter: &DumpFilter) -> bool {
