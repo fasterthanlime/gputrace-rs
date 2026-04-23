@@ -22,11 +22,34 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
         "* Device resources: `{}` files / `{}` bytes\n\n",
         report.trace.device_resource_count, report.trace.device_resource_bytes
     ));
+    out.push_str(&format!(
+        "* Command buffers: `{}`\n",
+        report.command_buffer_count
+    ));
+    out.push_str(&format!(
+        "* Compute encoders: `{}`\n",
+        report.compute_encoder_count
+    ));
+    out.push_str(&format!("* Dispatch calls: `{}`\n", report.dispatch_count));
+    out.push_str(&format!(
+        "* Pipeline mappings: `{}`\n",
+        report.pipeline_function_count
+    ));
+    out.push_str(&format!("* Kernels: `{}`\n\n", report.kernel_count));
     if report.findings.is_empty() {
         out.push_str("No findings yet.\n");
     } else {
         for finding in &report.findings {
             out.push_str(&format!("- {finding}\n"));
+        }
+    }
+    if !report.kernel_stats.is_empty() {
+        out.push_str("\n## Kernels\n\n");
+        for stat in report.kernel_stats.iter().take(10) {
+            out.push_str(&format!(
+                "- `{}`: {} dispatches\n",
+                stat.name, stat.dispatch_count
+            ));
         }
     }
     out
@@ -39,6 +62,15 @@ pub fn diff_report(report: &DiffReport) -> String {
     out.push_str(&format!("* Right: `{}`\n\n", report.right.trace.trace_name));
     for line in &report.summary {
         out.push_str(&format!("- {line}\n"));
+    }
+    if !report.kernel_changes.is_empty() {
+        out.push_str("\n## Kernel Changes\n\n");
+        for change in report.kernel_changes.iter().take(10) {
+            out.push_str(&format!(
+                "- `{}`: {} -> {} ({:+})\n",
+                change.name, change.left_dispatches, change.right_dispatches, change.delta
+            ));
+        }
     }
     out
 }
