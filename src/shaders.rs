@@ -26,6 +26,8 @@ pub struct ShaderEntry {
     pub dispatch_count: usize,
     pub total_duration_ns: Option<u64>,
     pub percent_of_total: Option<f64>,
+    pub execution_cost_percent: Option<f64>,
+    pub execution_cost_samples: usize,
     pub sample_count: usize,
     pub avg_sampling_density: Option<f64>,
     pub source_file: Option<PathBuf>,
@@ -61,6 +63,8 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
     let index = ShaderSourceIndex::build(search_paths)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     let mut duration_by_name = BTreeMap::<String, u64>::new();
+    let mut execution_cost_by_name = BTreeMap::<String, f64>::new();
+    let mut execution_cost_samples_by_name = BTreeMap::<String, usize>::new();
     let mut sample_count_by_name = BTreeMap::<String, usize>::new();
     let mut density_sum_by_name = BTreeMap::<String, f64>::new();
     let mut density_count_by_name = BTreeMap::<String, usize>::new();
@@ -79,6 +83,14 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 *density_sum_by_name.entry(name.clone()).or_default() += dispatch.sampling_density;
                 *density_count_by_name.entry(name).or_default() += 1;
             }
+        }
+        for cost in &summary.execution_costs {
+            let name = cost
+                .function_name
+                .clone()
+                .unwrap_or_else(|| format!("pipeline_{}", cost.pipeline_id));
+            *execution_cost_by_name.entry(name.clone()).or_default() += cost.cost_percent;
+            *execution_cost_samples_by_name.entry(name).or_default() += cost.sample_count;
         }
     }
 
@@ -111,6 +123,11 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 dispatch_count: kernel.dispatch_count,
                 total_duration_ns: total_duration_ns_for_shader,
                 percent_of_total,
+                execution_cost_percent: execution_cost_by_name.get(&kernel_name).copied(),
+                execution_cost_samples: execution_cost_samples_by_name
+                    .get(&kernel_name)
+                    .copied()
+                    .unwrap_or(0),
                 sample_count: sample_count_by_name.get(&kernel_name).copied().unwrap_or(0),
                 avg_sampling_density,
                 source_file,
@@ -194,12 +211,13 @@ pub fn format_report(report: &ShaderReport) -> String {
         .any(|shader| shader.total_duration_ns.is_some());
     if has_profiler_timing {
         out.push_str(&format!(
-            "{:<36} {:<18} {:>10} {:>14} {:>8} {:>8} {:>10}  {}\n",
+            "{:<36} {:<18} {:>10} {:>14} {:>8} {:>8} {:>8} {:>10}  {}\n",
             "Name",
             "Pipeline State",
             "Dispatches",
             "Duration ns",
-            "Cost %",
+            "Time %",
+            "Exec %",
             "Samples",
             "Samples/us",
             "Source"
@@ -217,7 +235,7 @@ pub fn format_report(report: &ShaderReport) -> String {
         };
         if has_profiler_timing {
             out.push_str(&format!(
-                "{:<36} 0x{:<16x} {:>10} {:>14} {:>7} {:>8} {:>10}  {}\n",
+                "{:<36} 0x{:<16x} {:>10} {:>14} {:>7} {:>8} {:>8} {:>10}  {}\n",
                 truncate(&shader.name, 36),
                 shader.pipeline_addr,
                 shader.dispatch_count,
@@ -227,6 +245,10 @@ pub fn format_report(report: &ShaderReport) -> String {
                     .unwrap_or_else(|| "-".to_owned()),
                 shader
                     .percent_of_total
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                shader
+                    .execution_cost_percent
                     .map(|value| format!("{value:.2}"))
                     .unwrap_or_else(|| "-".to_owned()),
                 shader.sample_count,
@@ -422,6 +444,8 @@ mod tests {
                 dispatch_count: 2,
                 total_duration_ns: Some(120),
                 percent_of_total: Some(60.0),
+                execution_cost_percent: Some(55.0),
+                execution_cost_samples: 11,
                 sample_count: 4,
                 avg_sampling_density: Some(0.2),
                 source_file: Some(PathBuf::from("/tmp/kernel.metal")),
@@ -431,9 +455,11 @@ mod tests {
 
         let output = format_report(&report);
         assert!(output.contains("Duration ns"));
-        assert!(output.contains("Cost %"));
+        assert!(output.contains("Time %"));
+        assert!(output.contains("Exec %"));
         assert!(output.contains("Samples"));
         assert!(output.contains("Samples/us"));
         assert!(output.contains("60.00"));
+        assert!(output.contains("55.00"));
     }
 }

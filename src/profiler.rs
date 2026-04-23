@@ -23,6 +23,14 @@ pub struct ProfilerPipeline {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProfilerExecutionCost {
+    pub pipeline_id: i64,
+    pub function_name: Option<String>,
+    pub sample_count: usize,
+    pub cost_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProfilerDispatch {
     pub index: usize,
     pub pipeline_index: usize,
@@ -86,6 +94,7 @@ pub struct GprwcntrTimestamp {
 pub struct ProfilerStreamDataSummary {
     pub function_names: Vec<String>,
     pub pipelines: Vec<ProfilerPipeline>,
+    pub execution_costs: Vec<ProfilerExecutionCost>,
     pub dispatches: Vec<ProfilerDispatch>,
     pub encoder_timings: Vec<ProfilerEncoderTiming>,
     pub timeline: Option<ProfilerTimelineInfo>,
@@ -155,7 +164,10 @@ pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
 
     let stream_data_summary = if stream_data_present {
         let stream_data_path = profiler_directory.join("streamData");
-        Some(parse_stream_data(&stream_data_path)?)
+        Some(parse_stream_data(
+            &stream_data_path,
+            Some(&profiler_directory),
+        )?)
     } else {
         None
     };
@@ -200,7 +212,7 @@ pub fn stream_data_summary<P: AsRef<Path>>(path: P) -> Result<ProfilerStreamData
     if !stream_data_path.is_file() {
         return Err(Error::MissingFile(stream_data_path));
     }
-    parse_stream_data(&stream_data_path)
+    parse_stream_data(&stream_data_path, Some(&profiler_directory))
 }
 
 pub fn format_report(report: &ProfilerReport) -> String {
@@ -251,6 +263,19 @@ pub fn format_report(report: &ProfilerReport) -> String {
                 timeline.absolute_time
             ));
         }
+        if !summary.execution_costs.is_empty() {
+            out.push_str("top functions by execution cost\n");
+            for cost in summary.execution_costs.iter().take(5) {
+                let name = cost
+                    .function_name
+                    .clone()
+                    .unwrap_or_else(|| format!("pipeline_{}", cost.pipeline_id));
+                out.push_str(&format!(
+                    "  - {name}: {:.2}% ({} samples)\n",
+                    cost.cost_percent, cost.sample_count
+                ));
+            }
+        }
 
         let top = top_dispatch_functions(summary);
         if !top.is_empty() {
@@ -295,7 +320,10 @@ fn top_dispatch_functions(summary: &ProfilerStreamDataSummary) -> Vec<(String, u
     rows
 }
 
-fn parse_stream_data(path: &Path) -> Result<ProfilerStreamDataSummary> {
+fn parse_stream_data(
+    path: &Path,
+    profiler_dir: Option<&Path>,
+) -> Result<ProfilerStreamDataSummary> {
     let plist = Value::from_file(path)?;
     let archive = plist
         .as_dictionary()
@@ -313,6 +341,9 @@ fn parse_stream_data(path: &Path) -> Result<ProfilerStreamDataSummary> {
     let (pipeline_addresses, pipeline_functions) =
         extract_pipeline_info(objects, root, &function_names);
     let pipelines = extract_pipelines(objects, root, &pipeline_addresses, &pipeline_functions);
+    let execution_costs = profiler_dir
+        .map(|dir| extract_execution_costs(dir, &pipelines))
+        .unwrap_or_default();
     let encoder_timings = extract_encoder_timings(objects, root);
     let mut dispatches = extract_dispatches(objects, root, &pipelines);
     let timeline = extract_timeline(objects, root);
@@ -330,10 +361,74 @@ fn parse_stream_data(path: &Path) -> Result<ProfilerStreamDataSummary> {
             .map(|encoder| encoder.duration_micros)
             .sum(),
         pipelines,
+        execution_costs,
         dispatches,
         encoder_timings,
         timeline,
     })
+}
+
+fn extract_execution_costs(
+    profiler_dir: &Path,
+    pipelines: &[ProfilerPipeline],
+) -> Vec<ProfilerExecutionCost> {
+    let pipeline_map = pipelines
+        .iter()
+        .map(|pipeline| (pipeline.pipeline_id as u32, pipeline))
+        .collect::<BTreeMap<_, _>>();
+    if pipeline_map.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(entries) = fs::read_dir(profiler_dir) else {
+        return Vec::new();
+    };
+
+    let mut counts = BTreeMap::<u32, usize>::new();
+    let mut total_samples = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !path.is_file() || !name.starts_with("Profiling_f_") || !name.ends_with(".raw") {
+            continue;
+        }
+        let Ok(data) = fs::read(&path) else {
+            continue;
+        };
+        for chunk in data.chunks_exact(4) {
+            let value = u32::from_le_bytes(chunk.try_into().unwrap());
+            if pipeline_map.contains_key(&value) {
+                *counts.entry(value).or_default() += 1;
+                total_samples += 1;
+            }
+        }
+    }
+
+    if total_samples == 0 {
+        return Vec::new();
+    }
+
+    let mut costs = counts
+        .into_iter()
+        .filter_map(|(pipeline_id, sample_count)| {
+            pipeline_map
+                .get(&pipeline_id)
+                .map(|pipeline| ProfilerExecutionCost {
+                    pipeline_id: pipeline.pipeline_id,
+                    function_name: pipeline.function_name.clone(),
+                    sample_count,
+                    cost_percent: sample_count as f64 / total_samples as f64 * 100.0,
+                })
+        })
+        .collect::<Vec<_>>();
+    costs.sort_by(|left, right| {
+        right
+            .cost_percent
+            .partial_cmp(&left.cost_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.pipeline_id.cmp(&right.pipeline_id))
+    });
+    costs
 }
 
 fn extract_function_names(objects: &[Value], root: &Dictionary) -> Vec<String> {
@@ -1270,7 +1365,7 @@ mod tests {
             .to_file_binary(&stream_data_path)
             .unwrap();
 
-        let summary = parse_stream_data(&stream_data_path).unwrap();
+        let summary = parse_stream_data(&stream_data_path, None).unwrap();
         assert_eq!(summary.function_names, vec!["kernel_main".to_owned()]);
         assert_eq!(summary.num_pipelines, 1);
         assert_eq!(summary.num_encoders, 1);
@@ -1288,6 +1383,7 @@ mod tests {
         );
         assert_eq!(summary.dispatches[0].duration_us, 90);
         assert_eq!(summary.dispatches[0].sample_count, 0);
+        assert!(summary.execution_costs.is_empty());
         assert!(summary.timeline.is_none());
     }
 
@@ -1299,7 +1395,7 @@ mod tests {
             .to_file_binary(&stream_data_path)
             .unwrap();
 
-        let summary = parse_stream_data(&stream_data_path).unwrap();
+        let summary = parse_stream_data(&stream_data_path, None).unwrap();
         let timeline = summary.timeline.expect("timeline metadata");
         assert_eq!(timeline.timebase_numer, 125);
         assert_eq!(timeline.timebase_denom, 3);
@@ -1366,6 +1462,12 @@ mod tests {
                     pipeline_id: 27,
                     pipeline_address: 0x1111,
                     function_name: Some("kernel_main".to_owned()),
+                }],
+                execution_costs: vec![ProfilerExecutionCost {
+                    pipeline_id: 27,
+                    function_name: Some("kernel_main".to_owned()),
+                    sample_count: 5,
+                    cost_percent: 62.5,
                 }],
                 dispatches: vec![ProfilerDispatch {
                     index: 0,
@@ -1437,5 +1539,6 @@ mod tests {
         assert!(text.contains("kernel_main"));
         assert!(text.contains("command_buffers=1"));
         assert!(text.contains("encoder_profiles=1"));
+        assert!(text.contains("execution cost"));
     }
 }

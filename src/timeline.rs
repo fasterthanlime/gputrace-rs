@@ -1004,6 +1004,7 @@ mod tests {
         profiler::ProfilerStreamDataSummary {
             function_names: vec![],
             pipelines: vec![],
+            execution_costs: vec![],
             dispatches,
             encoder_timings: vec![],
             timeline: Some(timeline),
