@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use std::{io, io::Write};
 
 use clap::{Args, Parser, Subcommand};
@@ -128,6 +129,8 @@ struct DiffArgs {
     quick: bool,
     #[arg(long)]
     by_encoder: bool,
+    #[arg(long)]
+    bench_dir: Option<PathBuf>,
     #[arg(long)]
     md_out: Option<PathBuf>,
     #[arg(short, long)]
@@ -1123,55 +1126,60 @@ pub fn run() -> Result<()> {
             }
         }
         CommandSet::Diff(args) => {
-            if args.left.is_some() && args.left_flag.is_some() {
-                return Err(crate::Error::InvalidInput(
-                    "diff positional left cannot be combined with --left".to_owned(),
-                ));
-            }
-            if args.right.is_some() && args.right_flag.is_some() {
-                return Err(crate::Error::InvalidInput(
-                    "diff positional right cannot be combined with --right".to_owned(),
-                ));
-            }
-            let left = args.left_flag.or(args.left).ok_or_else(|| {
-                crate::Error::InvalidInput("diff requires a left trace path".to_owned())
-            })?;
-            let right = args.right_flag.or(args.right).ok_or_else(|| {
-                crate::Error::InvalidInput("diff requires a right trace path".to_owned())
-            })?;
+            let limit = args.limit;
+            let min_delta_us = args.min_delta_us.unwrap_or_default();
+            let only_encoder = args.only_encoder;
+            let only_function = args.only_function.clone();
+            let md_out = args.md_out.clone();
+            let format_arg = args.format.clone();
+            let markdown_flag = args.markdown;
+            let json_flag = args.json;
+            let csv_flag = args.csv;
+            let by = args.by.clone();
+            let quick = args.quick;
+            let by_encoder = args.by_encoder;
+            let (left, right, discover_note) = resolve_diff_inputs(args)?;
             let report = diff::diff_paths_with_options(
                 left,
                 right,
                 &diff::DiffOptions {
                     profile: diff::ProfileDiffOptions {
-                        limit: args.limit,
-                        min_delta_us: args.min_delta_us.unwrap_or_default(),
-                        only_encoder: args.only_encoder,
-                        only_function: args.only_function,
+                        limit,
+                        min_delta_us,
+                        only_encoder,
+                        only_function,
                     },
                 },
             )?;
-            if let Some(path) = args.md_out.as_ref() {
-                fs::write(path, markdown::diff_report_with_limit(&report, args.limit))?;
+            if let Some(path) = md_out.as_ref() {
+                let mut text = String::new();
+                if let Some(note) = &discover_note {
+                    text.push_str(&format!("<!-- {note} -->\n\n"));
+                }
+                text.push_str(&markdown::diff_report_with_limit(&report, limit));
+                fs::write(path, text)?;
             }
 
-            let format = args.format.as_deref().unwrap_or(if args.csv {
+            let format = format_arg.as_deref().unwrap_or(if csv_flag {
                 "csv"
-            } else if args.markdown || args.quick || args.by_encoder {
+            } else if markdown_flag || quick || by_encoder {
                 "markdown"
             } else {
                 "json"
             });
-            if args.json {
+            if json_flag {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 match format {
                     "markdown" | "md" | "text" => {
-                        print!("{}", markdown::diff_report_with_limit(&report, args.limit));
+                        if let Some(note) = &discover_note {
+                            println!("{note}\n");
+                        }
+                        print!("{}", markdown::diff_report_with_limit(&report, limit));
                     }
                     "csv" => print!(
                         "{}",
-                        diff::format_profile_csv(&report, args.by.as_deref(), args.limit)?
+                        diff::format_profile_csv(&report, by.as_deref(), limit)?
                     ),
                     "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                     _ => return Err(crate::Error::Unsupported("unknown diff format")),
@@ -1655,6 +1663,167 @@ fn run_xcode_profile_command(args: XcodeProfileArgs) -> Result<()> {
             }
         }
     }
+}
+
+fn resolve_diff_inputs(args: DiffArgs) -> Result<(PathBuf, PathBuf, Option<String>)> {
+    if args.left.is_some() && args.left_flag.is_some() {
+        return Err(crate::Error::InvalidInput(
+            "diff positional left cannot be combined with --left".to_owned(),
+        ));
+    }
+    if args.right.is_some() && args.right_flag.is_some() {
+        return Err(crate::Error::InvalidInput(
+            "diff positional right cannot be combined with --right".to_owned(),
+        ));
+    }
+    let explicit_left = args.left_flag.or(args.left);
+    let explicit_right = args.right_flag.or(args.right);
+    if explicit_left.is_some() != explicit_right.is_some() {
+        return Err(crate::Error::InvalidInput(
+            "diff requires both left and right trace paths".to_owned(),
+        ));
+    }
+    if let (Some(left), Some(right)) = (explicit_left, explicit_right) {
+        let note = args
+            .bench_dir
+            .as_ref()
+            .map(|_| "--bench-dir ignored because explicit traces were provided".to_owned());
+        return Ok((left, right, note));
+    }
+    let bench_dir = args.bench_dir.ok_or_else(|| {
+        crate::Error::InvalidInput(
+            "diff requires <left> <right>, --left/--right, or --bench-dir".to_owned(),
+        )
+    })?;
+    let pair = discover_bench_pair(&bench_dir)?;
+    let note = format!(
+        "auto-pair: stem={} left={} right={}",
+        pair.stem,
+        pair.left
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("-"),
+        pair.right
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("-")
+    );
+    Ok((pair.left, pair.right, Some(note)))
+}
+
+#[derive(Debug, Clone)]
+struct BenchPair {
+    stem: String,
+    left: PathBuf,
+    right: PathBuf,
+    left_mtime: SystemTime,
+    right_mtime: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+struct BenchCandidate {
+    path: PathBuf,
+    mtime: SystemTime,
+}
+
+#[derive(Default)]
+struct BenchGroup {
+    go_perf: Vec<BenchCandidate>,
+    py_perf: Vec<BenchCandidate>,
+    go_raw: Vec<BenchCandidate>,
+    py_raw: Vec<BenchCandidate>,
+}
+
+fn discover_bench_pair(dir: &Path) -> Result<BenchPair> {
+    let mut groups = std::collections::BTreeMap::<String, BenchGroup>::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some((stem, side, kind)) = classify_bench_trace_name(&name) else {
+            continue;
+        };
+        let candidate = BenchCandidate {
+            path: entry.path(),
+            mtime: entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+        };
+        let group = groups.entry(stem).or_default();
+        match (side, kind) {
+            ("go", "perf") => group.go_perf.push(candidate),
+            ("py", "perf") => group.py_perf.push(candidate),
+            ("go", "raw") => group.go_raw.push(candidate),
+            ("py", "raw") => group.py_raw.push(candidate),
+            _ => {}
+        }
+    }
+
+    let mut pairs = groups
+        .into_iter()
+        .filter_map(|(stem, group)| select_bench_pair(stem, group))
+        .collect::<Vec<_>>();
+    pairs.sort_by(|left, right| {
+        let left_time = left.left_mtime.max(left.right_mtime);
+        let right_time = right.left_mtime.max(right.right_mtime);
+        right_time
+            .cmp(&left_time)
+            .then_with(|| left.stem.cmp(&right.stem))
+    });
+    pairs.into_iter().next().ok_or_else(|| {
+        crate::Error::InvalidInput(format!(
+            "no Go/Python trace pair found in {}",
+            dir.display()
+        ))
+    })
+}
+
+fn classify_bench_trace_name(name: &str) -> Option<(String, &'static str, &'static str)> {
+    if !name.ends_with(".gputrace") {
+        return None;
+    }
+    let perf = name.contains("-perfdata.gputrace");
+    if let Some((stem, _)) = name.split_once("_Go") {
+        return Some((stem.to_owned(), "go", if perf { "perf" } else { "raw" }));
+    }
+    if let Some((stem, _)) = name.split_once("_Python") {
+        return Some((stem.to_owned(), "py", if perf { "perf" } else { "raw" }));
+    }
+    None
+}
+
+fn select_bench_pair(stem: String, group: BenchGroup) -> Option<BenchPair> {
+    let go_perf = newest_bench_candidate(&group.go_perf);
+    let py_perf = newest_bench_candidate(&group.py_perf);
+    if let (Some(left), Some(right)) = (go_perf, py_perf) {
+        return Some(BenchPair {
+            stem,
+            left: left.path.clone(),
+            right: right.path.clone(),
+            left_mtime: left.mtime,
+            right_mtime: right.mtime,
+        });
+    }
+    let go_raw = newest_bench_candidate(&group.go_raw);
+    let py_raw = newest_bench_candidate(&group.py_raw);
+    let (Some(left), Some(right)) = (go_raw, py_raw) else {
+        return None;
+    };
+    Some(BenchPair {
+        stem,
+        left: left.path.clone(),
+        right: right.path.clone(),
+        left_mtime: left.mtime,
+        right_mtime: right.mtime,
+    })
+}
+
+fn newest_bench_candidate(candidates: &[BenchCandidate]) -> Option<&BenchCandidate> {
+    candidates.iter().max_by_key(|candidate| candidate.mtime)
 }
 
 fn run_xcode_profile_full(
