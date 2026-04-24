@@ -5,6 +5,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::counter_names::ALL_COUNTER_NAMES;
 use crate::profiler;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -22,6 +23,61 @@ pub struct CounterLimiter {
     pub device_memory_bandwidth_gbps: Option<f64>,
     pub buffer_l1_read_bandwidth_gbps: Option<f64>,
     pub buffer_l1_write_bandwidth_gbps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CounterFileMetric {
+    pub file_index: usize,
+    pub metric_name: String,
+    pub unit: Option<String>,
+    pub encoder_index: usize,
+    pub record_count: usize,
+    pub sample_count: usize,
+    pub representative_value: f64,
+    pub min_value: f64,
+    pub max_value: f64,
+    pub mean_value: f64,
+    pub confidence: f64,
+}
+
+pub fn counter_file_metric_name(file_index: usize) -> Option<&'static str> {
+    file_index
+        .checked_sub(4)
+        .and_then(|index| ALL_COUNTER_NAMES.get(index).copied())
+}
+
+pub fn extract_counter_file_metrics(profiler_dir: &Path) -> Vec<CounterFileMetric> {
+    let Ok(entries) = fs::read_dir(profiler_dir) else {
+        return Vec::new();
+    };
+
+    let mut files = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_index = name
+                .strip_prefix("Counters_f_")
+                .and_then(|rest| rest.strip_suffix(".raw"))
+                .and_then(|rest| rest.parse::<usize>().ok())?;
+            path.is_file().then_some((file_index, path))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|(file_index, _)| *file_index);
+
+    let mut metrics = Vec::new();
+    for (file_index, path) in files {
+        let Ok(data) = fs::read(path) else {
+            continue;
+        };
+        metrics.extend(extract_counter_file_metrics_from_data(file_index, &data));
+    }
+    metrics.sort_by(|left, right| {
+        left.encoder_index
+            .cmp(&right.encoder_index)
+            .then_with(|| left.file_index.cmp(&right.file_index))
+    });
+    metrics
 }
 
 pub fn extract_limiters(profiler_dir: &Path) -> Vec<CounterLimiter> {
@@ -107,6 +163,179 @@ pub fn extract_limiters_for_trace(path: &Path) -> Vec<CounterLimiter> {
     profiler::find_profiler_directory(path)
         .map(|dir| extract_limiters(&dir))
         .unwrap_or_default()
+}
+
+fn extract_counter_file_metrics_from_data(
+    file_index: usize,
+    data: &[u8],
+) -> Vec<CounterFileMetric> {
+    let record_starts = find_record_starts(data);
+    if record_starts.is_empty() {
+        return Vec::new();
+    }
+
+    let metric_name = counter_file_metric_name(file_index)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("Counters_f_{file_index}"));
+    let unit = counter_metric_unit(&metric_name).map(ToOwned::to_owned);
+    let mut current_encoder = None;
+    let mut by_encoder = BTreeMap::<usize, (usize, Vec<f64>)>::new();
+
+    for (index, offset) in record_starts.iter().enumerate() {
+        let next = record_starts.get(index + 1).copied().unwrap_or(data.len());
+        let record_size = next.saturating_sub(*offset);
+        if (2300..=2900).contains(&record_size) {
+            let encoder_index = current_encoder.map(|value| value + 1).unwrap_or(0);
+            current_encoder = Some(encoder_index);
+            by_encoder.entry(encoder_index).or_default();
+            continue;
+        }
+        if record_size != 464 {
+            continue;
+        }
+        let encoder_index = current_encoder.unwrap_or(0);
+        let Some(record) = data.get(*offset..(*offset + record_size)) else {
+            continue;
+        };
+        let values = extract_counter_record_values(record, &metric_name);
+        if values.is_empty() {
+            continue;
+        }
+        let (record_count, samples) = by_encoder.entry(encoder_index).or_default();
+        *record_count += 1;
+        samples.extend(values);
+    }
+
+    by_encoder
+        .into_iter()
+        .filter_map(|(encoder_index, (record_count, values))| {
+            summarize_counter_values(
+                file_index,
+                metric_name.clone(),
+                unit.clone(),
+                encoder_index,
+                record_count,
+                values,
+            )
+        })
+        .collect()
+}
+
+fn summarize_counter_values(
+    file_index: usize,
+    metric_name: String,
+    unit: Option<String>,
+    encoder_index: usize,
+    record_count: usize,
+    mut values: Vec<f64>,
+) -> Option<CounterFileMetric> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return None;
+    }
+
+    values.sort_by(|left, right| left.total_cmp(right));
+    let sample_count = values.len();
+    let min_value = values[0];
+    let max_value = values[sample_count - 1];
+    let mean_value = values.iter().sum::<f64>() / sample_count as f64;
+    let representative_value = median_sorted(&values);
+    let confidence = counter_metric_confidence(record_count, sample_count, min_value, max_value);
+
+    Some(CounterFileMetric {
+        file_index,
+        metric_name,
+        unit,
+        encoder_index,
+        record_count,
+        sample_count,
+        representative_value,
+        min_value,
+        max_value,
+        mean_value,
+        confidence,
+    })
+}
+
+fn extract_counter_record_values(record: &[u8], metric_name: &str) -> Vec<f64> {
+    let mut values = Vec::new();
+    let mut seen = Vec::<u32>::new();
+    let max = counter_metric_max_value(metric_name);
+    for chunk in record[4..].chunks_exact(mem::size_of::<u32>()) {
+        let bits = u32::from_le_bytes(chunk.try_into().unwrap());
+        let value = f32::from_bits(bits) as f64;
+        if value.is_finite() && value >= 0.000_001 && value <= max && !seen.contains(&bits) {
+            seen.push(bits);
+            values.push(value);
+        }
+    }
+    values
+}
+
+fn counter_metric_unit(metric_name: &str) -> Option<&'static str> {
+    if metric_name.contains("Bandwidth") {
+        Some("GB/s")
+    } else if metric_name.contains("Utilization")
+        || metric_name.contains("Limiter")
+        || metric_name.contains("Occupancy")
+        || metric_name.contains("Miss Rate")
+        || metric_name.contains("Inefficiency")
+        || metric_name.contains("Residency")
+        || metric_name.contains("Compression Ratio")
+        || metric_name.contains("Average")
+    {
+        Some("%")
+    } else if metric_name.contains("Bytes") {
+        Some("bytes")
+    } else if metric_name.contains("Instructions")
+        || metric_name.contains("Invocations")
+        || metric_name.contains("Accesses")
+        || metric_name.contains("Calls")
+        || metric_name.contains("Pixels")
+        || metric_name.contains("Primitives")
+        || metric_name.contains("Samples")
+        || metric_name.contains("Vertices")
+        || metric_name.contains("Triangles")
+    {
+        Some("count")
+    } else {
+        None
+    }
+}
+
+fn counter_metric_max_value(metric_name: &str) -> f64 {
+    match counter_metric_unit(metric_name) {
+        Some("%") => 10_000.0,
+        Some("GB/s") => 10_000.0,
+        Some("bytes") => 1.0e18,
+        Some("count") => 1.0e15,
+        _ => 1.0e12,
+    }
+}
+
+fn median_sorted(values: &[f64]) -> f64 {
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
+}
+
+fn counter_metric_confidence(
+    record_count: usize,
+    sample_count: usize,
+    min_value: f64,
+    max_value: f64,
+) -> f64 {
+    let record_confidence = (record_count as f64 / 4.0).min(1.0);
+    let sample_confidence = (sample_count as f64 / 12.0).min(1.0);
+    let spread_confidence = if max_value <= f64::EPSILON {
+        0.0
+    } else {
+        1.0 - ((max_value - min_value).abs() / max_value).min(1.0)
+    };
+    (0.45 * record_confidence + 0.35 * sample_confidence + 0.20 * spread_confidence).min(1.0)
 }
 
 fn classify_record_metrics(record: &[u8], limiter: &mut CounterLimiter) {
@@ -266,5 +495,42 @@ mod tests {
         assert!((limiters[0].device_memory_bandwidth_gbps.unwrap() - 8.2).abs() < 0.001);
         assert!((limiters[0].buffer_l1_read_bandwidth_gbps.unwrap() - 6.5).abs() < 0.001);
         assert!((limiters[0].buffer_l1_write_bandwidth_gbps.unwrap() - 2.4).abs() < 0.001);
+    }
+
+    #[test]
+    fn maps_counter_file_indices_using_go_csv_order() {
+        assert_eq!(counter_file_metric_name(3), None);
+        assert_eq!(counter_file_metric_name(12), Some("ALU Utilization"));
+        assert_eq!(
+            counter_file_metric_name(33),
+            Some("Compute Shader Launch Limiter")
+        );
+        assert_eq!(counter_file_metric_name(107), Some("Kernel Occupancy"));
+    }
+
+    #[test]
+    fn extracts_named_counter_file_metrics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Counters_f_12.raw");
+
+        let mut data = vec![0u8; 2400];
+        data[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
+        data.extend_from_slice(&sample_record(&[12.0, 16.0, 20.0]));
+        data.extend_from_slice(&sample_record(&[14.0, 18.0, 22.0]));
+        fs::write(&path, data).unwrap();
+
+        let metrics = extract_counter_file_metrics(dir.path());
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].file_index, 12);
+        assert_eq!(metrics[0].metric_name, "ALU Utilization");
+        assert_eq!(metrics[0].unit.as_deref(), Some("%"));
+        assert_eq!(metrics[0].encoder_index, 0);
+        assert_eq!(metrics[0].record_count, 2);
+        assert_eq!(metrics[0].sample_count, 6);
+        assert_eq!(metrics[0].representative_value, 17.0);
+        assert_eq!(metrics[0].min_value, 12.0);
+        assert_eq!(metrics[0].max_value, 22.0);
+        assert_eq!(metrics[0].mean_value, 17.0);
+        assert!(metrics[0].confidence > 0.5);
     }
 }

@@ -142,6 +142,7 @@ pub struct ProfilerReport {
     pub stream_data_present: bool,
     pub stream_data_summary: Option<ProfilerStreamDataSummary>,
     pub limiter_metrics: Vec<counter::CounterLimiter>,
+    pub raw_counter_metrics: Vec<counter::CounterFileMetric>,
     pub timeline_file_count: usize,
     pub counter_file_count: usize,
     pub profiling_file_count: usize,
@@ -204,6 +205,7 @@ pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
         None
     };
     let limiter_metrics = counter::extract_limiters(&profiler_directory);
+    let raw_counter_metrics = counter::extract_counter_file_metrics(&profiler_directory);
 
     let mut notes = Vec::new();
     if !stream_data_present {
@@ -217,7 +219,7 @@ pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
         );
     }
     notes.push(
-        "Timeline_f_*, Counters_f_*, and Profiling_f_* raw files are only inventoried here; detailed counter parsing is still incomplete."
+        "Profiling_f_* is parsed for execution-cost and occupancy samples; Counters_f_* is mapped through Xcode counter names and summarized per encoder."
             .to_owned(),
     );
 
@@ -227,6 +229,7 @@ pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
         stream_data_present,
         stream_data_summary,
         limiter_metrics,
+        raw_counter_metrics,
         timeline_file_count,
         counter_file_count,
         profiling_file_count,
@@ -498,6 +501,26 @@ pub fn format_report(report: &ProfilerReport) -> String {
         }
     }
 
+    if !report.raw_counter_metrics.is_empty() {
+        out.push_str("\nraw counter file metrics\n");
+        out.push_str("------------------------\n");
+        for metric in report.raw_counter_metrics.iter().take(16) {
+            out.push_str(&format!(
+                "  - encoder {} Counters_f_{} {}: median={} mean={} min={} max={} records={} samples={} confidence={:.2}\n",
+                metric.encoder_index,
+                metric.file_index,
+                metric.metric_name,
+                format_counter_metric_value(metric.representative_value, metric.unit.as_deref()),
+                format_counter_metric_value(metric.mean_value, metric.unit.as_deref()),
+                format_counter_metric_value(metric.min_value, metric.unit.as_deref()),
+                format_counter_metric_value(metric.max_value, metric.unit.as_deref()),
+                metric.record_count,
+                metric.sample_count,
+                metric.confidence
+            ));
+        }
+    }
+
     for note in &report.notes {
         out.push_str(&format!("~ {note}\n"));
     }
@@ -510,6 +533,16 @@ pub fn format_report(report: &ProfilerReport) -> String {
     }
 
     out
+}
+
+fn format_counter_metric_value(value: f64, unit: Option<&str>) -> String {
+    match unit {
+        Some("%") => format!("{value:.2}%"),
+        Some("GB/s") => format!("{value:.2} GB/s"),
+        Some("bytes") => format!("{value:.0} bytes"),
+        Some("count") => format!("{value:.0}"),
+        _ => format!("{value:.3}"),
+    }
 }
 
 fn top_dispatch_functions(summary: &ProfilerStreamDataSummary) -> Vec<(String, usize, u64)> {
@@ -1964,6 +1997,19 @@ mod tests {
                 buffer_l1_read_bandwidth_gbps: Some(2.3),
                 buffer_l1_write_bandwidth_gbps: Some(0.7),
             }],
+            raw_counter_metrics: vec![counter::CounterFileMetric {
+                file_index: 12,
+                metric_name: "ALU Utilization".to_owned(),
+                unit: Some("%".to_owned()),
+                encoder_index: 0,
+                record_count: 2,
+                sample_count: 6,
+                representative_value: 17.0,
+                min_value: 12.0,
+                max_value: 22.0,
+                mean_value: 17.0,
+                confidence: 0.75,
+            }],
             timeline_file_count: 1,
             counter_file_count: 2,
             profiling_file_count: 1,
@@ -1975,7 +2021,10 @@ mod tests {
                 size: 42,
                 kind: "streamData".to_owned(),
             }],
-            notes: vec!["Detailed counter parsing is not implemented yet.".to_owned()],
+            notes: vec![
+                "Counters_f_* is mapped through Xcode counter names and summarized per encoder."
+                    .to_owned(),
+            ],
         };
 
         let text = format_report(&report);
@@ -1986,6 +2035,8 @@ mod tests {
         assert!(text.contains("encoder_profiles=1"));
         assert!(text.contains("execution cost"));
         assert!(text.contains("counter limiter summary"));
+        assert!(text.contains("raw counter file metrics"));
+        assert!(text.contains("Counters_f_12 ALU Utilization"));
         assert!(text.contains("occ_mgr=72.00%"));
         assert!(text.contains("encoder 0: 37.50%"));
         assert!(text.contains("regs=32"));
