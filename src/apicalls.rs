@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use memchr::memmem;
 use serde::Serialize;
 
 use crate::error::Result;
@@ -11,12 +12,24 @@ use crate::trace::{
 pub struct ApiCallsReport {
     pub synthetic: bool,
     pub filter: Option<String>,
+    pub total_init_calls: usize,
     pub total_command_buffers: usize,
     pub total_dispatches: usize,
     pub matched_dispatches: usize,
     pub total_calls: usize,
+    pub init_calls: Vec<ApiInitCallEntry>,
     pub command_buffers: Vec<ApiCallCommandBuffer>,
     pub calls: Vec<ApiCallEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiInitCallEntry {
+    pub sequence: usize,
+    pub offset: usize,
+    pub kind: String,
+    pub address: Option<u64>,
+    pub label: Option<String>,
+    pub info: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,8 +66,10 @@ pub struct ApiCallEntry {
 }
 
 pub fn report(trace: &TraceBundle, filter: Option<&str>) -> Result<ApiCallsReport> {
+    let capture = trace.capture_data()?;
+    let init_calls = parse_initialization_calls(&capture);
     let regions = trace.command_buffer_regions()?;
-    Ok(report_from_regions(&regions, filter))
+    Ok(report_from_regions_and_init(&regions, init_calls, filter))
 }
 
 pub fn filter_command_buffer_report(
@@ -119,12 +134,13 @@ pub fn format_report(report: &ApiCallsReport) -> String {
     let mut out = String::new();
     out.push_str("Synthetic API-call report\n");
     out.push_str(
-        "Synthesized from command-buffer regions, encoder attribution, pipeline-state events, and dispatch records.\n",
+        "Synthesized from initialization records, command-buffer regions, encoder attribution, pipeline-state events, and dispatch records.\n",
     );
     out.push_str("This is an honest approximation of API intent, not a verbatim intercepted call stream.\n\n");
     if let Some(filter) = &report.filter {
         out.push_str(&format!(
-            "filter={filter:?}, command_buffers={}, dispatches={} (matched={}), synthesized_calls={}\n\n",
+            "filter={filter:?}, init_calls={}, command_buffers={}, dispatches={} (matched={}), synthesized_calls={}\n\n",
+            report.total_init_calls,
             report.total_command_buffers,
             report.total_dispatches,
             report.matched_dispatches,
@@ -132,9 +148,28 @@ pub fn format_report(report: &ApiCallsReport) -> String {
         ));
     } else {
         out.push_str(&format!(
-            "command_buffers={}, dispatches={}, synthesized_calls={}\n\n",
-            report.total_command_buffers, report.total_dispatches, report.total_calls
+            "init_calls={}, command_buffers={}, dispatches={}, synthesized_calls={}\n\n",
+            report.total_init_calls,
+            report.total_command_buffers,
+            report.total_dispatches,
+            report.total_calls
         ));
+    }
+
+    if !report.init_calls.is_empty() {
+        out.push_str("initialization\n");
+        for call in &report.init_calls {
+            let prefix = call
+                .label
+                .clone()
+                .or_else(|| call.address.map(|address| format!("0x{address:x}")))
+                .unwrap_or_else(|| "-".to_owned());
+            out.push_str(&format!(
+                "  #{:>4} @0x{:08x} {:<18} {} = {}\n",
+                call.sequence, call.offset, call.kind, prefix, call.info
+            ));
+        }
+        out.push('\n');
     }
 
     let calls_by_cb: BTreeMap<usize, Vec<&ApiCallEntry>> =
@@ -179,19 +214,30 @@ fn report_with_filtered_rows(
     ApiCallsReport {
         synthetic: report.synthetic,
         filter: report.filter.clone(),
+        total_init_calls: report.total_init_calls,
         total_command_buffers: command_buffers.len(),
         total_dispatches: command_buffers
             .iter()
             .map(|command_buffer| command_buffer.dispatch_count)
             .sum(),
         matched_dispatches: calls.iter().filter(|call| call.kind == "dispatch").count(),
-        total_calls: calls.len(),
+        total_calls: report.init_calls.len() + calls.len(),
+        init_calls: report.init_calls.clone(),
         command_buffers,
         calls,
     }
 }
 
+#[cfg(test)]
 fn report_from_regions(regions: &[CommandBufferRegion], filter: Option<&str>) -> ApiCallsReport {
+    report_from_regions_and_init(regions, Vec::new(), filter)
+}
+
+fn report_from_regions_and_init(
+    regions: &[CommandBufferRegion],
+    init_calls: Vec<ApiInitCallEntry>,
+    filter: Option<&str>,
+) -> ApiCallsReport {
     let filter_lower = filter.map(|value| value.to_ascii_lowercase());
     let included_regions: Vec<_> = regions
         .iter()
@@ -356,13 +402,245 @@ fn report_from_regions(regions: &[CommandBufferRegion], filter: Option<&str>) ->
     ApiCallsReport {
         synthetic: true,
         filter: filter.map(ToOwned::to_owned),
+        total_init_calls: init_calls.len(),
         total_command_buffers: command_buffers.len(),
         total_dispatches,
         matched_dispatches,
-        total_calls: calls.len(),
+        total_calls: init_calls.len() + calls.len(),
+        init_calls,
         command_buffers,
         calls,
     }
+}
+
+fn parse_initialization_calls(capture: &[u8]) -> Vec<ApiInitCallEntry> {
+    let first_command_buffer = memmem::find(capture, b"CUUU").unwrap_or(capture.len());
+    let data = &capture[..first_command_buffer];
+    let (cs_records, label_map) = parse_cs_records_from_init(data);
+    let mut calls = Vec::new();
+
+    for absolute in find_marker_offsets(data, b"CUt\0") {
+        if let Some(address) = read_u64(data, absolute + 0x04)
+            && address != 0
+        {
+            calls.push(init_call(
+                absolute,
+                "newResidencySet",
+                Some(address),
+                None,
+                "[Device newResidencySetWithDescriptor:<data> error:nil]".to_owned(),
+            ));
+        }
+    }
+
+    for absolute in find_marker_offsets(data, b"CU\0\0") {
+        if let Some(heap_addr) = read_u64(data, absolute + 0x24)
+            && heap_addr != 0
+        {
+            calls.push(init_call(
+                absolute,
+                "newHeap",
+                Some(heap_addr),
+                None,
+                "[Device newHeapWithDescriptor:<data>]".to_owned(),
+            ));
+        }
+    }
+
+    for absolute in find_marker_offsets(data, b"Culul") {
+        let Some(heap_addr) = read_u64(data, absolute + 0x08) else {
+            continue;
+        };
+        let Some(buffer_len) = read_u64(data, absolute + 0x10) else {
+            continue;
+        };
+        let Some(buffer_addr) = read_u64(data, absolute + 0x24) else {
+            continue;
+        };
+        calls.push(init_call(
+            absolute,
+            "newBuffer",
+            Some(buffer_addr),
+            None,
+            format!(
+                "[0x{heap_addr:x} newBufferWithLength:{buffer_len} options:HazardTrackingModeUntracked]"
+            ),
+        ));
+        calls.push(init_call(
+            absolute + 1,
+            "bufferHeapOffset",
+            Some(buffer_addr),
+            None,
+            format!("BufferHeapOffset(0x{buffer_addr:x}, 0)"),
+        ));
+    }
+
+    for record in cs_records {
+        if record.label.contains("Stream") || record.label.contains("Queue") {
+            calls.push(init_call(
+                record.offset,
+                "newCommandQueue",
+                Some(record.cs_address),
+                Some(record.label.clone()),
+                format!("{} = [Device newCommandQueue]", record.label),
+            ));
+        } else if looks_like_function_name(&record.label) && (record.cs_address >> 32) >= 0x7 {
+            calls.push(init_call(
+                record.offset,
+                "newFunction",
+                Some(record.cs_address),
+                Some(record.label.clone()),
+                format!(
+                    "[0x{:x} newFunctionWithName:\"{}\"]",
+                    record.cs_address, record.label
+                ),
+            ));
+        }
+    }
+
+    for absolute in find_marker_offsets(data, b"Cui\0") {
+        if let Some(event_addr) = read_u64(data, absolute + 0x0c)
+            && event_addr != 0
+        {
+            calls.push(init_call(
+                absolute,
+                "newSharedEvent",
+                Some(event_addr),
+                None,
+                "[Device newSharedEvent]".to_owned(),
+            ));
+        }
+    }
+
+    for absolute in find_marker_offsets(data, b"Ctt\0") {
+        let Some(function_addr) = read_u64(data, absolute + 0x0c) else {
+            continue;
+        };
+        let Some(pipeline_addr) = read_u64(data, absolute + 0x20) else {
+            continue;
+        };
+        if pipeline_addr == 0 {
+            continue;
+        }
+        let function_name = label_map
+            .get(&function_addr)
+            .cloned()
+            .unwrap_or_else(|| "function".to_owned());
+        calls.push(init_call(
+            absolute,
+            "newPipelineState",
+            Some(pipeline_addr),
+            None,
+            format!("[Device newComputePipelineStateWithFunction:{function_name} error:nil]"),
+        ));
+    }
+
+    for call in &mut calls {
+        if call.label.is_none()
+            && let Some(address) = call.address
+            && let Some(label) = label_map.get(&address)
+        {
+            call.label = Some(label.clone());
+        }
+    }
+
+    calls.sort_by(|left, right| {
+        left.offset
+            .cmp(&right.offset)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    for (sequence, call) in calls.iter_mut().enumerate() {
+        call.sequence = sequence;
+    }
+    calls
+}
+
+fn init_call(
+    offset: usize,
+    kind: &str,
+    address: Option<u64>,
+    label: Option<String>,
+    info: String,
+) -> ApiInitCallEntry {
+    ApiInitCallEntry {
+        sequence: 0,
+        offset,
+        kind: kind.to_owned(),
+        address,
+        label,
+        info,
+    }
+}
+
+#[derive(Debug)]
+struct CsInitRecord {
+    cs_address: u64,
+    label: String,
+    offset: usize,
+}
+
+fn parse_cs_records_from_init(data: &[u8]) -> (Vec<CsInitRecord>, BTreeMap<u64, String>) {
+    let mut records = Vec::new();
+    let mut labels = BTreeMap::new();
+    for offset in find_marker_offsets(data, b"CS") {
+        let Some(address) = read_u64(data, offset + 4) else {
+            continue;
+        };
+        let label_start = offset + 12;
+        let Some(label) = read_c_string(data, label_start, 128) else {
+            continue;
+        };
+        if !is_printable_ascii(&label) {
+            continue;
+        }
+        labels.insert(address, label.clone());
+        records.push(CsInitRecord {
+            cs_address: address,
+            label: label.clone(),
+            offset,
+        });
+
+        if looks_like_function_name(&label) {
+            let search_start = label_start + label.len() + 1;
+            let search_end = (offset + 0x30).min(data.len());
+            if search_start < search_end
+                && let Some(relative) = memmem::find(&data[search_start..search_end], b"t\0\0\0")
+                && let Some(function_addr) = read_u64(data, search_start + relative + 4)
+                && function_addr != 0
+                && function_addr != address
+            {
+                labels.insert(function_addr, label);
+            }
+        }
+    }
+    (records, labels)
+}
+
+fn find_marker_offsets(data: &[u8], marker: &[u8]) -> Vec<usize> {
+    memmem::find_iter(data, marker).collect()
+}
+
+fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
+    data.get(offset..offset + 8)
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_c_string(data: &[u8], offset: usize, max_len: usize) -> Option<String> {
+    let bytes = data.get(offset..)?;
+    let len = bytes.iter().take(max_len).position(|byte| *byte == 0)?;
+    (len > 0).then(|| String::from_utf8_lossy(&bytes[..len]).into_owned())
+}
+
+fn is_printable_ascii(value: &str) -> bool {
+    value.bytes().all(|byte| (32..=126).contains(&byte))
+}
+
+fn looks_like_function_name(value: &str) -> bool {
+    value.contains('_')
+        || value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
 }
 
 fn push_call(
@@ -531,7 +809,8 @@ fn format_dims(value: [u32; 3]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_call_kind_report, filter_command_buffer_report, format_report, report_from_regions,
+        filter_call_kind_report, filter_command_buffer_report, format_report,
+        parse_initialization_calls, report_from_regions,
     };
     use crate::trace::{
         BoundBuffer, CommandBuffer, CommandBufferRegion, ComputeEncoder, DispatchCall,
@@ -556,6 +835,57 @@ mod tests {
         assert_eq!(report.command_buffers[0].call_count, 6);
         assert_eq!(report.calls[2].pipeline_addr, Some(0x1111));
         assert_eq!(report.calls[5].kernel_name.as_deref(), Some("copy_kernel"));
+    }
+
+    #[test]
+    fn parses_go_style_initialization_calls_before_first_command_buffer() {
+        let mut data = vec![0u8; 0x200];
+        data[0x10..0x14].copy_from_slice(b"CUt\0");
+        data[0x14..0x1c].copy_from_slice(&0x0afd_018000_u64.to_le_bytes());
+
+        data[0x40..0x44].copy_from_slice(b"CU\0\0");
+        data[0x64..0x6c].copy_from_slice(&0x106d_a56b0_u64.to_le_bytes());
+
+        data[0x80..0x85].copy_from_slice(b"Culul");
+        data[0x88..0x90].copy_from_slice(&0x106d_a56b0_u64.to_le_bytes());
+        data[0x90..0x98].copy_from_slice(&16_u64.to_le_bytes());
+        data[0xa4..0xac].copy_from_slice(&0x106d_a6190_u64.to_le_bytes());
+
+        data[0xc0..0xc4].copy_from_slice(b"CS\0\0");
+        data[0xc4..0xcc].copy_from_slice(&0x7000_000001_u64.to_le_bytes());
+        data[0xcc..0xd7].copy_from_slice(b"gemm_kernel");
+        data[0xd7] = 0;
+        data[0xdc..0xe0].copy_from_slice(b"t\0\0\0");
+        data[0xe0..0xe8].copy_from_slice(&0x1010_u64.to_le_bytes());
+
+        data[0x100..0x104].copy_from_slice(b"Ctt\0");
+        data[0x10c..0x114].copy_from_slice(&0x1010_u64.to_le_bytes());
+        data[0x120..0x128].copy_from_slice(&0x2020_u64.to_le_bytes());
+
+        data[0x140..0x144].copy_from_slice(b"Cui\0");
+        data[0x14c..0x154].copy_from_slice(&0xafcc_88800_u64.to_le_bytes());
+
+        data[0x180..0x184].copy_from_slice(b"CUUU");
+
+        let calls = parse_initialization_calls(&data);
+        let kinds = calls
+            .iter()
+            .map(|call| call.kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "newResidencySet",
+                "newHeap",
+                "newBuffer",
+                "bufferHeapOffset",
+                "newFunction",
+                "newPipelineState",
+                "newSharedEvent"
+            ]
+        );
+        assert_eq!(calls[4].label.as_deref(), Some("gemm_kernel"));
+        assert!(calls[5].info.contains("gemm_kernel"));
     }
 
     #[test]
