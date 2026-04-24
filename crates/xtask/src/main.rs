@@ -6,7 +6,10 @@ use std::process::{Command, Stdio};
 fn main() {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        Some("install") => install(InstallOptions::parse(args)),
+        Some("install") => {
+            reject_extra_args(args);
+            install();
+        }
         Some(command) => {
             eprintln!("unknown command: {command}");
             usage();
@@ -22,36 +25,22 @@ fn main() {
 fn usage() {
     eprintln!("usage: cargo xtask <command>");
     eprintln!("available commands:");
-    eprintln!("  install [--metal-entitlements]");
+    eprintln!("  install");
 }
 
-#[derive(Debug, Default)]
-struct InstallOptions {
-    metal_entitlements: bool,
-}
-
-impl InstallOptions {
-    fn parse(args: impl Iterator<Item = String>) -> Self {
-        let mut options = Self::default();
-        for arg in args {
-            match arg.as_str() {
-                "--metal-entitlements" => options.metal_entitlements = true,
-                "--help" | "-h" => {
-                    usage();
-                    std::process::exit(0);
-                }
-                _ => {
-                    eprintln!("unknown install option: {arg}");
-                    usage();
-                    std::process::exit(1);
-                }
-            }
+fn reject_extra_args(args: impl Iterator<Item = String>) {
+    for arg in args {
+        if arg == "--help" || arg == "-h" {
+            usage();
+            std::process::exit(0);
         }
-        options
+        eprintln!("unknown install option: {arg}");
+        usage();
+        std::process::exit(1);
     }
 }
 
-fn install(options: InstallOptions) {
+fn install() {
     let repo = workspace_root();
     let release_binary = repo.join("target/release/gputrace");
     let installed_binary = cargo_bin_dir().join("gputrace");
@@ -78,23 +67,9 @@ fn install(options: InstallOptions) {
     });
     println!("copied gputrace to {}", installed_binary.display());
 
-    sign_installed_binary(&repo, &installed_binary, options.metal_entitlements);
+    sign_installed_binary(&installed_binary);
     if !verify_installed_binary(&installed_binary) {
-        if options.metal_entitlements {
-            eprintln!(
-                "gputrace did not run after Metal entitlement signing; restoring a usable signature without those entitlements"
-            );
-            sign_installed_binary(&repo, &installed_binary, false);
-            if verify_installed_binary(&installed_binary) {
-                eprintln!(
-                    "installed binary is usable, but Metal entitlement signing is not supported by this local signing setup"
-                );
-            } else {
-                std::process::exit(1);
-            }
-        } else {
-            std::process::exit(1);
-        }
+        std::process::exit(1);
     }
     check_accessibility_permission(&installed_binary);
 }
@@ -132,7 +107,7 @@ fn verify_installed_binary(binary: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn sign_installed_binary(repo: &Path, binary: &Path, metal_entitlements: bool) {
+fn sign_installed_binary(binary: &Path) {
     let identity = codesign_identity();
     let identity_arg = identity.as_deref().unwrap_or("-");
     if let Some(identity) = identity.as_deref() {
@@ -152,20 +127,12 @@ fn sign_installed_binary(repo: &Path, binary: &Path, metal_entitlements: bool) {
     if identity.is_some() {
         command.arg("--timestamp");
     }
-    if metal_entitlements {
-        let entitlements = repo.join("gputrace.entitlements");
-        println!(
-            "adding Metal performance entitlements from {}",
-            entitlements.display()
-        );
-        command.arg("--entitlements").arg(entitlements);
-    }
     command.arg(binary);
     run(&mut command, "codesign installed gputrace binary");
 }
 
 #[cfg(not(target_os = "macos"))]
-fn sign_installed_binary(_repo: &Path, _binary: &Path, _metal_entitlements: bool) {}
+fn sign_installed_binary(_binary: &Path) {}
 
 #[cfg(target_os = "macos")]
 fn codesign_identity() -> Option<String> {
@@ -188,13 +155,13 @@ fn codesign_identity() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn check_accessibility_permission(binary: &Path) {
-    println!("checking Accessibility permission...");
+    println!("checking/requesting Accessibility permission...");
     let output = Command::new(binary)
-        .args(["xcode-check-permissions", "--no-prompt"])
+        .arg("xcode-check-permissions")
         .output()
         .unwrap_or_else(|error| {
             panic!(
-                "failed to run {} xcode-check-permissions --no-prompt: {error}",
+                "failed to run {} xcode-check-permissions: {error}",
                 binary.display()
             )
         });
@@ -205,7 +172,7 @@ fn check_accessibility_permission(binary: &Path) {
 
     eprintln!("Accessibility is not granted for {}.", binary.display());
     eprintln!(
-        "Grant it in System Settings > Privacy & Security > Accessibility, or run: {} xcode-check-permissions",
+        "Grant it in System Settings > Privacy & Security > Accessibility, then rerun: {} xcode-check-permissions --no-prompt",
         binary.display()
     );
 }
