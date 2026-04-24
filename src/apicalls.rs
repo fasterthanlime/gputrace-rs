@@ -140,11 +140,13 @@ pub fn filter_call_kind_report(report: &ApiCallsReport, kind: &str) -> ApiCallsR
 
 pub fn format_report(report: &ApiCallsReport) -> String {
     let mut out = String::new();
-    out.push_str("Synthetic API-call report\n");
+    out.push_str("Go-style API-call report\n");
     out.push_str(
-        "Synthesized from initialization records, command-buffer regions, encoder attribution, pipeline-state events, and dispatch records.\n",
+        "Reconstructed from initialization records, command-buffer regions, encoder attribution, pipeline-state events, and dispatch records using the same trace-derived strategy as the Go implementation.\n",
     );
-    out.push_str("This is an honest approximation of API intent, not a verbatim intercepted call stream.\n\n");
+    out.push_str(
+        "This is a reconstructed Xcode-style call stream, not a verbatim intercepted API log.\n\n",
+    );
     if let Some(filter) = &report.filter {
         out.push_str(&format!(
             "filter={filter:?}, init_calls={}, command_buffers={}, dispatches={} (matched={}), synthesized_calls={}\n\n",
@@ -1081,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_encoder_label_and_marks_report_as_synthetic() {
+    fn falls_back_to_encoder_label_and_formats_go_style_report() {
         let mut region = sample_region();
         region.dispatches[0].kernel_name = None;
         region.pipeline_events.clear();
@@ -1098,8 +1100,8 @@ mod tests {
         );
 
         let rendered = format_report(&report);
-        assert!(rendered.contains("Synthetic API-call report"));
-        assert!(rendered.contains("honest approximation"));
+        assert!(rendered.contains("Go-style API-call report"));
+        assert!(rendered.contains("reconstructed Xcode-style call stream"));
         assert!(rendered.contains("dispatchThreadgroups"));
     }
 
