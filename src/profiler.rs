@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Cursor;
 use std::mem;
@@ -273,28 +273,17 @@ pub fn raw_encoder_timings<P: AsRef<Path>>(path: P) -> Result<Vec<ProfilerRawEnc
     let mut timings = Vec::new();
     for (index, path) in files {
         let data = fs::read(path)?;
-        let starts = raw_record_starts(&data);
-        if starts.is_empty() {
+        let records = raw_counter_records(&data);
+        if records.is_empty() {
             continue;
         }
         let mut relative_duration = 0f64;
         let mut sample_records = 0usize;
-        for (record_index, offset) in starts.iter().enumerate() {
-            let next = starts.get(record_index + 1).copied().unwrap_or(data.len());
-            let record_size = next.saturating_sub(*offset);
-            if record_size != 464 {
+        for record in records {
+            if record.len() != 464 {
                 continue;
             }
-            let record = &data[*offset..next];
-            let limiter_values = record
-                .chunks_exact(mem::size_of::<u32>())
-                .filter_map(|chunk: &[u8]| {
-                    let value =
-                        f32::from_bits(u32::from_le_bytes(chunk.try_into().unwrap())) as f64;
-                    (value.is_finite() && (0.001..=10.0).contains(&value)).then_some(value)
-                })
-                .take(30)
-                .collect::<Vec<_>>();
+            let limiter_values = raw_record_limiter_values(record, 30);
             if limiter_values.is_empty() {
                 continue;
             }
@@ -311,18 +300,62 @@ pub fn raw_encoder_timings<P: AsRef<Path>>(path: P) -> Result<Vec<ProfilerRawEnc
         });
     }
 
-    timings.sort_by(|left, right| right.duration_ns.cmp(&left.duration_ns));
+    timings.sort_by_key(|timing| timing.index);
     Ok(timings)
 }
 
-fn raw_record_starts(data: &[u8]) -> Vec<usize> {
-    let mut starts = Vec::new();
-    for i in 0..data.len().saturating_sub(mem::size_of::<u32>()) {
+fn raw_counter_records(data: &[u8]) -> Vec<&[u8]> {
+    let mut records = Vec::new();
+    let mut i = 0usize;
+    while i < data.len().saturating_sub(mem::size_of::<u32>()) {
         if data[i..].starts_with(&[0x4e, 0x00, 0x00, 0x00]) {
-            starts.push(i);
+            let record_size = estimate_raw_counter_record_size(data, i);
+            if i + record_size <= data.len() {
+                records.push(&data[i..i + record_size]);
+                i += record_size;
+            } else {
+                i += mem::size_of::<u32>();
+            }
+        } else {
+            i += 1;
         }
     }
-    starts
+    records
+}
+
+fn estimate_raw_counter_record_size(data: &[u8], offset: usize) -> usize {
+    if offset + 8 <= data.len() {
+        let potential_size = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap());
+        if potential_size > 0 && potential_size < 100_000 {
+            return potential_size as usize + 8;
+        }
+    }
+
+    let search_start = offset + mem::size_of::<u32>();
+    let search_end = data.len().min(offset.saturating_add(100_000));
+    for i in search_start..search_end.saturating_sub(mem::size_of::<u32>()) {
+        if data[i..].starts_with(&[0x4e, 0x00, 0x00, 0x00]) {
+            return i - offset;
+        }
+    }
+
+    69
+}
+
+fn raw_record_limiter_values(record: &[u8], max_count: usize) -> Vec<f64> {
+    let mut values = Vec::new();
+    let mut seen = BTreeSet::new();
+    for offset in (0..record.len().saturating_sub(mem::size_of::<u32>())).step_by(4) {
+        let bits = u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap());
+        let value = f32::from_bits(bits);
+        if value.is_finite() && (0.001..=10.0).contains(&value) && seen.insert(bits) {
+            values.push(value as f64);
+            if values.len() >= max_count {
+                break;
+            }
+        }
+    }
+    values
 }
 
 pub fn format_report(report: &ProfilerReport) -> String {
@@ -2054,8 +2087,9 @@ mod tests {
         data[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
         let mut record = vec![0u8; 464];
         record[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
+        record[4..8].copy_from_slice(&456u32.to_le_bytes());
         for (index, value) in [1.5f32, 2.0, 0.5].iter().enumerate() {
-            let offset = 4 + index * 4;
+            let offset = 8 + index * 4;
             record[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
         data.extend_from_slice(&record);
@@ -2066,5 +2100,27 @@ mod tests {
         assert_eq!(timings[0].index, 0);
         assert!(timings[0].duration_ns > 0);
         assert_eq!(timings[0].confidence_milli, 200);
+    }
+
+    #[test]
+    fn raw_encoder_timings_use_go_record_size_and_dedup_limiter_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiler_dir = dir.path().join("trace.gputrace.gpuprofiler_raw");
+        fs::create_dir_all(&profiler_dir).unwrap();
+
+        let mut record = vec![0u8; 464];
+        record[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
+        record[4..8].copy_from_slice(&456u32.to_le_bytes());
+        for (index, value) in [2.0f32, 2.0, 3.0].iter().enumerate() {
+            let offset = 8 + index * 4;
+            record[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        fs::write(profiler_dir.join("Counters_f_7.raw"), record).unwrap();
+
+        let timings = raw_encoder_timings(dir.path().join("trace.gputrace")).unwrap();
+
+        assert_eq!(timings.len(), 1);
+        assert_eq!(timings[0].index, 7);
+        assert_eq!(timings[0].duration_ns, 5_000_000);
     }
 }
