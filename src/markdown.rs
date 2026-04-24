@@ -185,7 +185,25 @@ pub fn diff_report(report: &DiffReport) -> String {
 
 pub fn diff_report_with_limit(report: &DiffReport, limit: usize) -> String {
     let mut out = String::new();
-    out.push_str("# Trace Diff\n\n");
+    out.push_str("# gputrace diff report\n\n");
+    if let Some(profile) = &report.profile_diff {
+        out.push_str(&format!("- Trace A: `{}`\n", profile.left_path));
+        out.push_str(&format!("- Trace B: `{}`\n", profile.right_path));
+        out.push_str(&format!(
+            "- Total GPU delta (A-B): `{:+}us` (A=`{}us`, B=`{}us`)\n",
+            profile.summary.total_delta_us,
+            profile.summary.left_total_gpu_time_us,
+            profile.summary.right_total_gpu_time_us
+        ));
+        out.push_str(&format!(
+            "- Dispatch delta (A-B): `{:+}`\n",
+            profile.summary.dispatch_count_delta
+        ));
+        out.push_str(&format!(
+            "- Likely cause: `{}`\n\n",
+            profile.summary.likely_cause
+        ));
+    }
     push_metric_block(
         &mut out,
         "Inputs",
