@@ -42,6 +42,7 @@ pub struct MTLBFileReport {
     pub kind: MTLBFileKind,
     pub file_size: u64,
     pub header: MTLBHeaderReport,
+    pub function_name_source: String,
     pub best_effort_function_count: usize,
     pub best_effort_function_names: Vec<String>,
     pub magic_offsets: Vec<u64>,
@@ -417,6 +418,10 @@ pub fn format_file_report(report: &MTLBFileReport) -> String {
     out.push_str(&format!(
         "  Bytecode:       0x{:x}\n",
         report.header.bytecode_offset
+    ));
+    out.push_str(&format!(
+        "Function Names:  {}\n",
+        report.function_name_source
     ));
     out.push_str(&format!(
         "  Offsets Valid:  {}\n",
@@ -960,7 +965,7 @@ fn build_functions_report(
 
 fn source_notes(is_bundle: bool, has_usage_counts: bool) -> Vec<String> {
     let mut notes = vec![
-        "function names come from a best-effort scan between the function table and bytecode offsets; this is not a full MTLB parser".to_owned(),
+        "function names prefer native Metal MTLLibrary loading on macOS and fall back to NAMED/NAME; binary scanning when Metal cannot load the library".to_owned(),
     ];
     if is_bundle {
         notes.push(
@@ -1035,7 +1040,9 @@ fn inspect_bytes(path: PathBuf, data: Vec<u8>, kind: MTLBFileKind) -> Result<MTL
     let header = parse_header(&data, file_size);
     let magic_offsets = find_magic_offsets(&data);
     let mut warnings = header_warnings(&header, file_size);
-    let best_effort_function_names = scan_function_names(&data, &header, &mut warnings);
+    let scanned_function_names = scan_function_names(&data, &header, &mut warnings);
+    let (best_effort_function_names, function_name_source) =
+        select_function_names(&path, scanned_function_names, &mut warnings);
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1048,6 +1055,7 @@ fn inspect_bytes(path: PathBuf, data: Vec<u8>, kind: MTLBFileKind) -> Result<MTL
         kind,
         file_size,
         header,
+        function_name_source,
         best_effort_function_count: best_effort_function_names.len(),
         best_effort_function_names,
         magic_offsets,
@@ -1105,6 +1113,64 @@ fn header_warnings(header: &MTLBHeaderReport, file_size: u64) -> Vec<String> {
         warnings.push("bytecode offset precedes string table offset".to_owned());
     }
     warnings
+}
+
+fn select_function_names(
+    path: &Path,
+    scanned_function_names: Vec<String>,
+    warnings: &mut Vec<String>,
+) -> (Vec<String>, String) {
+    match native_metal_function_names(path) {
+        Ok(mut native_names) if !native_names.is_empty() => {
+            native_names.sort();
+            native_names.dedup();
+            (native_names, "metal-native".to_owned())
+        }
+        Ok(_) => (scanned_function_names, "binary-scan".to_owned()),
+        Err(error) => {
+            if scanned_function_names.is_empty() {
+                warnings.push(format!(
+                    "native Metal loader did not return function names: {error}"
+                ));
+            }
+            (scanned_function_names, "binary-scan".to_owned())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_metal_function_names(path: &Path) -> std::result::Result<Vec<String>, String> {
+    use objc2::rc::autoreleasepool;
+    use objc2_foundation::{NSString, NSURL};
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary};
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {}
+
+    let path = path
+        .to_str()
+        .ok_or_else(|| "MTLB path is not valid UTF-8".to_owned())?;
+
+    autoreleasepool(|pool| {
+        let device =
+            MTLCreateSystemDefaultDevice().ok_or_else(|| "no Metal device available".to_owned())?;
+        let ns_path = NSString::from_str(path);
+        let url = NSURL::fileURLWithPath(&ns_path);
+        let library = device
+            .newLibraryWithURL_error(&url)
+            .map_err(|error| error.localizedDescription().to_string())?;
+        let names = library.functionNames();
+        let mut function_names = Vec::with_capacity(names.len());
+        for name in names.iter() {
+            function_names.push(unsafe { name.to_str(pool) }.to_owned());
+        }
+        Ok(function_names)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_metal_function_names(_path: &Path) -> std::result::Result<Vec<String>, String> {
+    Err("native Metal loader is only available on macOS".to_owned())
 }
 
 fn scan_function_names(
@@ -1250,6 +1316,7 @@ mod tests {
         assert_eq!(report.file_size, 192);
         assert_eq!(report.header.version, 7);
         assert_eq!(report.header.flags, 0x10);
+        assert_eq!(report.function_name_source, "binary-scan");
         assert_eq!(report.best_effort_function_count, 2);
         assert_eq!(
             report.best_effort_function_names,
@@ -1381,6 +1448,7 @@ mod tests {
         let bundle_text = format_bundle_report(&bundle_report);
 
         assert!(file_text.contains("Best-effort Functions: 1"));
+        assert!(file_text.contains("Function Names:  binary-scan"));
         assert!(file_text.contains("kernel_main"));
         assert!(bundle_text.contains("Direct MTLB Files: 1"));
         assert!(bundle_text.contains("library.mtlb"));
@@ -1405,6 +1473,7 @@ mod tests {
                 size_matches_header: true,
                 offsets_within_file: true,
             },
+            function_name_source: "binary-scan".to_owned(),
             best_effort_function_count: function_names.len(),
             best_effort_function_names: function_names
                 .iter()
