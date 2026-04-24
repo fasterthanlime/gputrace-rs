@@ -253,6 +253,14 @@ pub struct CounterMetricChange {
     pub right_gpu_read_bandwidth_gbps: Option<f64>,
     pub left_gpu_write_bandwidth_gbps: Option<f64>,
     pub right_gpu_write_bandwidth_gbps: Option<f64>,
+    pub left_buffer_device_memory_bytes_read: Option<f64>,
+    pub right_buffer_device_memory_bytes_read: Option<f64>,
+    pub left_buffer_device_memory_bytes_written: Option<f64>,
+    pub right_buffer_device_memory_bytes_written: Option<f64>,
+    pub left_bytes_read_from_device_memory: Option<f64>,
+    pub right_bytes_read_from_device_memory: Option<f64>,
+    pub left_bytes_written_to_device_memory: Option<f64>,
+    pub right_bytes_written_to_device_memory: Option<f64>,
     pub left_buffer_l1_miss_rate_percent: Option<f64>,
     pub right_buffer_l1_miss_rate_percent: Option<f64>,
     pub left_buffer_l1_read_accesses: Option<f64>,
@@ -263,6 +271,18 @@ pub struct CounterMetricChange {
     pub right_buffer_l1_write_accesses: Option<f64>,
     pub left_buffer_l1_write_bandwidth_gbps: Option<f64>,
     pub right_buffer_l1_write_bandwidth_gbps: Option<f64>,
+    pub left_compute_shader_launch_utilization_percent: Option<f64>,
+    pub right_compute_shader_launch_utilization_percent: Option<f64>,
+    pub left_control_flow_utilization_percent: Option<f64>,
+    pub right_control_flow_utilization_percent: Option<f64>,
+    pub left_instruction_throughput_utilization_percent: Option<f64>,
+    pub right_instruction_throughput_utilization_percent: Option<f64>,
+    pub left_integer_complex_utilization_percent: Option<f64>,
+    pub right_integer_complex_utilization_percent: Option<f64>,
+    pub left_integer_conditional_utilization_percent: Option<f64>,
+    pub right_integer_conditional_utilization_percent: Option<f64>,
+    pub left_f32_utilization_percent: Option<f64>,
+    pub right_f32_utilization_percent: Option<f64>,
 }
 
 pub fn diff_paths(left: impl AsRef<Path>, right: impl AsRef<Path>) -> Result<DiffReport> {
@@ -980,7 +1000,7 @@ pub fn diff_with_options(
     }
     if let Some(change) = counter_metric_changes.first() {
         summary.push(format!(
-            "Largest profiler metric delta: {} (inv {} -> {}, exec {} -> {}, occ {} -> {}, alu {} -> {}, llc {} -> {}, dev_bw {} -> {}, gpu_r {} -> {}, gpu_w {} -> {}, l1_miss {} -> {}, l1_racc {} -> {}, l1_rbw {} -> {}, l1_wacc {} -> {}, l1_wbw {} -> {})",
+            "Largest profiler metric delta: {} (inv {} -> {}, exec {} -> {}, occ {} -> {}, alu {} -> {}, llc {} -> {}, dev_bw {} -> {}, gpu_r {} -> {}, gpu_w {} -> {}, buf_dev_r {} -> {}, buf_dev_w {} -> {}, dev_r {} -> {}, dev_w {} -> {}, l1_miss {} -> {}, l1_racc {} -> {}, l1_rbw {} -> {}, l1_wacc {} -> {}, l1_wbw {} -> {}, csl_util {} -> {}, cf_util {} -> {}, ithr_util {} -> {}, ic_util {} -> {}, icond_util {} -> {}, f32_util {} -> {})",
             change.name,
             format_option_f64(change.left_kernel_invocations),
             format_option_f64(change.right_kernel_invocations),
@@ -998,6 +1018,14 @@ pub fn diff_with_options(
             format_option_f64(change.right_gpu_read_bandwidth_gbps),
             format_option_f64(change.left_gpu_write_bandwidth_gbps),
             format_option_f64(change.right_gpu_write_bandwidth_gbps),
+            format_option_f64(change.left_buffer_device_memory_bytes_read),
+            format_option_f64(change.right_buffer_device_memory_bytes_read),
+            format_option_f64(change.left_buffer_device_memory_bytes_written),
+            format_option_f64(change.right_buffer_device_memory_bytes_written),
+            format_option_f64(change.left_bytes_read_from_device_memory),
+            format_option_f64(change.right_bytes_read_from_device_memory),
+            format_option_f64(change.left_bytes_written_to_device_memory),
+            format_option_f64(change.right_bytes_written_to_device_memory),
             format_option_f64(change.left_buffer_l1_miss_rate_percent),
             format_option_f64(change.right_buffer_l1_miss_rate_percent),
             format_option_f64(change.left_buffer_l1_read_accesses),
@@ -1008,6 +1036,18 @@ pub fn diff_with_options(
             format_option_f64(change.right_buffer_l1_write_accesses),
             format_option_f64(change.left_buffer_l1_write_bandwidth_gbps),
             format_option_f64(change.right_buffer_l1_write_bandwidth_gbps),
+            format_option_f64(change.left_compute_shader_launch_utilization_percent),
+            format_option_f64(change.right_compute_shader_launch_utilization_percent),
+            format_option_f64(change.left_control_flow_utilization_percent),
+            format_option_f64(change.right_control_flow_utilization_percent),
+            format_option_f64(change.left_instruction_throughput_utilization_percent),
+            format_option_f64(change.right_instruction_throughput_utilization_percent),
+            format_option_f64(change.left_integer_complex_utilization_percent),
+            format_option_f64(change.right_integer_complex_utilization_percent),
+            format_option_f64(change.left_integer_conditional_utilization_percent),
+            format_option_f64(change.right_integer_conditional_utilization_percent),
+            format_option_f64(change.left_f32_utilization_percent),
+            format_option_f64(change.right_f32_utilization_percent),
         ));
     }
     if let Some(profile) = &profile_diff {
@@ -1085,6 +1125,16 @@ fn diff_counter_metrics(left: &TraceBundle, right: &TraceBundle) -> Vec<CounterM
             right_gpu_read_bandwidth_gbps: right_metrics.gpu_read_bandwidth_gbps,
             left_gpu_write_bandwidth_gbps: left_metrics.gpu_write_bandwidth_gbps,
             right_gpu_write_bandwidth_gbps: right_metrics.gpu_write_bandwidth_gbps,
+            left_buffer_device_memory_bytes_read: left_metrics.buffer_device_memory_bytes_read,
+            right_buffer_device_memory_bytes_read: right_metrics.buffer_device_memory_bytes_read,
+            left_buffer_device_memory_bytes_written: left_metrics
+                .buffer_device_memory_bytes_written,
+            right_buffer_device_memory_bytes_written: right_metrics
+                .buffer_device_memory_bytes_written,
+            left_bytes_read_from_device_memory: left_metrics.bytes_read_from_device_memory,
+            right_bytes_read_from_device_memory: right_metrics.bytes_read_from_device_memory,
+            left_bytes_written_to_device_memory: left_metrics.bytes_written_to_device_memory,
+            right_bytes_written_to_device_memory: right_metrics.bytes_written_to_device_memory,
             left_buffer_l1_miss_rate_percent: left_metrics.buffer_l1_miss_rate_percent,
             right_buffer_l1_miss_rate_percent: right_metrics.buffer_l1_miss_rate_percent,
             left_buffer_l1_read_accesses: left_metrics.buffer_l1_read_accesses,
@@ -1095,6 +1145,26 @@ fn diff_counter_metrics(left: &TraceBundle, right: &TraceBundle) -> Vec<CounterM
             right_buffer_l1_write_accesses: right_metrics.buffer_l1_write_accesses,
             left_buffer_l1_write_bandwidth_gbps: left_metrics.buffer_l1_write_bandwidth_gbps,
             right_buffer_l1_write_bandwidth_gbps: right_metrics.buffer_l1_write_bandwidth_gbps,
+            left_compute_shader_launch_utilization_percent: left_metrics
+                .compute_shader_launch_utilization_percent,
+            right_compute_shader_launch_utilization_percent: right_metrics
+                .compute_shader_launch_utilization_percent,
+            left_control_flow_utilization_percent: left_metrics.control_flow_utilization_percent,
+            right_control_flow_utilization_percent: right_metrics.control_flow_utilization_percent,
+            left_instruction_throughput_utilization_percent: left_metrics
+                .instruction_throughput_utilization_percent,
+            right_instruction_throughput_utilization_percent: right_metrics
+                .instruction_throughput_utilization_percent,
+            left_integer_complex_utilization_percent: left_metrics
+                .integer_complex_utilization_percent,
+            right_integer_complex_utilization_percent: right_metrics
+                .integer_complex_utilization_percent,
+            left_integer_conditional_utilization_percent: left_metrics
+                .integer_conditional_utilization_percent,
+            right_integer_conditional_utilization_percent: right_metrics
+                .integer_conditional_utilization_percent,
+            left_f32_utilization_percent: left_metrics.f32_utilization_percent,
+            right_f32_utilization_percent: right_metrics.f32_utilization_percent,
         });
     }
     changes.sort_by(|left, right| {
@@ -2155,6 +2225,22 @@ fn aggregate_counter_metrics(
             entry.gpu_write_bw_sum += value;
             entry.gpu_write_bw_count += 1;
         }
+        if let Some(value) = row.buffer_device_memory_bytes_read {
+            entry.buffer_device_memory_read_sum += value;
+            entry.buffer_device_memory_read_count += 1;
+        }
+        if let Some(value) = row.buffer_device_memory_bytes_written {
+            entry.buffer_device_memory_written_sum += value;
+            entry.buffer_device_memory_written_count += 1;
+        }
+        if let Some(value) = row.bytes_read_from_device_memory {
+            entry.device_memory_read_sum += value;
+            entry.device_memory_read_count += 1;
+        }
+        if let Some(value) = row.bytes_written_to_device_memory {
+            entry.device_memory_written_sum += value;
+            entry.device_memory_written_count += 1;
+        }
         if let Some(value) = row.buffer_l1_miss_rate_percent {
             entry.buffer_l1_miss_rate_sum += value;
             entry.buffer_l1_miss_rate_count += 1;
@@ -2174,6 +2260,30 @@ fn aggregate_counter_metrics(
         if let Some(value) = row.buffer_l1_write_bandwidth_gbps {
             entry.buffer_l1_write_bw_sum += value;
             entry.buffer_l1_write_bw_count += 1;
+        }
+        if let Some(value) = row.compute_shader_launch_utilization_percent {
+            entry.compute_shader_launch_util_sum += value;
+            entry.compute_shader_launch_util_count += 1;
+        }
+        if let Some(value) = row.control_flow_utilization_percent {
+            entry.control_flow_util_sum += value;
+            entry.control_flow_util_count += 1;
+        }
+        if let Some(value) = row.instruction_throughput_utilization_percent {
+            entry.instruction_throughput_util_sum += value;
+            entry.instruction_throughput_util_count += 1;
+        }
+        if let Some(value) = row.integer_complex_utilization_percent {
+            entry.integer_complex_util_sum += value;
+            entry.integer_complex_util_count += 1;
+        }
+        if let Some(value) = row.integer_conditional_utilization_percent {
+            entry.integer_conditional_util_sum += value;
+            entry.integer_conditional_util_count += 1;
+        }
+        if let Some(value) = row.f32_utilization_percent {
+            entry.f32_util_sum += value;
+            entry.f32_util_count += 1;
         }
     }
 
@@ -2205,6 +2315,22 @@ fn aggregate_counter_metrics(
                         sums.gpu_write_bw_sum,
                         sums.gpu_write_bw_count,
                     ),
+                    buffer_device_memory_bytes_read: average_option(
+                        sums.buffer_device_memory_read_sum,
+                        sums.buffer_device_memory_read_count,
+                    ),
+                    buffer_device_memory_bytes_written: average_option(
+                        sums.buffer_device_memory_written_sum,
+                        sums.buffer_device_memory_written_count,
+                    ),
+                    bytes_read_from_device_memory: average_option(
+                        sums.device_memory_read_sum,
+                        sums.device_memory_read_count,
+                    ),
+                    bytes_written_to_device_memory: average_option(
+                        sums.device_memory_written_sum,
+                        sums.device_memory_written_count,
+                    ),
                     buffer_l1_miss_rate_percent: average_option(
                         sums.buffer_l1_miss_rate_sum,
                         sums.buffer_l1_miss_rate_count,
@@ -2225,6 +2351,27 @@ fn aggregate_counter_metrics(
                         sums.buffer_l1_write_bw_sum,
                         sums.buffer_l1_write_bw_count,
                     ),
+                    compute_shader_launch_utilization_percent: average_option(
+                        sums.compute_shader_launch_util_sum,
+                        sums.compute_shader_launch_util_count,
+                    ),
+                    control_flow_utilization_percent: average_option(
+                        sums.control_flow_util_sum,
+                        sums.control_flow_util_count,
+                    ),
+                    instruction_throughput_utilization_percent: average_option(
+                        sums.instruction_throughput_util_sum,
+                        sums.instruction_throughput_util_count,
+                    ),
+                    integer_complex_utilization_percent: average_option(
+                        sums.integer_complex_util_sum,
+                        sums.integer_complex_util_count,
+                    ),
+                    integer_conditional_utilization_percent: average_option(
+                        sums.integer_conditional_util_sum,
+                        sums.integer_conditional_util_count,
+                    ),
+                    f32_utilization_percent: average_option(sums.f32_util_sum, sums.f32_util_count),
                 },
             )
         })
@@ -2249,6 +2396,14 @@ struct CounterAggregateSums {
     gpu_read_bw_count: usize,
     gpu_write_bw_sum: f64,
     gpu_write_bw_count: usize,
+    buffer_device_memory_read_sum: f64,
+    buffer_device_memory_read_count: usize,
+    buffer_device_memory_written_sum: f64,
+    buffer_device_memory_written_count: usize,
+    device_memory_read_sum: f64,
+    device_memory_read_count: usize,
+    device_memory_written_sum: f64,
+    device_memory_written_count: usize,
     buffer_l1_miss_rate_sum: f64,
     buffer_l1_miss_rate_count: usize,
     buffer_l1_read_accesses_sum: f64,
@@ -2259,6 +2414,18 @@ struct CounterAggregateSums {
     buffer_l1_write_accesses_count: usize,
     buffer_l1_write_bw_sum: f64,
     buffer_l1_write_bw_count: usize,
+    compute_shader_launch_util_sum: f64,
+    compute_shader_launch_util_count: usize,
+    control_flow_util_sum: f64,
+    control_flow_util_count: usize,
+    instruction_throughput_util_sum: f64,
+    instruction_throughput_util_count: usize,
+    integer_complex_util_sum: f64,
+    integer_complex_util_count: usize,
+    integer_conditional_util_sum: f64,
+    integer_conditional_util_count: usize,
+    f32_util_sum: f64,
+    f32_util_count: usize,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -2271,11 +2438,21 @@ struct CounterAggregate {
     device_memory_bandwidth_gbps: Option<f64>,
     gpu_read_bandwidth_gbps: Option<f64>,
     gpu_write_bandwidth_gbps: Option<f64>,
+    buffer_device_memory_bytes_read: Option<f64>,
+    buffer_device_memory_bytes_written: Option<f64>,
+    bytes_read_from_device_memory: Option<f64>,
+    bytes_written_to_device_memory: Option<f64>,
     buffer_l1_miss_rate_percent: Option<f64>,
     buffer_l1_read_accesses: Option<f64>,
     buffer_l1_read_bandwidth_gbps: Option<f64>,
     buffer_l1_write_accesses: Option<f64>,
     buffer_l1_write_bandwidth_gbps: Option<f64>,
+    compute_shader_launch_utilization_percent: Option<f64>,
+    control_flow_utilization_percent: Option<f64>,
+    instruction_throughput_utilization_percent: Option<f64>,
+    integer_complex_utilization_percent: Option<f64>,
+    integer_conditional_utilization_percent: Option<f64>,
+    f32_utilization_percent: Option<f64>,
 }
 
 fn average_option(sum: f64, count: usize) -> Option<f64> {
@@ -2313,6 +2490,22 @@ fn metrics_equal(left: CounterAggregate, right: CounterAggregate) -> bool {
             right.gpu_write_bandwidth_gbps,
         )
         && approx_option_eq(
+            left.buffer_device_memory_bytes_read,
+            right.buffer_device_memory_bytes_read,
+        )
+        && approx_option_eq(
+            left.buffer_device_memory_bytes_written,
+            right.buffer_device_memory_bytes_written,
+        )
+        && approx_option_eq(
+            left.bytes_read_from_device_memory,
+            right.bytes_read_from_device_memory,
+        )
+        && approx_option_eq(
+            left.bytes_written_to_device_memory,
+            right.bytes_written_to_device_memory,
+        )
+        && approx_option_eq(
             left.buffer_l1_miss_rate_percent,
             right.buffer_l1_miss_rate_percent,
         )
@@ -2329,6 +2522,27 @@ fn metrics_equal(left: CounterAggregate, right: CounterAggregate) -> bool {
             left.buffer_l1_write_bandwidth_gbps,
             right.buffer_l1_write_bandwidth_gbps,
         )
+        && approx_option_eq(
+            left.compute_shader_launch_utilization_percent,
+            right.compute_shader_launch_utilization_percent,
+        )
+        && approx_option_eq(
+            left.control_flow_utilization_percent,
+            right.control_flow_utilization_percent,
+        )
+        && approx_option_eq(
+            left.instruction_throughput_utilization_percent,
+            right.instruction_throughput_utilization_percent,
+        )
+        && approx_option_eq(
+            left.integer_complex_utilization_percent,
+            right.integer_complex_utilization_percent,
+        )
+        && approx_option_eq(
+            left.integer_conditional_utilization_percent,
+            right.integer_conditional_utilization_percent,
+        )
+        && approx_option_eq(left.f32_utilization_percent, right.f32_utilization_percent)
 }
 
 fn approx_option_eq(left: Option<f64>, right: Option<f64>) -> bool {
@@ -2381,6 +2595,26 @@ fn aggregate_change_magnitude(change: &CounterMetricChange) -> f64 {
         )
         .abs()
         + option_delta(
+            change.left_buffer_device_memory_bytes_read,
+            change.right_buffer_device_memory_bytes_read,
+        )
+        .abs()
+        + option_delta(
+            change.left_buffer_device_memory_bytes_written,
+            change.right_buffer_device_memory_bytes_written,
+        )
+        .abs()
+        + option_delta(
+            change.left_bytes_read_from_device_memory,
+            change.right_bytes_read_from_device_memory,
+        )
+        .abs()
+        + option_delta(
+            change.left_bytes_written_to_device_memory,
+            change.right_bytes_written_to_device_memory,
+        )
+        .abs()
+        + option_delta(
             change.left_buffer_l1_miss_rate_percent,
             change.right_buffer_l1_miss_rate_percent,
         )
@@ -2403,6 +2637,36 @@ fn aggregate_change_magnitude(change: &CounterMetricChange) -> f64 {
         + option_delta(
             change.left_buffer_l1_write_bandwidth_gbps,
             change.right_buffer_l1_write_bandwidth_gbps,
+        )
+        .abs()
+        + option_delta(
+            change.left_compute_shader_launch_utilization_percent,
+            change.right_compute_shader_launch_utilization_percent,
+        )
+        .abs()
+        + option_delta(
+            change.left_control_flow_utilization_percent,
+            change.right_control_flow_utilization_percent,
+        )
+        .abs()
+        + option_delta(
+            change.left_instruction_throughput_utilization_percent,
+            change.right_instruction_throughput_utilization_percent,
+        )
+        .abs()
+        + option_delta(
+            change.left_integer_complex_utilization_percent,
+            change.right_integer_complex_utilization_percent,
+        )
+        .abs()
+        + option_delta(
+            change.left_integer_conditional_utilization_percent,
+            change.right_integer_conditional_utilization_percent,
+        )
+        .abs()
+        + option_delta(
+            change.left_f32_utilization_percent,
+            change.right_f32_utilization_percent,
         )
         .abs()
 }
