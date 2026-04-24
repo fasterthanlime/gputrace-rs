@@ -29,12 +29,14 @@ const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const K_AX_ERROR_SUCCESS: AXError = 0;
 const K_AX_ERROR_ACTION_UNSUPPORTED: AXError = -25205;
 const K_AX_ERROR_API_DISABLED: AXError = -25204;
+const K_AX_ERROR_ACTION_UNSUPPORTED_ALT: AXError = -25206;
 const K_CF_NUMBER_SINT32_TYPE: c_int = 3;
 const K_AX_VALUE_CGPOINT: c_int = 1;
 const K_AX_VALUE_CGSIZE: c_int = 2;
 const K_CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
 const K_CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
 const K_CG_HID_EVENT_TAP: u32 = 0;
+const EXPORT_SHEET_SEARCH_LIMIT: usize = 60_000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -221,6 +223,12 @@ impl AxElement {
             }
         }
         children
+    }
+
+    fn parent(&self) -> Option<AxElement> {
+        let value = self.copy_attr("AXParent")?;
+        let retained = unsafe { CFRetain(value.ptr()) };
+        AxElement::new(retained)
     }
 
     fn point_attr(&self, name: &str) -> Option<CGPoint> {
@@ -487,12 +495,28 @@ pub fn select_tab(trace_path: Option<&Path>, tab_name: &str) -> Result<XcodeActi
     };
     let window_title = window.title();
     let name = normalize(tab_name);
-    let Some(tab) = find_descendant(&window, 5_000, |el| {
+    let elements = descendants(&window, 5_000);
+    if let Some(tab) = elements.iter().find(|el| {
         is_tab_role(&el.role(), el.subrole().as_deref()) && normalize(&el.label()) == name
+    }) {
+        press(&tab, Some(&window))?;
+        return Ok(XcodeActionResult {
+            window_title,
+            action: "select-tab".to_owned(),
+            target: tab_name.to_owned(),
+        });
+    }
+
+    let Some(item) = elements.iter().find(|el| {
+        matches!(
+            el.role().as_str(),
+            "AXStaticText" | "AXCell" | "AXRow" | "AXButton"
+        ) && normalize(&el.label()) == name
     }) else {
         return Err(Error::InvalidInput("missing-action".to_owned()));
     };
-    press(&tab, Some(&window))?;
+    let target = clickable_navigation_ancestor(item).unwrap_or_else(|| item.clone());
+    press(&target, Some(&window))?;
     Ok(XcodeActionResult {
         window_title,
         action: "select-tab".to_owned(),
@@ -642,29 +666,34 @@ pub fn finish_export_sheet(
 ) -> Result<XcodeActionResult> {
     let initial_app = app()?;
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut sheet_window = None;
+    let mut sheet_target = None;
     while Instant::now() < deadline {
         let fresh_app = app().unwrap_or_else(|_| initial_app.clone());
-        for window in windows(&fresh_app) {
-            if find_descendant(&window, 1_000, |el| el.role() == "AXSheet").is_some()
-                || find_save_button(&window).is_some()
-            {
-                sheet_window = Some(window);
-                break;
-            }
-        }
-        if sheet_window.is_some() {
+        if let Some(target) = find_export_sheet(&fresh_app) {
+            sheet_target = Some(target);
             break;
         }
         thread::sleep(Duration::from_millis(250));
     }
-    let Some(window) = sheet_window.or(selected_window(trace_path)?) else {
-        return Err(Error::InvalidInput(
-            "export sheet did not appear".to_owned(),
-        ));
+    let (window, sheet) = if let Some(target) = sheet_target {
+        target
+    } else {
+        let Some(window) = selected_window(trace_path)? else {
+            return Err(Error::InvalidInput(
+                "export sheet did not appear".to_owned(),
+            ));
+        };
+        let Some(sheet) = find_export_sheet_in_window(&window).or_else(|| {
+            find_save_button(&window, EXPORT_SHEET_SEARCH_LIMIT).map(|_| window.clone())
+        }) else {
+            return Err(Error::InvalidInput(
+                "export sheet did not appear".to_owned(),
+            ));
+        };
+        (window, sheet)
     };
 
-    if let Some(embed) = find_checkbox(&window, "Embed performance data", 1_000)
+    if let Some(embed) = find_checkbox(&sheet, "Embed performance data", EXPORT_SHEET_SEARCH_LIMIT)
         && embed.enabled()
         && !checkbox_checked(&embed)
     {
@@ -673,14 +702,14 @@ pub fn finish_export_sheet(
     }
 
     let output_name = file_name.to_string_lossy();
-    if let Some(field) = find_save_as_field(&window) {
+    if let Some(field) = find_save_as_field(&sheet) {
         field.set_string_value(&output_name)?;
         let _ = field.perform("AXConfirm");
     }
 
-    let _ = navigate_to_parent_best_effort(&window, parent);
+    let _ = navigate_to_parent_best_effort(&sheet, parent);
 
-    let Some(button) = find_save_button(&window) else {
+    let Some(button) = find_save_button(&sheet, EXPORT_SHEET_SEARCH_LIMIT) else {
         return Err(Error::InvalidInput(
             "Save/Export button not found".to_owned(),
         ));
@@ -692,7 +721,7 @@ pub fn finish_export_sheet(
     }
     press(&button, Some(&window))?;
     thread::sleep(Duration::from_millis(500));
-    if let Some(replace) = find_button(&window, "Replace", 1_000)
+    if let Some(replace) = find_button(&window, "Replace", EXPORT_SHEET_SEARCH_LIMIT)
         && replace.enabled()
     {
         press(&replace, Some(&window))?;
@@ -701,6 +730,18 @@ pub fn finish_export_sheet(
         window_title: window.title(),
         action: "save-export".to_owned(),
         target: output_name.into_owned(),
+    })
+}
+
+fn find_export_sheet(app: &AxElement) -> Option<(AxElement, AxElement)> {
+    windows(app)
+        .into_iter()
+        .find_map(|window| find_export_sheet_in_window(&window).map(|sheet| (window, sheet)))
+}
+
+fn find_export_sheet_in_window(window: &AxElement) -> Option<AxElement> {
+    find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, |el| {
+        el.role() == "AXSheet"
     })
 }
 
@@ -911,19 +952,19 @@ fn find_checkbox(root: &AxElement, name: &str, max_visit: usize) -> Option<AxEle
     })
 }
 
-fn find_save_button(root: &AxElement) -> Option<AxElement> {
+fn find_save_button(root: &AxElement, max_visit: usize) -> Option<AxElement> {
     ["Save", "Export"]
         .iter()
-        .find_map(|name| find_button(root, name, 1_500).filter(AxElement::enabled))
+        .find_map(|name| find_button(root, name, max_visit).filter(AxElement::enabled))
 }
 
 fn find_save_as_field(root: &AxElement) -> Option<AxElement> {
-    find_descendant(root, 1_500, |el| {
+    find_descendant(root, EXPORT_SHEET_SEARCH_LIMIT, |el| {
         matches!(el.role().as_str(), "AXTextField" | "AXComboBox")
             && el.string_attr("AXIdentifier") == "saveAsNameTextField"
     })
     .or_else(|| {
-        find_descendant(root, 1_500, |el| {
+        find_descendant(root, EXPORT_SHEET_SEARCH_LIMIT, |el| {
             el.role() == "AXTextField"
                 && normalize(&el.string_attr("AXDescription")).contains("save")
         })
@@ -933,7 +974,7 @@ fn find_save_as_field(root: &AxElement) -> Option<AxElement> {
 fn navigate_to_parent_best_effort(window: &AxElement, parent: &Path) -> Result<()> {
     std::fs::create_dir_all(parent)?;
     let parent = parent.to_string_lossy();
-    if let Some(path_field) = find_descendant(window, 1_500, |el| {
+    if let Some(path_field) = find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, |el| {
         matches!(el.role().as_str(), "AXTextField" | "AXComboBox")
             && (el.string_attr("AXIdentifier") == "PathTextField"
                 || normalize(&el.string_attr("AXDescription")).contains("path")
@@ -978,12 +1019,50 @@ fn checkbox_checked(el: &AxElement) -> bool {
         .unwrap_or(false)
 }
 
+fn clickable_navigation_ancestor(el: &AxElement) -> Option<AxElement> {
+    let mut current = el.clone();
+    for _ in 0..8 {
+        if matches!(current.role().as_str(), "AXRow" | "AXCell" | "AXButton") {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+    None
+}
+
 fn status_from_elements(elements: &[AxElement]) -> XcodeAutomationStatus {
+    let has_complete_landmark = elements.iter().any(|el| {
+        let text = el.label();
+        (el.role() == "AXButton" && matches!(text.as_str(), "Show Performance" | "Export"))
+            || matches!(
+                text.as_str(),
+                "Effective GPU Time"
+                    | "Top Shaders"
+                    | "GPU Commands"
+                    | "Performance State"
+                    | "Overview"
+                    | "Timeline"
+                    | "Shaders"
+                    | "Counters"
+                    | "Cost Graph"
+                    | "Heat Map"
+            )
+            || text.ends_with(" ms")
+    });
+
     for el in elements {
         let text = el.label();
-        if text.contains("Profiling GPU Trace") || text.contains("% completed") {
+        if text.contains("Profiling GPU Trace") {
             return XcodeAutomationStatus::Running;
         }
+    }
+
+    if has_complete_landmark {
+        return XcodeAutomationStatus::Complete;
+    }
+
+    for el in elements {
+        let text = el.label();
         if text.contains("Performance data not available") {
             return XcodeAutomationStatus::ReplayReady;
         }
@@ -1004,12 +1083,6 @@ fn status_from_elements(elements: &[AxElement]) -> XcodeAutomationStatus {
                 };
             }
         }
-    }
-    if elements
-        .iter()
-        .any(|el| el.role() == "AXButton" && el.label() == "Show Performance")
-    {
-        return XcodeAutomationStatus::Complete;
     }
     parse_status("unknown")
 }
@@ -1114,7 +1187,10 @@ fn press(el: &AxElement, window: Option<&AxElement>) -> Result<()> {
     if err == K_AX_ERROR_SUCCESS {
         return Ok(());
     }
-    if matches!(err, K_AX_ERROR_ACTION_UNSUPPORTED | K_AX_ERROR_API_DISABLED) {
+    if matches!(
+        err,
+        K_AX_ERROR_ACTION_UNSUPPORTED | K_AX_ERROR_API_DISABLED | K_AX_ERROR_ACTION_UNSUPPORTED_ALT
+    ) {
         if let Some(window) = window {
             let _ = activate_xcode();
             thread::sleep(Duration::from_millis(150));

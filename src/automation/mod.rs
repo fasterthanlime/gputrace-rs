@@ -577,6 +577,7 @@ fn export_profile_trace(
     output_path: &Path,
 ) -> Result<XcodeExportResult> {
     let output_path = prepare_export_output_path(output_path)?;
+    let _ = show_summary(trace_path);
     let _ = click_button(trace_path, &["Export"])
         .or_else(|_| click_menu_item(&["File", "Export…"]))
         .or_else(|_| click_menu_item(&["File", "Export..."]))
