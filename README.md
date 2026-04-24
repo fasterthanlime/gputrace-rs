@@ -87,3 +87,6 @@ Not included by design:
 ## LLM Usage
 
 For agent-oriented workflows, see [docs/LLM_USAGE.md](docs/LLM_USAGE.md).
+
+For the full capture-profile-export-analyze loop through Xcode, see
+[docs/PROFILE_WORKFLOW.md](docs/PROFILE_WORKFLOW.md).

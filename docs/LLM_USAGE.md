@@ -63,6 +63,10 @@ gputrace xcode-profile run /abs/path/input.gputrace --output /abs/path/input-per
 gputrace profiler /abs/path/input-perfdata.gputrace --format json
 ```
 
+For the complete operational runbook, including split recovery commands,
+export verification, and interpretation caveats, see
+[`docs/PROFILE_WORKFLOW.md`](PROFILE_WORKFLOW.md).
+
 Useful debugging commands:
 
 ```bash
