@@ -979,15 +979,9 @@ fn checkbox_checked(el: &AxElement) -> bool {
 }
 
 fn status_from_elements(elements: &[AxElement]) -> XcodeAutomationStatus {
-    if elements
-        .iter()
-        .any(|el| el.role() == "AXButton" && el.label() == "Show Performance")
-    {
-        return XcodeAutomationStatus::Complete;
-    }
     for el in elements {
         let text = el.label();
-        if text.contains("Profiling GPU Trace") {
+        if text.contains("Profiling GPU Trace") || text.contains("% completed") {
             return XcodeAutomationStatus::Running;
         }
         if text.contains("Performance data not available") {
@@ -1010,6 +1004,12 @@ fn status_from_elements(elements: &[AxElement]) -> XcodeAutomationStatus {
                 };
             }
         }
+    }
+    if elements
+        .iter()
+        .any(|el| el.role() == "AXButton" && el.label() == "Show Performance")
+    {
+        return XcodeAutomationStatus::Complete;
     }
     parse_status("unknown")
 }
