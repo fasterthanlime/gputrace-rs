@@ -12,7 +12,6 @@ use crate::trace::TraceBundle;
 
 pub const MAGIC_MTLB: &[u8; 4] = b"MTLB";
 const MTLB_HEADER_LEN: usize = 48;
-const FUNCTION_SCAN_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum MTLBFileKind {
@@ -1184,18 +1183,12 @@ fn scan_function_names(
         return Vec::new();
     }
 
-    let end = match header.bytecode_offset as usize {
-        0 => data.len(),
-        value if value > start && value <= data.len() => value,
-        _ => data.len(),
-    };
-    let haystack = &data[start..end];
+    let haystack = &data[start..];
     let tags = [b"NAMED\0".as_slice(), b"NAME;\0".as_slice()];
     let mut names = Vec::new();
-    let mut seen = BTreeSet::new();
     let mut cursor = 0;
 
-    while cursor < haystack.len() && names.len() < FUNCTION_SCAN_LIMIT {
+    while cursor < haystack.len() {
         let mut best_match = None;
         for tag in tags {
             if let Some(relative) = memmem::find(&haystack[cursor..], tag) {
@@ -1216,48 +1209,14 @@ fn scan_function_names(
         let raw_name = &haystack[name_start..name_start + name_len];
         cursor = name_start + name_len + 1;
 
-        if raw_name.is_empty() || !is_plausible_function_name(raw_name) {
+        if raw_name.is_empty() {
             continue;
         }
 
-        let name = String::from_utf8_lossy(raw_name).into_owned();
-        if seen.insert(name.clone()) {
-            names.push(name);
-        }
-    }
-
-    if names.len() == FUNCTION_SCAN_LIMIT {
-        warnings.push(format!(
-            "best-effort function scan hit the {} name cap",
-            FUNCTION_SCAN_LIMIT
-        ));
+        names.push(String::from_utf8_lossy(raw_name).into_owned());
     }
 
     names
-}
-
-fn is_plausible_function_name(bytes: &[u8]) -> bool {
-    bytes.iter().all(|byte| {
-        matches!(
-            byte,
-            b'a'..=b'z'
-                | b'A'..=b'Z'
-                | b'0'..=b'9'
-                | b'_'
-                | b':'
-                | b'.'
-                | b'$'
-                | b'['
-                | b']'
-                | b'<'
-                | b'>'
-                | b'('
-                | b')'
-                | b','
-                | b' '
-                | b'-'
-        )
-    })
 }
 
 fn find_magic_offsets(data: &[u8]) -> Vec<u64> {
@@ -1324,6 +1283,31 @@ mod tests {
         );
         assert_eq!(report.magic_offsets, vec![0]);
         assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn binary_function_scan_matches_go_fallback_semantics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("library.mtlb");
+        let mut data = sample_mtlb(&["before_bytecode"], 256, 48, 96, 160);
+        data[170..176].copy_from_slice(b"NAME;\0");
+        data[176..190].copy_from_slice(b"after_bytecode");
+        data[190] = 0;
+        data[200..206].copy_from_slice(b"NAMED\0");
+        data[206..221].copy_from_slice(b"before_bytecode");
+        data[221] = 0;
+        fs::write(&path, data).unwrap();
+
+        let report = inspect_file(&path).unwrap();
+
+        assert_eq!(
+            report.best_effort_function_names,
+            vec![
+                "before_bytecode".to_owned(),
+                "after_bytecode".to_owned(),
+                "before_bytecode".to_owned(),
+            ]
+        );
     }
 
     #[test]
