@@ -439,16 +439,39 @@ pub fn click_button(trace_path: Option<&Path>, button_names: &[&str]) -> Result<
         .iter()
         .map(|s| normalize(s))
         .collect::<Vec<_>>();
-    let Some(button) = find_descendant(&window, 5_000, |el| {
-        el.role() == "AXButton"
-            && el.enabled()
-            && names.iter().any(|name| {
-                normalize(&el.title()) == *name
-                    || normalize(&el.string_attr("AXDescription")) == *name
-            })
+    let buttons = descendants(&window, 5_000)
+        .into_iter()
+        .filter(|el| el.role() == "AXButton")
+        .collect::<Vec<_>>();
+    let Some(button) = buttons.iter().find(|el| {
+        names.iter().any(|name| {
+            normalize(&el.label()) == *name
+                || normalize(&el.title()) == *name
+                || normalize(&el.string_attr("AXDescription")) == *name
+        })
     }) else {
-        return Err(Error::InvalidInput("missing-action".to_owned()));
+        return Err(Error::InvalidInput(format!(
+            "missing-action; requested={:?}; buttons={:?}",
+            button_names,
+            buttons
+                .iter()
+                .map(|el| {
+                    (
+                        el.label(),
+                        el.title(),
+                        el.string_attr("AXDescription"),
+                        el.enabled(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        )));
     };
+    if !button.enabled() {
+        return Err(Error::InvalidInput(format!(
+            "button '{}' is disabled",
+            button.label()
+        )));
+    }
     let target = button.label();
     press(&button, Some(&window))?;
     Ok(XcodeActionResult {
