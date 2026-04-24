@@ -126,6 +126,14 @@ struct DiffArgs {
     #[arg(long)]
     by: Option<String>,
     #[arg(long)]
+    show_matches: bool,
+    #[arg(long)]
+    show_unmatched: bool,
+    #[arg(long)]
+    show_occurrences: bool,
+    #[arg(long)]
+    explain: bool,
+    #[arg(long)]
     quick: bool,
     #[arg(long)]
     by_encoder: bool,
@@ -1126,6 +1134,7 @@ pub fn run() -> Result<()> {
             }
         }
         CommandSet::Diff(args) => {
+            validate_diff_args(&args)?;
             let limit = args.limit;
             let min_delta_us = args.min_delta_us.unwrap_or_default();
             let only_encoder = args.only_encoder;
@@ -1136,6 +1145,10 @@ pub fn run() -> Result<()> {
             let json_flag = args.json;
             let csv_flag = args.csv;
             let by = args.by.clone();
+            let show_matches = args.show_matches;
+            let show_unmatched = args.show_unmatched;
+            let show_occurrences = args.show_occurrences;
+            let explain = args.explain;
             let quick = args.quick;
             let by_encoder = args.by_encoder;
             let (left, right, discover_note) = resolve_diff_inputs(args)?;
@@ -1162,21 +1175,37 @@ pub fn run() -> Result<()> {
 
             let format = format_arg.as_deref().unwrap_or(if csv_flag {
                 "csv"
-            } else if markdown_flag || quick || by_encoder {
+            } else if markdown_flag {
                 "markdown"
             } else {
-                "json"
+                "text"
             });
             if json_flag {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 match format {
-                    "markdown" | "md" | "text" => {
+                    "markdown" | "md" => {
                         if let Some(note) = &discover_note {
                             println!("{note}\n");
                         }
                         print!("{}", markdown::diff_report_with_limit(&report, limit));
                     }
+                    "text" | "table" => print!(
+                        "{}",
+                        diff::format_profile_text(
+                            &report,
+                            &diff::ProfileTextOptions {
+                                by: by.as_deref(),
+                                show_matches,
+                                show_unmatched,
+                                show_occurrences,
+                                explain,
+                                quick,
+                                by_encoder,
+                                limit,
+                            },
+                        )?
+                    ),
                     "csv" => print!(
                         "{}",
                         diff::format_profile_csv(&report, by.as_deref(), limit)?
@@ -1487,6 +1516,135 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+fn validate_diff_args(args: &DiffArgs) -> Result<()> {
+    if args.json && args.csv {
+        return Err(crate::Error::InvalidInput(
+            "--json and --csv are mutually exclusive".to_owned(),
+        ));
+    }
+    if args.limit == 0 {
+        return Err(crate::Error::InvalidInput("--limit must be > 0".to_owned()));
+    }
+    if args.min_delta_us.is_some_and(|value| value < 0) {
+        return Err(crate::Error::InvalidInput(
+            "--min-delta-us must be >= 0".to_owned(),
+        ));
+    }
+    validate_diff_by(args.by.as_deref())?;
+    if args.left.is_some() != args.right.is_some() {
+        return Err(crate::Error::InvalidInput(
+            "expected 0 or 2 positional traces, got 1".to_owned(),
+        ));
+    }
+    if (args.left_flag.is_some()) != (args.right_flag.is_some()) {
+        return Err(crate::Error::InvalidInput(
+            "--left and --right must be provided together".to_owned(),
+        ));
+    }
+    if (args.left.is_some() || args.right.is_some())
+        && (args.left_flag.is_some() || args.right_flag.is_some())
+    {
+        return Err(crate::Error::InvalidInput(
+            "positional traces cannot be combined with --left/--right".to_owned(),
+        ));
+    }
+    if (args.left.is_some() || args.right.is_some()) && args.bench_dir.is_some() {
+        return Err(crate::Error::InvalidInput(
+            "positional traces cannot be combined with --bench-dir".to_owned(),
+        ));
+    }
+    let text_only_flags = args.show_matches
+        || args.show_unmatched
+        || args.show_occurrences
+        || args.explain
+        || args.by_encoder;
+    if args.json && text_only_flags {
+        return Err(crate::Error::InvalidInput(
+            "--json cannot be combined with text-only flags (--show-*, --explain, --by-encoder)"
+                .to_owned(),
+        ));
+    }
+    if args.csv {
+        if args.quick {
+            return Err(crate::Error::InvalidInput(
+                "--quick cannot be combined with --csv".to_owned(),
+            ));
+        }
+        if text_only_flags {
+            return Err(crate::Error::InvalidInput(
+                "--csv cannot be combined with text-only flags (--show-*, --explain, --by-encoder)"
+                    .to_owned(),
+            ));
+        }
+        if args
+            .by
+            .as_deref()
+            .is_some_and(|value| value.trim().contains(','))
+        {
+            return Err(crate::Error::InvalidInput(
+                "--csv requires a single --by view".to_owned(),
+            ));
+        }
+    }
+    if args.quick {
+        if args.json {
+            return Err(crate::Error::InvalidInput(
+                "--quick cannot be combined with --json".to_owned(),
+            ));
+        }
+        if args
+            .by
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(crate::Error::InvalidInput(
+                "--quick cannot be combined with --by".to_owned(),
+            ));
+        }
+        if args.show_matches || args.show_unmatched || args.show_occurrences || args.explain {
+            return Err(crate::Error::InvalidInput(
+                "--quick cannot be combined with --show-matches/--show-unmatched/--show-occurrences/--explain"
+                    .to_owned(),
+            ));
+        }
+    }
+    if args.by_encoder
+        && args
+            .by
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(crate::Error::InvalidInput(
+            "--by-encoder cannot be combined with --by".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_diff_by(by: Option<&str>) -> Result<()> {
+    let Some(by) = by.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let valid = matches!(
+        by,
+        "function"
+            | "encoder"
+            | "pipeline"
+            | "timeline-windows"
+            | "dispatch"
+            | "unmatched"
+            | "matches"
+            | "occurrences"
+    );
+    if valid {
+        Ok(())
+    } else {
+        Err(crate::Error::InvalidInput(format!(
+            "invalid --by value {by:?}; expected one of function, encoder, pipeline, timeline-windows, dispatch, unmatched, matches, occurrences"
+        )))
+    }
+}
+
 fn run_xcode_profile_command(args: XcodeProfileArgs) -> Result<()> {
     match args.command {
         Some(XcodeProfileCommand::Open(args)) => {
@@ -1668,12 +1826,12 @@ fn run_xcode_profile_command(args: XcodeProfileArgs) -> Result<()> {
 fn resolve_diff_inputs(args: DiffArgs) -> Result<(PathBuf, PathBuf, Option<String>)> {
     if args.left.is_some() && args.left_flag.is_some() {
         return Err(crate::Error::InvalidInput(
-            "diff positional left cannot be combined with --left".to_owned(),
+            "positional traces cannot be combined with --left/--right".to_owned(),
         ));
     }
     if args.right.is_some() && args.right_flag.is_some() {
         return Err(crate::Error::InvalidInput(
-            "diff positional right cannot be combined with --right".to_owned(),
+            "positional traces cannot be combined with --left/--right".to_owned(),
         ));
     }
     let explicit_left = args.left_flag.or(args.left);
@@ -1687,7 +1845,7 @@ fn resolve_diff_inputs(args: DiffArgs) -> Result<(PathBuf, PathBuf, Option<Strin
         let note = args
             .bench_dir
             .as_ref()
-            .map(|_| "--bench-dir ignored because explicit traces were provided".to_owned());
+            .map(|_| "--bench-dir ignored because --left/--right were provided".to_owned());
         return Ok((left, right, note));
     }
     let bench_dir = args.bench_dir.ok_or_else(|| {
@@ -1708,7 +1866,30 @@ fn resolve_diff_inputs(args: DiffArgs) -> Result<(PathBuf, PathBuf, Option<Strin
             .and_then(|name| name.to_str())
             .unwrap_or("-")
     );
+    let note = if pair.left_raw.is_some()
+        || pair.right_raw.is_some()
+        || pair.left_csv.is_some()
+        || pair.right_csv.is_some()
+    {
+        format!(
+            "{note} siblings(left_raw={} right_raw={} left_csv={} right_csv={})",
+            option_file_name(pair.left_raw.as_deref()),
+            option_file_name(pair.right_raw.as_deref()),
+            option_file_name(pair.left_csv.as_deref()),
+            option_file_name(pair.right_csv.as_deref())
+        )
+    } else {
+        note
+    };
     Ok((pair.left, pair.right, Some(note)))
+}
+
+fn option_file_name(path: Option<&Path>) -> String {
+    path.and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("-")
+        .to_owned()
 }
 
 #[derive(Debug, Clone)]
@@ -1716,6 +1897,10 @@ struct BenchPair {
     stem: String,
     left: PathBuf,
     right: PathBuf,
+    left_raw: Option<PathBuf>,
+    right_raw: Option<PathBuf>,
+    left_csv: Option<PathBuf>,
+    right_csv: Option<PathBuf>,
     left_mtime: SystemTime,
     right_mtime: SystemTime,
 }
@@ -1765,7 +1950,7 @@ fn discover_bench_pair(dir: &Path) -> Result<BenchPair> {
 
     let mut pairs = groups
         .into_iter()
-        .filter_map(|(stem, group)| select_bench_pair(stem, group))
+        .filter_map(|(stem, group)| select_bench_pair(dir, stem, group))
         .collect::<Vec<_>>();
     pairs.sort_by(|left, right| {
         let left_time = left.left_mtime.max(left.right_mtime);
@@ -1786,40 +1971,69 @@ fn classify_bench_trace_name(name: &str) -> Option<(String, &'static str, &'stat
     if !name.ends_with(".gputrace") {
         return None;
     }
-    let perf = name.contains("-perfdata.gputrace");
-    if let Some((stem, _)) = name.split_once("_Go") {
-        return Some((stem.to_owned(), "go", if perf { "perf" } else { "raw" }));
+    let perf = name.ends_with("-perfdata.gputrace");
+    if let Some(stem) = classify_bench_side(name, "_Go") {
+        return Some((stem, "go", if perf { "perf" } else { "raw" }));
     }
-    if let Some((stem, _)) = name.split_once("_Python") {
-        return Some((stem.to_owned(), "py", if perf { "perf" } else { "raw" }));
+    if let Some(stem) = classify_bench_side(name, "_Python") {
+        return Some((stem, "py", if perf { "perf" } else { "raw" }));
     }
     None
 }
 
-fn select_bench_pair(stem: String, group: BenchGroup) -> Option<BenchPair> {
+fn classify_bench_side(name: &str, marker: &str) -> Option<String> {
+    let marker_index = name.rfind(marker)?;
+    let after_marker = &name[marker_index + marker.len()..];
+    if after_marker.contains('_') {
+        Some(name[..marker_index].to_owned())
+    } else {
+        None
+    }
+}
+
+fn select_bench_pair(dir: &Path, stem: String, group: BenchGroup) -> Option<BenchPair> {
     let go_perf = newest_bench_candidate(&group.go_perf);
     let py_perf = newest_bench_candidate(&group.py_perf);
-    if let (Some(left), Some(right)) = (go_perf, py_perf) {
-        return Some(BenchPair {
-            stem,
-            left: left.path.clone(),
-            right: right.path.clone(),
-            left_mtime: left.mtime,
-            right_mtime: right.mtime,
-        });
-    }
     let go_raw = newest_bench_candidate(&group.go_raw);
     let py_raw = newest_bench_candidate(&group.py_raw);
-    let (Some(left), Some(right)) = (go_raw, py_raw) else {
-        return None;
-    };
-    Some(BenchPair {
+
+    let mut pair = BenchPair {
         stem,
-        left: left.path.clone(),
-        right: right.path.clone(),
-        left_mtime: left.mtime,
-        right_mtime: right.mtime,
-    })
+        left: PathBuf::new(),
+        right: PathBuf::new(),
+        left_raw: go_raw.map(|candidate| candidate.path.clone()),
+        right_raw: py_raw.map(|candidate| candidate.path.clone()),
+        left_csv: None,
+        right_csv: None,
+        left_mtime: SystemTime::UNIX_EPOCH,
+        right_mtime: SystemTime::UNIX_EPOCH,
+    };
+
+    if let (Some(left), Some(right)) = (go_perf, py_perf) {
+        pair.left = left.path.clone();
+        pair.right = right.path.clone();
+        pair.left_mtime = left.mtime;
+        pair.right_mtime = right.mtime;
+    } else if let (Some(left), Some(right)) = (go_raw, py_raw) {
+        pair.left = left.path.clone();
+        pair.right = right.path.clone();
+        pair.left_mtime = left.mtime;
+        pair.right_mtime = right.mtime;
+    } else {
+        return None;
+    }
+    pair.left_csv = find_sibling_counter_csv(dir, &pair.left);
+    pair.right_csv = find_sibling_counter_csv(dir, &pair.right);
+    Some(pair)
+}
+
+fn find_sibling_counter_csv(dir: &Path, trace_path: &Path) -> Option<PathBuf> {
+    let base = trace_path.file_name()?.to_str()?;
+    let stem = base
+        .strip_suffix("-perfdata.gputrace")
+        .or_else(|| base.strip_suffix(".gputrace"))?;
+    let csv = dir.join(format!("{stem}_counters.csv"));
+    csv.exists().then_some(csv)
 }
 
 fn newest_bench_candidate(candidates: &[BenchCandidate]) -> Option<&BenchCandidate> {

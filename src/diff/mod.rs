@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::analysis::{AnalysisReport, analyze};
@@ -403,6 +404,433 @@ pub fn format_profile_csv(report: &DiffReport, view: Option<&str>, limit: usize)
         }
     }
     Ok(out)
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileTextOptions<'a> {
+    pub by: Option<&'a str>,
+    pub show_matches: bool,
+    pub show_unmatched: bool,
+    pub show_occurrences: bool,
+    pub explain: bool,
+    pub quick: bool,
+    pub by_encoder: bool,
+    pub limit: usize,
+}
+
+pub fn format_profile_text(
+    report: &DiffReport,
+    options: &ProfileTextOptions<'_>,
+) -> Result<String> {
+    let Some(profile) = &report.profile_diff else {
+        let mut out = String::new();
+        out.push_str("Trace Diff\n");
+        for summary in &report.summary {
+            writeln!(&mut out, "- {summary}").expect("writing to string cannot fail");
+        }
+        return Ok(out);
+    };
+
+    let limit = options.limit.max(1);
+    let mut out = String::new();
+    if options.quick {
+        push_profile_quick_text(&mut out, profile, limit.min(10));
+        if options.by_encoder {
+            out.push('\n');
+            push_profile_encoder_focus_text(&mut out, profile, limit);
+        }
+        return Ok(out);
+    }
+    if options.by_encoder {
+        push_profile_encoder_focus_text(&mut out, profile, limit);
+        return Ok(out);
+    }
+
+    let by = options.by.unwrap_or_default().trim();
+    if by.is_empty() {
+        push_profile_overview_text(&mut out, profile, options.explain);
+        push_profile_function_text(&mut out, profile, limit);
+        push_profile_dispatch_outliers_text(&mut out, profile, limit);
+        if options.show_occurrences {
+            push_profile_matches_text(&mut out, profile, limit, "Function Occurrences");
+        }
+        if options.show_matches {
+            push_profile_matches_text(&mut out, profile, limit, "Matched Dispatches");
+        }
+        if options.show_unmatched {
+            push_profile_unmatched_text(&mut out, profile, limit);
+        }
+        return Ok(out);
+    }
+
+    match by {
+        "function" => push_profile_function_text(&mut out, profile, limit),
+        "encoder" => push_profile_encoder_text(&mut out, profile, limit),
+        "pipeline" => push_profile_pipeline_text(&mut out, profile, limit),
+        "timeline-windows" => push_profile_spike_windows_text(&mut out, profile, limit),
+        "dispatch" => push_profile_dispatch_outliers_text(&mut out, profile, limit),
+        "matches" | "occurrences" => {
+            push_profile_matches_text(&mut out, profile, limit, "Matched Dispatches")
+        }
+        "unmatched" => push_profile_unmatched_text(&mut out, profile, limit),
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "invalid diff text --by view: {other}"
+            )));
+        }
+    }
+    Ok(out)
+}
+
+fn push_profile_overview_text(out: &mut String, profile: &ProfileDiffReport, explain: bool) {
+    writeln!(out, "Trace Diff").expect("writing to string cannot fail");
+    writeln!(out, "Trace left: {}", profile.left_path).expect("writing to string cannot fail");
+    writeln!(out, "Trace right: {}", profile.right_path).expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "Total GPU delta (left-right): {:+} us (left={} us right={} us)",
+        profile.summary.total_delta_us,
+        profile.summary.left_total_gpu_time_us,
+        profile.summary.right_total_gpu_time_us
+    )
+    .expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "Matched delta: {:+} us",
+        profile.summary.matched_delta_us
+    )
+    .expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "Structural/unmatched delta: {:+} us",
+        profile.summary.unmatched_delta_us
+    )
+    .expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "Dispatch delta: {:+} (left={} right={})",
+        profile.summary.dispatch_count_delta,
+        profile.summary.left_dispatch_count,
+        profile.summary.right_dispatch_count
+    )
+    .expect("writing to string cannot fail");
+    writeln!(out, "Likely cause: {}", profile.summary.likely_cause)
+        .expect("writing to string cannot fail");
+    if explain {
+        writeln!(
+            out,
+            "Interpretation: compare matched delta for common work against structural/unmatched delta to separate per-dispatch slowdown from command stream changes."
+        )
+        .expect("writing to string cannot fail");
+    }
+    for warning in &profile.warnings {
+        writeln!(out, "Warning: {warning}").expect("writing to string cannot fail");
+    }
+}
+
+fn push_profile_quick_text(out: &mut String, profile: &ProfileDiffReport, limit: usize) {
+    writeln!(out, "Quick Triage").expect("writing to string cannot fail");
+    writeln!(out, "Trace left: {}", profile.left_path).expect("writing to string cannot fail");
+    writeln!(out, "Trace right: {}", profile.right_path).expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "Total GPU delta (matched common work): {:+} us",
+        profile.summary.matched_delta_us
+    )
+    .expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "Total GPU delta (all dispatches): {:+} us (left={} us right={} us)",
+        profile.summary.total_delta_us,
+        profile.summary.left_total_gpu_time_us,
+        profile.summary.right_total_gpu_time_us
+    )
+    .expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "Structural/unmatched delta: {:+} us",
+        profile.summary.unmatched_delta_us
+    )
+    .expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "Dispatch delta (left-right): {:+}",
+        profile.summary.dispatch_count_delta
+    )
+    .expect("writing to string cannot fail");
+    push_profile_function_text(out, profile, limit);
+    push_profile_dispatch_outliers_text(out, profile, limit);
+    push_profile_unnamed_text(out, profile, limit);
+    push_profile_spike_windows_text(out, profile, limit);
+}
+
+fn push_profile_function_text(out: &mut String, profile: &ProfileDiffReport, limit: usize) {
+    writeln!(out, "\nTop Function Deltas").expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "{:<52} {:>8} {:>8} {:>10}",
+        "function", "count_l", "count_r", "delta_us"
+    )
+    .expect("writing to string cannot fail");
+    for row in profile.top_function_deltas.iter().take(limit) {
+        writeln!(
+            out,
+            "{:<52} {:>8} {:>8} {:+>10}",
+            truncate_text(&row.function_name, 52),
+            row.left_dispatch_count,
+            row.right_dispatch_count,
+            row.total_delta_us
+        )
+        .expect("writing to string cannot fail");
+    }
+}
+
+fn push_profile_encoder_text(out: &mut String, profile: &ProfileDiffReport, limit: usize) {
+    writeln!(out, "\nEncoder Deltas").expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "{:<8} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}",
+        "encoder", "count_l", "count_r", "delta", "left_us", "right_us", "delta_us"
+    )
+    .expect("writing to string cannot fail");
+    for row in profile.encoder_deltas.iter().take(limit) {
+        writeln!(
+            out,
+            "{:<8} {:>8} {:>8} {:+>8} {:>10} {:>10} {:+>10}",
+            row.encoder_index,
+            row.left_dispatch_count,
+            row.right_dispatch_count,
+            row.dispatch_count_delta,
+            row.left_total_us,
+            row.right_total_us,
+            row.total_delta_us
+        )
+        .expect("writing to string cannot fail");
+    }
+}
+
+fn push_profile_encoder_focus_text(out: &mut String, profile: &ProfileDiffReport, limit: usize) {
+    writeln!(out, "Encoder Focus").expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "{:<8} {:>8} {:>8} {:>8} {:>13} {:>10} {:>10}",
+        "encoder", "count_l", "count_r", "matched", "matched_delta", "unmatched", "unmatched"
+    )
+    .expect("writing to string cannot fail");
+    let total_abs: i64 = profile
+        .encoder_reports
+        .iter()
+        .map(|row| row.matched_delta_us.abs())
+        .sum();
+    for row in profile.encoder_reports.iter().take(limit) {
+        writeln!(
+            out,
+            "{:<8} {:>8} {:>8} {:>8} {:+>13} {:>10} {:+>10}",
+            row.encoder_index,
+            row.left_dispatch_count,
+            row.right_dispatch_count,
+            row.matched_count,
+            row.matched_delta_us,
+            row.unmatched_count,
+            row.unmatched_delta_us
+        )
+        .expect("writing to string cannot fail");
+        for (index, pair) in row.top_dispatches.iter().take(3).enumerate() {
+            writeln!(
+                out,
+                "  top {:<2} left={:<6} right={:<6} pipe={:<8} fn={:<28} delta={:+7}",
+                index + 1,
+                pair.left_source_index,
+                pair.right_source_index,
+                option_csv(pair.left_pipeline_id),
+                truncate_text(&pair.function_name, 28),
+                pair.delta_us
+            )
+            .expect("writing to string cannot fail");
+        }
+    }
+    if let Some(top) = profile.encoder_reports.first() {
+        let share = if total_abs > 0 {
+            top.matched_delta_us.abs() as f64 * 100.0 / total_abs as f64
+        } else {
+            0.0
+        };
+        let dominance = if share >= 60.0 {
+            "dominates"
+        } else {
+            "does not dominate"
+        };
+        writeln!(
+            out,
+            "\nDominant encoder: {} ({:+} us matched, {:.1}% of matched encoder delta) -> {}",
+            top.encoder_index, top.matched_delta_us, share, dominance
+        )
+        .expect("writing to string cannot fail");
+    }
+}
+
+fn push_profile_pipeline_text(out: &mut String, profile: &ProfileDiffReport, limit: usize) {
+    writeln!(out, "\nPipeline Deltas").expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "{:<10} {:<44} {:>8} {:>8} {:>10}",
+        "pipeline", "function", "count_l", "count_r", "delta_us"
+    )
+    .expect("writing to string cannot fail");
+    for row in profile.pipeline_deltas.iter().take(limit) {
+        writeln!(
+            out,
+            "{:<10} {:<44} {:>8} {:>8} {:+>10}",
+            option_csv(row.pipeline_id),
+            truncate_text(&row.function_name, 44),
+            row.left_dispatch_count,
+            row.right_dispatch_count,
+            row.total_delta_us
+        )
+        .expect("writing to string cannot fail");
+    }
+}
+
+fn push_profile_dispatch_outliers_text(
+    out: &mut String,
+    profile: &ProfileDiffReport,
+    limit: usize,
+) {
+    writeln!(out, "\nTop Dispatch Outliers").expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "{:<7} {:<7} {:<7} {:<8} {:<8} {:<40} {:>8} {:>8} {:>9}",
+        "left", "right", "enc", "pipe_l", "pipe_r", "function", "left_us", "right_us", "delta"
+    )
+    .expect("writing to string cannot fail");
+    for row in profile.top_dispatch_outliers.iter().take(limit) {
+        writeln!(
+            out,
+            "{:<7} {:<7} {:<7} {:<8} {:<8} {:<40} {:>8} {:>8} {:+>9}",
+            row.left_source_index,
+            row.right_source_index,
+            row.encoder_index,
+            option_csv(row.left_pipeline_id),
+            option_csv(row.right_pipeline_id),
+            truncate_text(&row.function_name, 40),
+            row.left_duration_us,
+            row.right_duration_us,
+            row.delta_us
+        )
+        .expect("writing to string cannot fail");
+    }
+}
+
+fn push_profile_matches_text(
+    out: &mut String,
+    profile: &ProfileDiffReport,
+    limit: usize,
+    title: &str,
+) {
+    writeln!(out, "\n{title}").expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "{:<7} {:<7} {:<7} {:<40} {:>8} {:>8} {:>9} {:<18} {:>7}",
+        "left", "right", "enc", "function", "left_us", "right_us", "delta", "method", "conf"
+    )
+    .expect("writing to string cannot fail");
+    for row in profile.matched_pairs.iter().take(limit) {
+        writeln!(
+            out,
+            "{:<7} {:<7} {:<7} {:<40} {:>8} {:>8} {:+>9} {:<18} {:>7.3}",
+            row.left_source_index,
+            row.right_source_index,
+            row.encoder_index,
+            truncate_text(&row.function_name, 40),
+            row.left_duration_us,
+            row.right_duration_us,
+            row.delta_us,
+            truncate_text(&row.match_method, 18),
+            row.confidence
+        )
+        .expect("writing to string cannot fail");
+    }
+}
+
+fn push_profile_unmatched_text(out: &mut String, profile: &ProfileDiffReport, limit: usize) {
+    writeln!(out, "\nUnmatched Dispatches").expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "{:<6} {:<8} {:<7} {:<10} {:<40} {:>10}",
+        "trace", "index", "enc", "pipeline", "function", "duration"
+    )
+    .expect("writing to string cannot fail");
+    for row in profile.unmatched.iter().take(limit) {
+        writeln!(
+            out,
+            "{:<6} {:<8} {:<7} {:<10} {:<40} {:>10}",
+            row.trace,
+            row.source_index,
+            row.encoder_index,
+            option_csv(row.pipeline_id),
+            truncate_text(&row.function_name, 40),
+            row.duration_us
+        )
+        .expect("writing to string cannot fail");
+    }
+}
+
+fn push_profile_unnamed_text(out: &mut String, profile: &ProfileDiffReport, limit: usize) {
+    writeln!(out, "\nUnnamed Dispatch Summary").expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "{:<10} {:<24} {:>8} {:>8} {:>10} {:>10} {:>10}",
+        "pipeline", "kernel_id", "count_l", "count_r", "left_us", "right_us", "delta"
+    )
+    .expect("writing to string cannot fail");
+    for row in profile.unnamed_dispatch_deltas.iter().take(limit) {
+        writeln!(
+            out,
+            "{:<10} {:<24} {:>8} {:>8} {:>10} {:>10} {:+>10}",
+            option_csv(row.pipeline_id),
+            truncate_text(&row.kernel_id, 24),
+            row.left_dispatch_count,
+            row.right_dispatch_count,
+            row.left_total_us,
+            row.right_total_us,
+            row.total_delta_us
+        )
+        .expect("writing to string cannot fail");
+    }
+}
+
+fn push_profile_spike_windows_text(out: &mut String, profile: &ProfileDiffReport, limit: usize) {
+    writeln!(out, "\nSpike Windows").expect("writing to string cannot fail");
+    writeln!(
+        out,
+        "{:<7} {:<10} {:<10} {:<10} {:<10} {:<8} {:>10}",
+        "enc", "left_start", "left_end", "right_st", "right_end", "matches", "cum_delta"
+    )
+    .expect("writing to string cannot fail");
+    for row in profile.timeline_spike_windows.iter().take(limit) {
+        writeln!(
+            out,
+            "{:<7} {:<10} {:<10} {:<10} {:<10} {:<8} {:+>10}",
+            row.encoder_index,
+            row.left_start_source_index,
+            row.left_end_source_index,
+            row.right_start_source_index,
+            row.right_end_source_index,
+            row.match_count,
+            row.total_delta_us
+        )
+        .expect("writing to string cannot fail");
+    }
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        truncated
+    } else {
+        value.to_owned()
+    }
 }
 
 pub fn diff_with_options(
