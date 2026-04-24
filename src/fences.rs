@@ -7,6 +7,7 @@ use crate::error::Result;
 use crate::trace::{MTSPRecord, RecordType, TraceBundle};
 
 pub const LEGACY_INFERRED_FENCE_ADDR: u64 = 0x9df0ec000;
+const CULUL_MARKER: &[u8] = b"Culul\0\0\0";
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +36,7 @@ pub enum FenceLabelSource {
 pub struct FenceOperation {
     pub sequence: usize,
     pub offset: usize,
+    pub marker_offset: usize,
     pub record_size: u32,
     pub icb_addr: u64,
     pub label: Option<String>,
@@ -45,6 +47,10 @@ pub struct FenceOperation {
     pub field_1: u32,
     pub field_2: u32,
     pub field_3: u32,
+    pub structured_icb_addr: Option<u64>,
+    pub structured_field_1: Option<u32>,
+    pub structured_field_2: Option<u32>,
+    pub structured_field_3: Option<u32>,
     pub payload_size: u32,
     pub payload_addr: u64,
     pub array_count: u32,
@@ -94,36 +100,33 @@ pub fn build_report(
         }
         culul_records += 1;
 
-        let Ok(parsed) = record.parse_culul_structured() else {
+        let Some(go) = parse_go_fence_fields(record) else {
             continue;
         };
 
-        let label = label_map.get(&parsed.icb_addr).cloned();
-        let mentions_fence = label.as_deref().is_some_and(label_mentions_fence);
-        let has_legacy_addr = parsed.icb_addr == LEGACY_INFERRED_FENCE_ADDR;
-        let op_kind = classify_op_kind(parsed.field_1);
+        let parsed = record.parse_culul_structured().ok();
+        let label = label_map
+            .get(&go.icb_addr)
+            .cloned()
+            .or_else(|| go.has_legacy_addr.then(|| "fences (inferred)".to_owned()));
+        let has_exact_go_label = label
+            .as_deref()
+            .is_some_and(|value| value == "fences" || value == "fences (inferred)");
+        let mentions_fence = label
+            .as_deref()
+            .is_some_and(|value| label_mentions_fence(value) && !has_exact_go_label);
+        let op_kind = classify_op_kind(go.field_1);
         let has_wait_update_shape = op_kind != FenceOpKind::Unknown;
 
-        if mentions_fence || has_legacy_addr {
+        if has_exact_go_label || go.has_legacy_addr {
             labeled_fence_candidates += 1;
 
             let mut evidence = Vec::new();
-            let (label_source, confidence) = if mentions_fence {
-                evidence.push("device label mentions 'fence'".to_owned());
-                (
-                    Some(FenceLabelSource::DeviceLabel),
-                    if label
-                        .as_deref()
-                        .is_some_and(|value| value.eq_ignore_ascii_case("fences"))
-                    {
-                        FenceConfidence::High
-                    } else {
-                        FenceConfidence::Medium
-                    },
-                )
+            let (label_source, confidence) = if has_exact_go_label && !go.has_legacy_addr {
+                evidence.push("matched Go fence rule: device label is exactly 'fences'".to_owned());
+                (Some(FenceLabelSource::DeviceLabel), FenceConfidence::High)
             } else {
-                evidence
-                    .push("matched legacy inferred fence address from the Go command".to_owned());
+                evidence.push("matched Go fence rule: legacy inferred fence address".to_owned());
                 (
                     Some(FenceLabelSource::LegacyInferredAddress),
                     FenceConfidence::Low,
@@ -132,44 +135,58 @@ pub fn build_report(
 
             if has_wait_update_shape {
                 evidence.push(format!(
-                    "field_1=0x{:x} matches a wait/update-like pattern",
-                    parsed.field_1
+                    "Go field1=0x{:x} matches {}",
+                    go.field_1,
+                    format_op_type(op_kind)
                 ));
             } else {
                 evidence.push(format!(
-                    "field_1=0x{:x} is not yet decoded to a known wait/update pattern",
-                    parsed.field_1
+                    "Go field1=0x{:x} did not match the Go wait/update constants",
+                    go.field_1
+                ));
+            }
+            if let Some(parsed) = parsed.as_ref() {
+                evidence.push(format!(
+                    "structured decode: icb=0x{:x} f1=0x{:x} f2=0x{:x} f3=0x{:x}",
+                    parsed.icb_addr, parsed.field_1, parsed.field_2, parsed.field_3
                 ));
             }
 
             operations.push(FenceOperation {
                 sequence: operations.len(),
-                offset: record.offset,
-                record_size: parsed.record_size,
-                icb_addr: parsed.icb_addr,
+                offset: go.absolute_marker_offset,
+                marker_offset: go.marker_offset,
+                record_size: parsed
+                    .as_ref()
+                    .map_or(record.size as u32, |value| value.record_size),
+                icb_addr: go.icb_addr,
                 label,
                 label_source,
                 op_kind,
                 confidence,
-                marker_count: parsed.marker_count,
-                field_1: parsed.field_1,
-                field_2: parsed.field_2,
-                field_3: parsed.field_3,
-                payload_size: parsed.payload_size,
-                payload_addr: parsed.payload_addr,
-                array_count: parsed.array_count,
-                array_stride: parsed.array_stride,
-                array_addresses: parsed.array_addresses,
+                marker_count: parsed.as_ref().map_or(0, |value| value.marker_count),
+                field_1: go.field_1,
+                field_2: go.field_2,
+                field_3: parsed.as_ref().map_or(0, |value| value.field_3),
+                structured_icb_addr: parsed.as_ref().map(|value| value.icb_addr),
+                structured_field_1: parsed.as_ref().map(|value| value.field_1),
+                structured_field_2: parsed.as_ref().map(|value| value.field_2),
+                structured_field_3: parsed.as_ref().map(|value| value.field_3),
+                payload_size: parsed.as_ref().map_or(0, |value| value.payload_size),
+                payload_addr: parsed.as_ref().map_or(0, |value| value.payload_addr),
+                array_count: parsed.as_ref().map_or(0, |value| value.array_count),
+                array_stride: parsed.as_ref().map_or(0, |value| value.array_stride),
+                array_addresses: parsed.map_or_else(Vec::new, |value| value.array_addresses),
                 evidence,
             });
-        } else if has_wait_update_shape {
+        } else if mentions_fence || has_wait_update_shape {
             unlabeled_pattern_candidates += 1;
         }
     }
 
     let mut notes = vec![
-        "This is a heuristic fence report synthesized from MTSP Culul records and CS labels.".to_owned(),
-        "Metal fence/shared-event semantics are not fully decoded here; op kinds are inferred from field_1 patterns and label matches.".to_owned(),
+        "This report uses the Go command's Culul marker offsets and exact fence label/address rules.".to_owned(),
+        "Metal fence/shared-event semantics are still not fully decoded; op types preserve the Go field1 constants.".to_owned(),
     ];
     if unlabeled_pattern_candidates > 0 {
         notes.push(format!(
@@ -197,9 +214,9 @@ pub fn build_report(
 
 pub fn format_report(report: &FencesReport) -> String {
     let mut out = String::new();
-    out.push_str("Fence report (heuristic)\n");
+    out.push_str("Fence report (Go-compatible scan)\n");
     out.push_str(
-        "Derived from MTSP Culul records plus CS label extraction; this is not a fully decoded Metal fence timeline.\n\n",
+        "Derived from raw Culul marker offsets plus CS label extraction; this matches the Go fence command's primary fields.\n\n",
     );
     out.push_str(&format!(
         "records={} culul={} labeled_candidates={} unlabeled_pattern_candidates={} reported_ops={}\n",
@@ -276,11 +293,44 @@ fn label_mentions_fence(label: &str) -> bool {
     label.to_ascii_lowercase().contains("fence")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GoFenceFields {
+    absolute_marker_offset: usize,
+    marker_offset: usize,
+    icb_addr: u64,
+    field_1: u32,
+    field_2: u32,
+    has_legacy_addr: bool,
+}
+
+fn parse_go_fence_fields(record: &MTSPRecord) -> Option<GoFenceFields> {
+    let marker_offset = find_bytes(&record.data, CULUL_MARKER)?;
+    let icb_addr = read_u64(&record.data, marker_offset + 8)?;
+    let field_1 = read_u32(&record.data, marker_offset + 16)?;
+    let field_2 = read_u32(&record.data, marker_offset + 20)?;
+    Some(GoFenceFields {
+        absolute_marker_offset: record.offset + marker_offset,
+        marker_offset,
+        icb_addr,
+        field_1,
+        field_2,
+        has_legacy_addr: icb_addr == LEGACY_INFERRED_FENCE_ADDR,
+    })
+}
+
 fn classify_op_kind(field_1: u32) -> FenceOpKind {
     match field_1 {
         0x800 => FenceOpKind::WaitLike,
         0x80000 => FenceOpKind::UpdateLike,
         _ => FenceOpKind::Unknown,
+    }
+}
+
+fn format_op_type(kind: FenceOpKind) -> &'static str {
+    match kind {
+        FenceOpKind::WaitLike => "Wait?",
+        FenceOpKind::UpdateLike => "Update?",
+        FenceOpKind::Unknown => "Unknown",
     }
 }
 
@@ -311,6 +361,24 @@ fn truncate(value: &str, max_len: usize) -> String {
         + "..."
 }
 
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        data.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        data.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +399,9 @@ mod tests {
         let mut bytes = vec![0u8; size];
         bytes[0..4].copy_from_slice(&(size as u32).to_le_bytes());
         bytes[8..13].copy_from_slice(b"Culul");
+        bytes[0x10..0x18].copy_from_slice(&icb_addr.to_le_bytes());
+        bytes[0x18..0x1c].copy_from_slice(&field_1.to_le_bytes());
+        bytes[0x1c..0x20].copy_from_slice(&field_2.to_le_bytes());
         bytes[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
         bytes[0x28..0x30].copy_from_slice(&icb_addr.to_le_bytes());
         bytes[0x30..0x34].copy_from_slice(&field_1.to_le_bytes());
@@ -356,6 +427,11 @@ mod tests {
         assert_eq!(op.op_kind, FenceOpKind::WaitLike);
         assert_eq!(op.confidence, FenceConfidence::High);
         assert_eq!(op.label_source, Some(FenceLabelSource::DeviceLabel));
+        assert_eq!(op.offset, 0x8);
+        assert_eq!(op.marker_offset, 0x8);
+        assert_eq!(op.field_1, 0x800);
+        assert_eq!(op.field_2, 0x11);
+        assert_eq!(op.structured_field_1, Some(0x800));
     }
 
     #[test]
@@ -392,8 +468,8 @@ mod tests {
 
         let rendered = format_report(&report);
 
-        assert!(rendered.contains("Fence report (heuristic)"));
+        assert!(rendered.contains("Fence report (Go-compatible scan)"));
         assert!(rendered.contains("wait-like"));
-        assert!(rendered.contains("device label mentions 'fence'"));
+        assert!(rendered.contains("matched Go fence rule"));
     }
 }
