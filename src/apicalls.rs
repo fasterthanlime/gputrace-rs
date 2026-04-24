@@ -35,6 +35,9 @@ pub struct ApiInitCallEntry {
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiCallCommandBuffer {
     pub index: usize,
+    pub address: Option<u64>,
+    pub queue_address: Option<u64>,
+    pub label: Option<String>,
     pub timestamp_ns: u64,
     pub offset: usize,
     pub end_offset: usize,
@@ -69,7 +72,12 @@ pub fn report(trace: &TraceBundle, filter: Option<&str>) -> Result<ApiCallsRepor
     let capture = trace.capture_data()?;
     let init_calls = parse_initialization_calls(&capture);
     let regions = trace.command_buffer_regions()?;
-    Ok(report_from_regions_and_init(&regions, init_calls, filter))
+    Ok(report_from_regions_and_init(
+        &regions,
+        init_calls,
+        Some(&capture),
+        filter,
+    ))
 }
 
 pub fn filter_command_buffer_report(
@@ -230,12 +238,13 @@ fn report_with_filtered_rows(
 
 #[cfg(test)]
 fn report_from_regions(regions: &[CommandBufferRegion], filter: Option<&str>) -> ApiCallsReport {
-    report_from_regions_and_init(regions, Vec::new(), filter)
+    report_from_regions_and_init(regions, Vec::new(), None, filter)
 }
 
 fn report_from_regions_and_init(
     regions: &[CommandBufferRegion],
     init_calls: Vec<ApiInitCallEntry>,
+    capture: Option<&[u8]>,
     filter: Option<&str>,
 ) -> ApiCallsReport {
     let filter_lower = filter.map(|value| value.to_ascii_lowercase());
@@ -257,6 +266,9 @@ fn report_from_regions_and_init(
     let mut command_buffers = Vec::new();
 
     for region in included_regions {
+        let metadata = capture
+            .and_then(|capture| parse_command_buffer_metadata(capture, region))
+            .unwrap_or_default();
         let call_start = calls.len();
         push_call(
             &mut calls,
@@ -264,27 +276,46 @@ fn report_from_regions_and_init(
             region.command_buffer.offset,
             "command_buffer",
             "commandBuffer",
-            format!(
-                "observed command buffer region start (ts={} ns)",
-                region.command_buffer.timestamp
-            ),
+            command_buffer_details(region, &metadata),
         );
+        if let Some(label) = &metadata.label {
+            push_call(
+                &mut calls,
+                region.command_buffer.index,
+                region.command_buffer.offset,
+                "setLabel",
+                "setLabel",
+                format!("setLabel:\"{label}\""),
+            );
+        }
 
-        let mut seen_encoders = BTreeSet::new();
-        let mut last_pipeline_by_encoder = BTreeMap::<u64, u64>::new();
-
-        for dispatch in &region.dispatches {
-            let encoder = resolve_encoder(region, dispatch);
-            if let Some(encoder) = encoder
-                && seen_encoders.insert(encoder.address)
-            {
+        let mut covered_dispatches = BTreeSet::new();
+        for encoder in &region.encoders {
+            push_call_with_context(
+                &mut calls,
+                region.command_buffer.index,
+                encoder.offset,
+                "encoder",
+                "computeCommandEncoder",
+                format!("observed encoder {}", display_encoder(encoder)),
+                Some(encoder),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            if !encoder.label.is_empty() {
                 push_call_with_context(
                     &mut calls,
                     region.command_buffer.index,
                     encoder.offset,
-                    "encoder",
-                    "computeCommandEncoder",
-                    format!("observed encoder {}", display_encoder(encoder)),
+                    "setLabel",
+                    "setLabel",
+                    format!("setLabel:\"{}\"", encoder.label),
                     Some(encoder),
                     None,
                     None,
@@ -297,98 +328,76 @@ fn report_from_regions_and_init(
                 );
             }
 
-            let pipeline_event = resolve_pipeline_event(region, dispatch, encoder);
-            let pipeline_addr = dispatch
-                .pipeline_addr
-                .or_else(|| pipeline_event.map(|event| event.pipeline_addr));
-            let kernel_name = dispatch
-                .kernel_name
-                .clone()
-                .or_else(|| encoder.and_then(kernel_name_from_encoder));
-
-            if let Some(pipeline_addr) = pipeline_addr {
-                let encoder_address = encoder.map(|value| value.address).unwrap_or_default();
-                let changed = last_pipeline_by_encoder
-                    .get(&encoder_address)
-                    .copied()
-                    .is_none_or(|previous| previous != pipeline_addr);
-                if changed {
-                    push_call_with_context(
-                        &mut calls,
-                        region.command_buffer.index,
-                        pipeline_event.map_or(dispatch.offset, |event| event.offset),
-                        "pipeline",
-                        "setComputePipelineState",
-                        format!(
-                            "{} (0x{:x})",
-                            kernel_name.clone().unwrap_or_else(|| "unknown".to_owned()),
-                            pipeline_addr
-                        ),
-                        encoder,
-                        Some(pipeline_addr),
-                        kernel_name.clone(),
-                        Some(dispatch.index),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                    );
-                    last_pipeline_by_encoder.insert(encoder_address, pipeline_addr);
-                }
-            }
-
-            for buffer in &dispatch.buffers {
-                push_call_with_context(
+            let mut last_pipeline_addr = None;
+            for dispatch in region.dispatches.iter().filter(|dispatch| {
+                resolve_encoder(region, dispatch)
+                    .is_some_and(|value| value.address == encoder.address)
+            }) {
+                covered_dispatches.insert(dispatch.index);
+                push_dispatch_calls(
                     &mut calls,
-                    region.command_buffer.index,
-                    dispatch.offset,
-                    "buffer_binding",
-                    "setBuffer",
-                    format!(
-                        "slot={} buffer={} usage={}",
-                        buffer.index,
-                        display_buffer(buffer),
-                        buffer.usage
-                    ),
-                    encoder,
-                    pipeline_addr,
-                    kernel_name.clone(),
-                    Some(dispatch.index),
-                    Some(buffer.index),
-                    Some(display_buffer(buffer)),
-                    Some(buffer.usage.to_string()),
-                    None,
-                    None,
+                    region,
+                    dispatch,
+                    Some(encoder),
+                    &mut last_pipeline_addr,
                 );
             }
 
             push_call_with_context(
                 &mut calls,
                 region.command_buffer.index,
-                dispatch.offset,
-                "dispatch",
-                "dispatchThreadgroups",
-                format!(
-                    "kernel={} grid={} group={}",
-                    kernel_name.clone().unwrap_or_else(|| "unknown".to_owned()),
-                    format_dims(dispatch.grid_size),
-                    format_dims(dispatch.group_size)
-                ),
-                encoder,
-                pipeline_addr,
-                kernel_name,
-                Some(dispatch.index),
+                encoder.offset,
+                "endEncoding",
+                "endEncoding",
+                "endEncoding".to_owned(),
+                Some(encoder),
                 None,
                 None,
                 None,
-                Some(dispatch.grid_size),
-                Some(dispatch.group_size),
+                None,
+                None,
+                None,
+                None,
+                None,
             );
         }
 
+        let mut last_unmatched_pipeline_addr = None;
+        for dispatch in &region.dispatches {
+            if covered_dispatches.contains(&dispatch.index) {
+                continue;
+            }
+            push_dispatch_calls(
+                &mut calls,
+                region,
+                dispatch,
+                None,
+                &mut last_unmatched_pipeline_addr,
+            );
+        }
+
+        push_call(
+            &mut calls,
+            region.command_buffer.index,
+            region.end_offset,
+            "commit",
+            "commit",
+            "commit".to_owned(),
+        );
+        push_call(
+            &mut calls,
+            region.command_buffer.index,
+            region.end_offset,
+            "wait",
+            "waitUntilCompleted",
+            "waitUntilCompleted".to_owned(),
+        );
+
         command_buffers.push(ApiCallCommandBuffer {
             index: region.command_buffer.index,
+            address: metadata.address,
+            queue_address: metadata.queue_address,
+            label: metadata.label,
             timestamp_ns: region.command_buffer.timestamp,
             offset: region.command_buffer.offset,
             end_offset: region.end_offset,
@@ -411,6 +420,149 @@ fn report_from_regions_and_init(
         command_buffers,
         calls,
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CommandBufferMetadata {
+    address: Option<u64>,
+    queue_address: Option<u64>,
+    label: Option<String>,
+}
+
+fn parse_command_buffer_metadata(
+    capture: &[u8],
+    region: &CommandBufferRegion,
+) -> Option<CommandBufferMetadata> {
+    let start = region.command_buffer.offset.min(capture.len());
+    let end = region.end_offset.min(capture.len());
+    let data = capture.get(start..end)?;
+
+    let c_records = find_marker_offsets(data, b"C\0\0\0")
+        .into_iter()
+        .filter_map(|offset| read_u64(data, offset + 4))
+        .take(2)
+        .collect::<Vec<_>>();
+    let queue_address = c_records.first().copied().filter(|value| *value != 0);
+    let address = c_records.get(1).copied().filter(|value| *value != 0);
+
+    let label = find_marker_offsets(data, b"CS\0\0")
+        .into_iter()
+        .find_map(|offset| read_c_string(data, offset + 12, 128))
+        .filter(|label| is_printable_ascii(label));
+
+    Some(CommandBufferMetadata {
+        address,
+        queue_address,
+        label,
+    })
+}
+
+fn command_buffer_details(
+    region: &CommandBufferRegion,
+    metadata: &CommandBufferMetadata,
+) -> String {
+    match (metadata.address, metadata.queue_address) {
+        (Some(address), Some(queue)) => format!("0x{address:x} = [0x{queue:x} commandBuffer]"),
+        (Some(address), None) => format!("0x{address:x} = [commandBuffer]"),
+        (None, Some(queue)) => format!("[0x{queue:x} commandBuffer]"),
+        (None, None) => format!(
+            "observed command buffer region start (ts={} ns)",
+            region.command_buffer.timestamp
+        ),
+    }
+}
+
+fn push_dispatch_calls(
+    calls: &mut Vec<ApiCallEntry>,
+    region: &CommandBufferRegion,
+    dispatch: &DispatchCall,
+    encoder: Option<&ComputeEncoder>,
+    last_pipeline_addr: &mut Option<u64>,
+) {
+    let resolved_encoder = encoder.or_else(|| resolve_encoder(region, dispatch));
+    let pipeline_event = resolve_pipeline_event(region, dispatch, resolved_encoder);
+    let pipeline_addr = dispatch
+        .pipeline_addr
+        .or_else(|| pipeline_event.map(|event| event.pipeline_addr));
+    let kernel_name = dispatch
+        .kernel_name
+        .clone()
+        .or_else(|| resolved_encoder.and_then(kernel_name_from_encoder));
+
+    if let Some(pipeline_addr) = pipeline_addr
+        && last_pipeline_addr.is_none_or(|previous| previous != pipeline_addr)
+    {
+        push_call_with_context(
+            calls,
+            region.command_buffer.index,
+            pipeline_event.map_or(dispatch.offset, |event| event.offset),
+            "pipeline",
+            "setComputePipelineState",
+            format!(
+                "{} (0x{:x})",
+                kernel_name.clone().unwrap_or_else(|| "unknown".to_owned()),
+                pipeline_addr
+            ),
+            resolved_encoder,
+            Some(pipeline_addr),
+            kernel_name.clone(),
+            Some(dispatch.index),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        *last_pipeline_addr = Some(pipeline_addr);
+    }
+
+    for buffer in &dispatch.buffers {
+        push_call_with_context(
+            calls,
+            region.command_buffer.index,
+            dispatch.offset,
+            "buffer_binding",
+            "setBuffer",
+            format!(
+                "slot={} buffer={} usage={}",
+                buffer.index,
+                display_buffer(buffer),
+                buffer.usage
+            ),
+            resolved_encoder,
+            pipeline_addr,
+            kernel_name.clone(),
+            Some(dispatch.index),
+            Some(buffer.index),
+            Some(display_buffer(buffer)),
+            Some(buffer.usage.to_string()),
+            None,
+            None,
+        );
+    }
+
+    push_call_with_context(
+        calls,
+        region.command_buffer.index,
+        dispatch.offset,
+        "dispatch",
+        "dispatchThreadgroups",
+        format!(
+            "kernel={} grid={} group={}",
+            kernel_name.clone().unwrap_or_else(|| "unknown".to_owned()),
+            format_dims(dispatch.grid_size),
+            format_dims(dispatch.group_size)
+        ),
+        resolved_encoder,
+        pipeline_addr,
+        kernel_name,
+        Some(dispatch.index),
+        None,
+        None,
+        None,
+        Some(dispatch.grid_size),
+        Some(dispatch.group_size),
+    );
 }
 
 fn parse_initialization_calls(capture: &[u8]) -> Vec<ApiInitCallEntry> {
@@ -810,7 +962,7 @@ fn format_dims(value: [u32; 3]) -> String {
 mod tests {
     use super::{
         filter_call_kind_report, filter_command_buffer_report, format_report,
-        parse_initialization_calls, report_from_regions,
+        parse_initialization_calls, report_from_regions, report_from_regions_and_init,
     };
     use crate::trace::{
         BoundBuffer, CommandBuffer, CommandBufferRegion, ComputeEncoder, DispatchCall,
@@ -826,15 +978,19 @@ mod tests {
             vec![
                 "command_buffer",
                 "encoder",
+                "setLabel",
                 "pipeline",
                 "buffer_binding",
                 "buffer_binding",
-                "dispatch"
+                "dispatch",
+                "endEncoding",
+                "commit",
+                "wait"
             ]
         );
-        assert_eq!(report.command_buffers[0].call_count, 6);
-        assert_eq!(report.calls[2].pipeline_addr, Some(0x1111));
-        assert_eq!(report.calls[5].kernel_name.as_deref(), Some("copy_kernel"));
+        assert_eq!(report.command_buffers[0].call_count, 10);
+        assert_eq!(report.calls[3].pipeline_addr, Some(0x1111));
+        assert_eq!(report.calls[6].kernel_name.as_deref(), Some("copy_kernel"));
     }
 
     #[test]
@@ -889,6 +1045,27 @@ mod tests {
     }
 
     #[test]
+    fn extracts_command_buffer_metadata_from_capture_region() {
+        let region = sample_region();
+        let mut capture = vec![0u8; 0x400];
+        capture[0x300..0x304].copy_from_slice(b"C\0\0\0");
+        capture[0x304..0x30c].copy_from_slice(&0x7000_u64.to_le_bytes());
+        capture[0x310..0x314].copy_from_slice(b"C\0\0\0");
+        capture[0x314..0x31c].copy_from_slice(&0x8000_u64.to_le_bytes());
+        capture[0x330..0x334].copy_from_slice(b"CS\0\0");
+        capture[0x334..0x33c].copy_from_slice(&0x8000_u64.to_le_bytes());
+        capture[0x33c..0x344].copy_from_slice(b"CB main\0");
+
+        let report = report_from_regions_and_init(&[region], Vec::new(), Some(&capture), None);
+
+        assert_eq!(report.command_buffers[0].queue_address, Some(0x7000));
+        assert_eq!(report.command_buffers[0].address, Some(0x8000));
+        assert_eq!(report.command_buffers[0].label.as_deref(), Some("CB main"));
+        assert!(report.calls[0].details.contains("[0x7000 commandBuffer]"));
+        assert_eq!(report.calls[1].kind, "setLabel");
+    }
+
+    #[test]
     fn filter_keeps_only_matching_command_buffers() {
         let mut non_matching = sample_region();
         non_matching.command_buffer.index = 9;
@@ -914,7 +1091,8 @@ mod tests {
         assert_eq!(
             report
                 .calls
-                .last()
+                .iter()
+                .find(|call| call.kind == "dispatch")
                 .and_then(|call| call.kernel_name.as_deref()),
             Some("main_encoder")
         );
@@ -937,7 +1115,7 @@ mod tests {
         let command_buffer = filter_command_buffer_report(&report, 4);
         assert_eq!(command_buffer.total_command_buffers, 1);
         assert_eq!(command_buffer.command_buffers[0].index, 4);
-        assert!(command_buffer.calls.iter().all(|call| call.sequence < 6));
+        assert!(command_buffer.calls.iter().all(|call| call.sequence < 10));
 
         let dispatches = filter_call_kind_report(&report, "dispatch");
         assert_eq!(dispatches.total_command_buffers, 2);
