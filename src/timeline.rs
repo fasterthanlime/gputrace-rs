@@ -1330,7 +1330,10 @@ fn parse_raw_timeline_file(path: &Path) -> Result<RawTimelineFile> {
     };
     let mut notes = Vec::new();
     if header.is_none() {
-        notes.push("File is smaller than the 256-byte timeline header.".to_owned());
+        notes.push(format!(
+            "file too small: {} bytes (expected > 0x3c000, matching Go ParseTimelineRaw)",
+            data.len()
+        ));
     }
     if header_timestamps.is_empty() {
         notes.push(
@@ -1359,14 +1362,14 @@ fn parse_timeline_file_index(path: &Path) -> Option<usize> {
 }
 
 fn parse_raw_timeline_header(data: &[u8]) -> Option<RawTimelineHeader> {
-    if data.len() < 256 {
+    if data.len() < 0x3c000 {
         return None;
     }
     Some(RawTimelineHeader {
         magic: u64::from_le_bytes(data[0..8].try_into().ok()?),
         flags: u64::from_le_bytes(data[8..16].try_into().ok()?),
         counter_count: u32::from_le_bytes(data[12..16].try_into().ok()?),
-        data_offset: u64::from_le_bytes(data[32..40].try_into().ok()?),
+        data_offset: u32::from_le_bytes(data[32..36].try_into().ok()?) as u64,
         entry_count: u64::from_le_bytes(data[80..88].try_into().ok()?),
         gpu_timestamp: u64::from_le_bytes(data[104..112].try_into().ok()?),
     })
@@ -1966,11 +1969,11 @@ mod tests {
     fn parses_raw_timeline_header_and_timestamps() {
         let dir = tempdir().unwrap();
         let raw_path = dir.path().join("Timeline_f_3.raw");
-        let mut data = vec![0u8; 1024];
+        let mut data = vec![0u8; 0x3c100];
         data[0..8].copy_from_slice(&0x773d413b0016b551u64.to_le_bytes());
         data[8..16].copy_from_slice(&0x12u64.to_le_bytes());
         data[12..16].copy_from_slice(&752u32.to_le_bytes());
-        data[32..40].copy_from_slice(&0x3c000u64.to_le_bytes());
+        data[32..36].copy_from_slice(&0x3c000u32.to_le_bytes());
         data[80..88].copy_from_slice(&42u64.to_le_bytes());
         data[104..112].copy_from_slice(&123456789u64.to_le_bytes());
         data[500..508].copy_from_slice(&111_111u64.to_le_bytes());
@@ -2005,6 +2008,7 @@ mod tests {
         let text = format_raw_report(&report);
         assert!(text.contains("Raw timeline heuristic report"));
         assert!(text.contains("Timeline_f_0.raw"));
+        assert!(text.contains("expected > 0x3c000"));
 
         let json = export_raw_json(&report).unwrap();
         assert!(json.contains("\"file_count\": 1"));
