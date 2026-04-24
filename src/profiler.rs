@@ -2004,6 +2004,8 @@ mod tests {
                 encoder_index: 0,
                 record_count: 2,
                 sample_count: 6,
+                aggregation: "average".to_owned(),
+                total_value: 102.0,
                 representative_value: 17.0,
                 min_value: 12.0,
                 max_value: 22.0,

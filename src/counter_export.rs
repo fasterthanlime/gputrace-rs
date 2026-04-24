@@ -50,11 +50,21 @@ pub struct CounterExportRow {
     pub device_memory_bandwidth_gbps: Option<f64>,
     pub gpu_read_bandwidth_gbps: Option<f64>,
     pub gpu_write_bandwidth_gbps: Option<f64>,
+    pub buffer_device_memory_bytes_read: Option<f64>,
+    pub buffer_device_memory_bytes_written: Option<f64>,
+    pub bytes_read_from_device_memory: Option<f64>,
+    pub bytes_written_to_device_memory: Option<f64>,
     pub buffer_l1_miss_rate_percent: Option<f64>,
     pub buffer_l1_read_accesses: Option<f64>,
     pub buffer_l1_read_bandwidth_gbps: Option<f64>,
     pub buffer_l1_write_accesses: Option<f64>,
     pub buffer_l1_write_bandwidth_gbps: Option<f64>,
+    pub compute_shader_launch_utilization_percent: Option<f64>,
+    pub control_flow_utilization_percent: Option<f64>,
+    pub instruction_throughput_utilization_percent: Option<f64>,
+    pub integer_complex_utilization_percent: Option<f64>,
+    pub integer_conditional_utilization_percent: Option<f64>,
+    pub f32_utilization_percent: Option<f64>,
     pub temporary_register_count: Option<i64>,
     pub uniform_register_count: Option<i64>,
     pub spilled_bytes: Option<i64>,
@@ -68,12 +78,24 @@ pub struct CounterExportRow {
 pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
     let timeline = timeline::report(trace)?;
     let limiters = counter::extract_limiters_for_trace(&trace.path);
+    let raw_counter_metrics = profiler::find_profiler_directory(&trace.path)
+        .map(|dir| counter::extract_counter_file_metrics(&dir))
+        .unwrap_or_default();
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     let xcode_counter_data = xcode_counters::parse(trace, None).ok();
 
     let limiters_by_encoder = limiters
         .into_iter()
         .map(|limiter| (limiter.encoder_index, limiter))
+        .collect::<BTreeMap<_, _>>();
+    let raw_metrics_by_encoder = raw_counter_metrics
+        .into_iter()
+        .map(|metric| {
+            (
+                (metric.encoder_index, metric.metric_name.clone()),
+                raw_counter_metric_value(&metric),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
 
     let mut execution_cost_by_name = BTreeMap::<String, (f64, usize)>::new();
@@ -175,31 +197,68 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
                 .and_then(|encoder| encoder.counters.get(name))
                 .copied()
         };
+        let raw_metric = |name: &str| {
+            raw_metrics_by_encoder
+                .get(&(encoder.index, name.to_owned()))
+                .copied()
+        };
         let kernel_invocations = xcode_metric("Kernel Invocations")
+            .or_else(|| raw_metric("Kernel Invocations"))
             .map(|value| value.round().max(0.0) as usize)
             .unwrap_or(encoder.dispatch_count);
         let occupancy_percent = occupancy
             .map(|(percent, _)| percent)
-            .or_else(|| xcode_metric("Kernel Occupancy"));
-        let alu_utilization_percent = limiter
-            .and_then(|limiter| limiter.alu_utilization)
-            .or_else(|| xcode_metric("ALU Utilization"));
-        let device_memory_bandwidth_gbps = limiter
-            .and_then(|limiter| limiter.device_memory_bandwidth_gbps)
-            .or_else(|| xcode_metric("Device Memory Bandwidth"));
-        let buffer_l1_read_bandwidth_gbps = limiter
-            .and_then(|limiter| limiter.buffer_l1_read_bandwidth_gbps)
-            .or_else(|| xcode_metric("Buffer L1 Read Bandwidth"))
+            .or_else(|| xcode_metric("Kernel Occupancy"))
+            .or_else(|| raw_metric("Kernel Occupancy"));
+        let alu_utilization_percent = xcode_metric("ALU Utilization")
+            .or_else(|| raw_metric("ALU Utilization"))
+            .or_else(|| limiter.and_then(|limiter| limiter.alu_utilization));
+        let device_memory_bandwidth_gbps = xcode_metric("Device Memory Bandwidth")
+            .or_else(|| raw_metric("Device Memory Bandwidth"))
+            .or_else(|| limiter.and_then(|limiter| limiter.device_memory_bandwidth_gbps));
+        let buffer_l1_read_bandwidth_gbps = xcode_metric("Buffer L1 Read Bandwidth")
+            .or_else(|| raw_metric("Buffer L1 Read Bandwidth"))
             .or_else(|| xcode_metric("L1 Read Bandwidth"));
-        let buffer_l1_write_bandwidth_gbps = limiter
-            .and_then(|limiter| limiter.buffer_l1_write_bandwidth_gbps)
-            .or_else(|| xcode_metric("Buffer L1 Write Bandwidth"))
+        let buffer_l1_write_bandwidth_gbps = xcode_metric("Buffer L1 Write Bandwidth")
+            .or_else(|| raw_metric("Buffer L1 Write Bandwidth"))
             .or_else(|| xcode_metric("L1 Write Bandwidth"));
-        let gpu_read_bandwidth_gbps = xcode_metric("GPU Read Bandwidth");
-        let gpu_write_bandwidth_gbps = xcode_metric("GPU Write Bandwidth");
-        let buffer_l1_miss_rate_percent = xcode_metric("Buffer L1 Miss Rate");
-        let buffer_l1_read_accesses = xcode_metric("Buffer L1 Read Accesses");
-        let buffer_l1_write_accesses = xcode_metric("Buffer L1 Write Accesses");
+        let buffer_l1_read_bandwidth_gbps = buffer_l1_read_bandwidth_gbps
+            .or_else(|| limiter.and_then(|limiter| limiter.buffer_l1_read_bandwidth_gbps));
+        let buffer_l1_write_bandwidth_gbps = buffer_l1_write_bandwidth_gbps
+            .or_else(|| limiter.and_then(|limiter| limiter.buffer_l1_write_bandwidth_gbps));
+        let gpu_read_bandwidth_gbps =
+            xcode_metric("GPU Read Bandwidth").or_else(|| raw_metric("GPU Read Bandwidth"));
+        let gpu_write_bandwidth_gbps =
+            xcode_metric("GPU Write Bandwidth").or_else(|| raw_metric("GPU Write Bandwidth"));
+        let buffer_device_memory_bytes_read = xcode_metric("Buffer Device Memory Bytes Read")
+            .or_else(|| raw_metric("Buffer Device Memory Bytes Read"));
+        let buffer_device_memory_bytes_written = xcode_metric("Buffer Device Memory Bytes Written")
+            .or_else(|| raw_metric("Buffer Device Memory Bytes Written"));
+        let bytes_read_from_device_memory = xcode_metric("Bytes Read From Device Memory")
+            .or_else(|| raw_metric("Bytes Read From Device Memory"));
+        let bytes_written_to_device_memory = xcode_metric("Bytes Written To Device Memory")
+            .or_else(|| raw_metric("Bytes Written To Device Memory"));
+        let buffer_l1_miss_rate_percent =
+            xcode_metric("Buffer L1 Miss Rate").or_else(|| raw_metric("Buffer L1 Miss Rate"));
+        let buffer_l1_read_accesses = xcode_metric("Buffer L1 Read Accesses")
+            .or_else(|| raw_metric("Buffer L1 Read Accesses"));
+        let buffer_l1_write_accesses = xcode_metric("Buffer L1 Write Accesses")
+            .or_else(|| raw_metric("Buffer L1 Write Accesses"));
+        let compute_shader_launch_utilization_percent =
+            xcode_metric("Compute Shader Launch Utilization")
+                .or_else(|| raw_metric("Compute Shader Launch Utilization"));
+        let control_flow_utilization_percent = xcode_metric("Control Flow Utilization")
+            .or_else(|| raw_metric("Control Flow Utilization"));
+        let instruction_throughput_utilization_percent =
+            xcode_metric("Instruction Throughput Utilization")
+                .or_else(|| raw_metric("Instruction Throughput Utilization"));
+        let integer_complex_utilization_percent = xcode_metric("Integer and Complex Utilization")
+            .or_else(|| raw_metric("Integer and Complex Utilization"));
+        let integer_conditional_utilization_percent =
+            xcode_metric("Integer and Conditional Utilization")
+                .or_else(|| raw_metric("Integer and Conditional Utilization"));
+        let f32_utilization_percent =
+            xcode_metric("F32 Utilization").or_else(|| raw_metric("F32 Utilization"));
         let metric_source = if execution_cost_percent.is_some() {
             "execution-cost".to_owned()
         } else if sample_count > 0 {
@@ -210,9 +269,20 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
                 || device_memory_bandwidth_gbps.is_some()
                 || buffer_l1_miss_rate_percent.is_some()
                 || gpu_read_bandwidth_gbps.is_some()
-                || gpu_write_bandwidth_gbps.is_some())
+                || gpu_write_bandwidth_gbps.is_some()
+                || buffer_device_memory_bytes_read.is_some()
+                || buffer_device_memory_bytes_written.is_some()
+                || bytes_read_from_device_memory.is_some()
+                || bytes_written_to_device_memory.is_some()
+                || compute_shader_launch_utilization_percent.is_some()
+                || control_flow_utilization_percent.is_some())
         {
             "xcode-counters".to_owned()
+        } else if raw_metrics_by_encoder
+            .keys()
+            .any(|(encoder_index, _)| *encoder_index == encoder.index)
+        {
+            "raw-counter-mapped".to_owned()
         } else if limiter.is_some() {
             "raw-counter".to_owned()
         } else {
@@ -240,28 +310,44 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
             occupancy_manager_percent: limiter.and_then(|limiter| limiter.occupancy_manager),
             alu_utilization_percent,
-            shader_launch_limiter_percent: limiter
-                .and_then(|limiter| limiter.compute_shader_launch.map(normalize_percent_like)),
-            instruction_throughput_percent: limiter
-                .and_then(|limiter| limiter.instruction_throughput),
-            integer_complex_percent: limiter
-                .and_then(|limiter| limiter.integer_complex.map(normalize_percent_like)),
-            f32_limiter_percent: limiter
-                .and_then(|limiter| limiter.f32_limiter.map(normalize_percent_like)),
-            l1_cache_percent: limiter
-                .and_then(|limiter| limiter.l1_cache.map(normalize_percent_like)),
-            last_level_cache_percent: limiter
-                .and_then(|limiter| limiter.last_level_cache.map(normalize_percent_like)),
-            control_flow_percent: limiter
-                .and_then(|limiter| limiter.control_flow.map(normalize_percent_like)),
+            shader_launch_limiter_percent: raw_metric("Compute Shader Launch Limiter")
+                .or_else(|| limiter.and_then(|limiter| limiter.compute_shader_launch))
+                .map(normalize_percent_like),
+            instruction_throughput_percent: raw_metric("Instruction Throughput Limiter")
+                .or_else(|| limiter.and_then(|limiter| limiter.instruction_throughput)),
+            integer_complex_percent: raw_metric("Integer and Complex Limiter")
+                .or_else(|| limiter.and_then(|limiter| limiter.integer_complex))
+                .map(normalize_percent_like),
+            f32_limiter_percent: raw_metric("F32 Limiter")
+                .or_else(|| limiter.and_then(|limiter| limiter.f32_limiter))
+                .map(normalize_percent_like),
+            l1_cache_percent: raw_metric("L1 Cache Limiter")
+                .or_else(|| limiter.and_then(|limiter| limiter.l1_cache))
+                .map(normalize_percent_like),
+            last_level_cache_percent: raw_metric("Last Level Cache Limiter")
+                .or_else(|| limiter.and_then(|limiter| limiter.last_level_cache))
+                .map(normalize_percent_like),
+            control_flow_percent: raw_metric("Control Flow Limiter")
+                .or_else(|| limiter.and_then(|limiter| limiter.control_flow))
+                .map(normalize_percent_like),
             device_memory_bandwidth_gbps,
             gpu_read_bandwidth_gbps,
             gpu_write_bandwidth_gbps,
+            buffer_device_memory_bytes_read,
+            buffer_device_memory_bytes_written,
+            bytes_read_from_device_memory,
+            bytes_written_to_device_memory,
             buffer_l1_miss_rate_percent,
             buffer_l1_read_accesses,
             buffer_l1_read_bandwidth_gbps,
             buffer_l1_write_accesses,
             buffer_l1_write_bandwidth_gbps,
+            compute_shader_launch_utilization_percent,
+            control_flow_utilization_percent,
+            instruction_throughput_utilization_percent,
+            integer_complex_utilization_percent,
+            integer_conditional_utilization_percent,
+            f32_utilization_percent,
             temporary_register_count: pipeline_stats.map(|stats| stats.temporary_register_count),
             uniform_register_count: pipeline_stats.map(|stats| stats.uniform_register_count),
             spilled_bytes: pipeline_stats.map(|stats| stats.spilled_bytes),
@@ -279,6 +365,14 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
         total_rows: rows.len(),
         rows,
     })
+}
+
+fn raw_counter_metric_value(metric: &counter::CounterFileMetric) -> f64 {
+    if metric.aggregation == "sum" {
+        metric.total_value
+    } else {
+        metric.mean_value
+    }
 }
 
 fn match_xcode_encoder<'a>(
@@ -378,7 +472,7 @@ pub fn format_report(report: &CounterExportReport) -> String {
 
 pub fn format_csv(report: &CounterExportReport) -> String {
     let mut out = String::new();
-    out.push_str("row_index,command_buffer_index,encoder_index,encoder_label,kernel_name,pipeline_addr,start_time_ns,end_time_ns,duration_ns,dispatch_count,kernel_invocations,metric_source,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,occupancy_manager_percent,alu_utilization_percent,shader_launch_limiter_percent,instruction_throughput_percent,integer_complex_percent,f32_limiter_percent,l1_cache_percent,last_level_cache_percent,control_flow_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_read_bandwidth_gbps,buffer_l1_write_accesses,buffer_l1_write_bandwidth_gbps,temporary_register_count,uniform_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms\n");
+    out.push_str("row_index,command_buffer_index,encoder_index,encoder_label,kernel_name,pipeline_addr,start_time_ns,end_time_ns,duration_ns,dispatch_count,kernel_invocations,metric_source,execution_cost_percent,execution_cost_samples,sample_count,avg_sampling_density,occupancy_percent,occupancy_confidence,occupancy_manager_percent,alu_utilization_percent,shader_launch_limiter_percent,instruction_throughput_percent,integer_complex_percent,f32_limiter_percent,l1_cache_percent,last_level_cache_percent,control_flow_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_device_memory_bytes_read,buffer_device_memory_bytes_written,bytes_read_from_device_memory,bytes_written_to_device_memory,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_read_bandwidth_gbps,buffer_l1_write_accesses,buffer_l1_write_bandwidth_gbps,compute_shader_launch_utilization_percent,control_flow_utilization_percent,instruction_throughput_utilization_percent,integer_complex_utilization_percent,integer_conditional_utilization_percent,f32_utilization_percent,temporary_register_count,uniform_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms\n");
     for row in &report.rows {
         let columns = vec![
             row.row_index.to_string(),
@@ -413,11 +507,21 @@ pub fn format_csv(report: &CounterExportReport) -> String {
             option_csv(row.device_memory_bandwidth_gbps),
             option_csv(row.gpu_read_bandwidth_gbps),
             option_csv(row.gpu_write_bandwidth_gbps),
+            option_csv(row.buffer_device_memory_bytes_read),
+            option_csv(row.buffer_device_memory_bytes_written),
+            option_csv(row.bytes_read_from_device_memory),
+            option_csv(row.bytes_written_to_device_memory),
             option_csv(row.buffer_l1_miss_rate_percent),
             option_csv(row.buffer_l1_read_accesses),
             option_csv(row.buffer_l1_read_bandwidth_gbps),
             option_csv(row.buffer_l1_write_accesses),
             option_csv(row.buffer_l1_write_bandwidth_gbps),
+            option_csv(row.compute_shader_launch_utilization_percent),
+            option_csv(row.control_flow_utilization_percent),
+            option_csv(row.instruction_throughput_utilization_percent),
+            option_csv(row.integer_complex_utilization_percent),
+            option_csv(row.integer_conditional_utilization_percent),
+            option_csv(row.f32_utilization_percent),
             option_csv(row.temporary_register_count),
             option_csv(row.uniform_register_count),
             option_csv(row.spilled_bytes),
@@ -483,11 +587,29 @@ fn xcode_metric_csv(row: &CounterExportRow, name: &str) -> String {
         "Device Memory Bandwidth" => option_csv(row.device_memory_bandwidth_gbps),
         "GPU Read Bandwidth" => option_csv(row.gpu_read_bandwidth_gbps),
         "GPU Write Bandwidth" => option_csv(row.gpu_write_bandwidth_gbps),
+        "Buffer Device Memory Bytes Read" => option_csv(row.buffer_device_memory_bytes_read),
+        "Buffer Device Memory Bytes Written" => option_csv(row.buffer_device_memory_bytes_written),
+        "Bytes Read From Device Memory" => option_csv(row.bytes_read_from_device_memory),
+        "Bytes Written To Device Memory" => option_csv(row.bytes_written_to_device_memory),
         "Buffer L1 Miss Rate" => option_csv(row.buffer_l1_miss_rate_percent),
         "Buffer L1 Read Accesses" => option_csv(row.buffer_l1_read_accesses),
         "Buffer L1 Read Bandwidth" => option_csv(row.buffer_l1_read_bandwidth_gbps),
+        "L1 Read Bandwidth" => option_csv(row.buffer_l1_read_bandwidth_gbps),
         "Buffer L1 Write Accesses" => option_csv(row.buffer_l1_write_accesses),
         "Buffer L1 Write Bandwidth" => option_csv(row.buffer_l1_write_bandwidth_gbps),
+        "L1 Write Bandwidth" => option_csv(row.buffer_l1_write_bandwidth_gbps),
+        "Compute Shader Launch Utilization" => {
+            option_csv(row.compute_shader_launch_utilization_percent)
+        }
+        "Control Flow Utilization" => option_csv(row.control_flow_utilization_percent),
+        "Instruction Throughput Utilization" => {
+            option_csv(row.instruction_throughput_utilization_percent)
+        }
+        "Integer and Complex Utilization" => option_csv(row.integer_complex_utilization_percent),
+        "Integer and Conditional Utilization" => {
+            option_csv(row.integer_conditional_utilization_percent)
+        }
+        "F32 Utilization" => option_csv(row.f32_utilization_percent),
         "Kernel ALU Instructions" => option_csv(row.alu_instruction_count),
         "Kernel ALU Integer and Conditional Instructions" => {
             option_csv(row.branch_instruction_count)
@@ -814,11 +936,21 @@ mod tests {
                 device_memory_bandwidth_gbps: Some(3.2),
                 gpu_read_bandwidth_gbps: Some(2.2),
                 gpu_write_bandwidth_gbps: Some(1.0),
+                buffer_device_memory_bytes_read: Some(4096.0),
+                buffer_device_memory_bytes_written: Some(2048.0),
+                bytes_read_from_device_memory: Some(8192.0),
+                bytes_written_to_device_memory: Some(1024.0),
                 buffer_l1_miss_rate_percent: Some(4.5),
                 buffer_l1_read_accesses: Some(128.0),
                 buffer_l1_read_bandwidth_gbps: Some(1.4),
                 buffer_l1_write_accesses: Some(32.0),
                 buffer_l1_write_bandwidth_gbps: Some(0.8),
+                compute_shader_launch_utilization_percent: Some(70.0),
+                control_flow_utilization_percent: Some(11.0),
+                instruction_throughput_utilization_percent: Some(22.0),
+                integer_complex_utilization_percent: Some(33.0),
+                integer_conditional_utilization_percent: Some(44.0),
+                f32_utilization_percent: Some(55.0),
                 temporary_register_count: Some(24),
                 uniform_register_count: Some(12),
                 spilled_bytes: Some(64),
@@ -891,5 +1023,42 @@ mod tests {
             match_xcode_encoder(1, "Main Encoder", &data).map(|encoder| encoder.index),
             Some(99)
         );
+    }
+
+    #[test]
+    fn raw_counter_metric_value_uses_go_aggregation_semantics() {
+        let averaged = counter::CounterFileMetric {
+            file_index: 12,
+            metric_name: "ALU Utilization".into(),
+            unit: Some("%".into()),
+            encoder_index: 0,
+            record_count: 2,
+            sample_count: 2,
+            aggregation: "average".into(),
+            total_value: 60.0,
+            representative_value: 30.0,
+            min_value: 20.0,
+            max_value: 40.0,
+            mean_value: 30.0,
+            confidence: 1.0,
+        };
+        let summed = counter::CounterFileMetric {
+            file_index: 28,
+            metric_name: "Bytes Read From Device Memory".into(),
+            unit: Some("bytes".into()),
+            encoder_index: 0,
+            record_count: 2,
+            sample_count: 2,
+            aggregation: "sum".into(),
+            total_value: 12_288.0,
+            representative_value: 12_288.0,
+            min_value: 4096.0,
+            max_value: 8192.0,
+            mean_value: 6144.0,
+            confidence: 1.0,
+        };
+
+        assert_eq!(raw_counter_metric_value(&averaged), 30.0);
+        assert_eq!(raw_counter_metric_value(&summed), 12_288.0);
     }
 }

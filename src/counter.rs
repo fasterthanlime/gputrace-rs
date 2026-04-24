@@ -33,6 +33,8 @@ pub struct CounterFileMetric {
     pub encoder_index: usize,
     pub record_count: usize,
     pub sample_count: usize,
+    pub aggregation: String,
+    pub total_value: f64,
     pub representative_value: f64,
     pub min_value: f64,
     pub max_value: f64,
@@ -238,8 +240,14 @@ fn summarize_counter_values(
     let sample_count = values.len();
     let min_value = values[0];
     let max_value = values[sample_count - 1];
-    let mean_value = values.iter().sum::<f64>() / sample_count as f64;
-    let representative_value = median_sorted(&values);
+    let total_value = values.iter().sum::<f64>();
+    let mean_value = total_value / sample_count as f64;
+    let aggregation = counter_metric_aggregation(unit.as_deref()).to_owned();
+    let representative_value = if aggregation == "sum" {
+        total_value
+    } else {
+        median_sorted(&values)
+    };
     let confidence = counter_metric_confidence(record_count, sample_count, min_value, max_value);
 
     Some(CounterFileMetric {
@@ -249,6 +257,8 @@ fn summarize_counter_values(
         encoder_index,
         record_count,
         sample_count,
+        aggregation,
+        total_value,
         representative_value,
         min_value,
         max_value,
@@ -258,6 +268,13 @@ fn summarize_counter_values(
 }
 
 fn extract_counter_record_values(record: &[u8], metric_name: &str) -> Vec<f64> {
+    if counter_metric_unit(metric_name) == Some("bytes") {
+        return extract_byte_count_candidates(record)
+            .into_iter()
+            .map(|value| value as f64)
+            .collect();
+    }
+
     let mut values = Vec::new();
     let mut seen = Vec::<u32>::new();
     let max = counter_metric_max_value(metric_name);
@@ -267,6 +284,26 @@ fn extract_counter_record_values(record: &[u8], metric_name: &str) -> Vec<f64> {
         if value.is_finite() && value >= 0.000_001 && value <= max && !seen.contains(&bits) {
             seen.push(bits);
             values.push(value);
+        }
+    }
+    values
+}
+
+fn extract_byte_count_candidates(data: &[u8]) -> Vec<u64> {
+    const MIN_BYTES: u64 = 1_000;
+    const MAX_BYTES: u64 = 100_000_000;
+
+    let mut values = Vec::new();
+    let mut seen = Vec::<u64>::new();
+    for start in [0usize, 4] {
+        let mut offset = start;
+        while offset + mem::size_of::<u64>() <= data.len() {
+            let value = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            if (MIN_BYTES..=MAX_BYTES).contains(&value) && !seen.contains(&value) {
+                seen.push(value);
+                values.push(value);
+            }
+            offset += mem::size_of::<u64>();
         }
     }
     values
@@ -300,6 +337,14 @@ fn counter_metric_unit(metric_name: &str) -> Option<&'static str> {
         Some("count")
     } else {
         None
+    }
+}
+
+fn counter_metric_aggregation(unit: Option<&str>) -> &'static str {
+    if unit == Some("bytes") {
+        "sum"
+    } else {
+        "average"
     }
 }
 
@@ -468,6 +513,16 @@ mod tests {
         record
     }
 
+    fn byte_sample_record(values: &[u64]) -> Vec<u8> {
+        let mut record = vec![0u8; 464];
+        record[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
+        for (index, value) in values.iter().enumerate() {
+            let offset = 8 + index * 8;
+            record[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        record
+    }
+
     #[test]
     fn extracts_limiters_from_counter_file() {
         let dir = tempdir().unwrap();
@@ -527,10 +582,35 @@ mod tests {
         assert_eq!(metrics[0].encoder_index, 0);
         assert_eq!(metrics[0].record_count, 2);
         assert_eq!(metrics[0].sample_count, 6);
+        assert_eq!(metrics[0].aggregation, "average");
+        assert_eq!(metrics[0].total_value, 102.0);
         assert_eq!(metrics[0].representative_value, 17.0);
         assert_eq!(metrics[0].min_value, 12.0);
         assert_eq!(metrics[0].max_value, 22.0);
         assert_eq!(metrics[0].mean_value, 17.0);
         assert!(metrics[0].confidence > 0.5);
+    }
+
+    #[test]
+    fn sums_byte_counter_file_metrics_like_go() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Counters_f_28.raw");
+
+        let mut data = vec![0u8; 2400];
+        data[0..4].copy_from_slice(&0x4e_u32.to_le_bytes());
+        data.extend_from_slice(&byte_sample_record(&[4096, 8192]));
+        data.extend_from_slice(&byte_sample_record(&[16384]));
+        fs::write(&path, data).unwrap();
+
+        let metrics = extract_counter_file_metrics(dir.path());
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].file_index, 28);
+        assert_eq!(metrics[0].metric_name, "Bytes Read From Device Memory");
+        assert_eq!(metrics[0].unit.as_deref(), Some("bytes"));
+        assert_eq!(metrics[0].aggregation, "sum");
+        assert_eq!(metrics[0].sample_count, 3);
+        assert_eq!(metrics[0].total_value, 28_672.0);
+        assert_eq!(metrics[0].representative_value, 28_672.0);
+        assert!((metrics[0].mean_value - 9557.333).abs() < 0.01);
     }
 }
