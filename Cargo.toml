@@ -3,6 +3,14 @@ name = "gputrace-rs"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+resolver = "3"
+members = [".", "crates/xtask"]
+
+[[bin]]
+name = "gputrace"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 csv = "1.4"

@@ -32,6 +32,7 @@ use crate::xcode_counters;
 
 #[derive(Debug, Parser)]
 #[command(name = "gputrace")]
+#[command(version)]
 #[command(about = "Tools for parsing, analyzing, diffing, and automating GPU traces")]
 pub struct Cli {
     #[command(subcommand)]
