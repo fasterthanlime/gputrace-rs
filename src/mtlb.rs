@@ -8,6 +8,7 @@ use serde_json::json;
 use walkdir::WalkDir;
 
 use crate::error::{Error, Result};
+use crate::timing;
 use crate::trace::TraceBundle;
 
 pub const MAGIC_MTLB: &[u8; 4] = b"MTLB";
@@ -770,13 +771,24 @@ fn select_extract_target<'a>(
 
 fn approximate_usage_counts(bundle_path: &Path) -> Option<BTreeMap<String, usize>> {
     let trace = TraceBundle::open(bundle_path).ok()?;
-    let kernel_stats = trace.analyze_kernels().ok()?;
-    Some(
-        kernel_stats
-            .into_iter()
-            .map(|(name, stat)| (name, stat.dispatch_count))
-            .collect(),
-    )
+    let structural = trace.analyze_kernels().ok();
+    let mut usage = structural
+        .into_iter()
+        .flatten()
+        .map(|(name, stat)| (name, stat.dispatch_count))
+        .collect::<BTreeMap<_, _>>();
+    if usage.values().any(|count| *count > 0) {
+        return Some(usage);
+    }
+
+    let timing = timing::report(&trace).ok()?;
+    usage.clear();
+    for kernel in timing.kernels {
+        if kernel.dispatch_count > 0 {
+            usage.insert(kernel.name, kernel.dispatch_count);
+        }
+    }
+    (!usage.is_empty()).then_some(usage)
 }
 
 fn build_inventory_report(
@@ -973,7 +985,7 @@ fn source_notes(is_bundle: bool, has_usage_counts: bool) -> Vec<String> {
     }
     if has_usage_counts {
         notes.push(
-            "usage is approximate and comes from current trace kernel attribution, not direct MTLB symbol binding".to_owned(),
+            "usage is approximate and comes from structural kernel attribution or profiler timing names, not direct MTLB symbol binding".to_owned(),
         );
     }
     notes
