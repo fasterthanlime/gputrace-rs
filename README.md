@@ -63,6 +63,9 @@ not Xcode's Performance/Cost percentage.
 
 `raw-counters` reads the profiler bundle directly and enriches raw counter hashes
 with installed AGX Metal catalog names where the local system provides them.
+Its JSON output also includes `derived_metrics` computed by running Apple's
+local AGX `*-derived.js` formulas against decoded raw counter variables; it does
+not require an Xcode counter CSV.
 
 ## Main Commands
 
