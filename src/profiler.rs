@@ -1377,20 +1377,35 @@ fn parse_gprwcntr_blob(
         return None;
     }
 
-    let record_data = &data[8..];
-    let record_size = 168usize;
-    let sample_count = record_data.len() / record_size;
+    let repeated_magic = data.get(80..88).is_some_and(|magic| magic == b"GPRWCNTR");
+    let record_size = if repeated_magic { 80usize } else { 168usize };
+    let sample_count = if repeated_magic {
+        data.len() / record_size
+    } else {
+        data[8..].len() / record_size
+    };
     let mut timestamps = Vec::with_capacity(sample_count);
     let mut min_timestamp = u64::MAX;
     let mut max_timestamp = 0u64;
 
-    for chunk in record_data.chunks_exact(record_size) {
-        let timestamp = read_u64(chunk, 0);
-        let entry = GprwcntrTimestamp {
-            timestamp,
-            size: read_u64(chunk, 8),
-            count: read_u64(chunk, 16),
-            flags: read_u32(chunk, 24),
+    for chunk in gprwcntr_records(data, repeated_magic, record_size) {
+        let entry = if repeated_magic {
+            if chunk.get(..8) != Some(b"GPRWCNTR") {
+                continue;
+            }
+            GprwcntrTimestamp {
+                timestamp: read_u64(chunk, 8),
+                size: read_u64(chunk, 16),
+                count: read_u64(chunk, 24),
+                flags: read_u32(chunk, 48),
+            }
+        } else {
+            GprwcntrTimestamp {
+                timestamp: read_u64(chunk, 0),
+                size: read_u64(chunk, 8),
+                count: read_u64(chunk, 16),
+                flags: read_u32(chunk, 24),
+            }
         };
         if entry.timestamp > 0 {
             min_timestamp = min_timestamp.min(entry.timestamp);
@@ -1423,6 +1438,18 @@ fn parse_gprwcntr_blob(
         end_ticks,
         duration_ns,
     })
+}
+
+fn gprwcntr_records(
+    data: &[u8],
+    repeated_magic: bool,
+    record_size: usize,
+) -> std::slice::ChunksExact<'_, u8> {
+    if repeated_magic {
+        data.chunks_exact(record_size)
+    } else {
+        data[8..].chunks_exact(record_size)
+    }
 }
 
 fn correlate_dispatch_samples(
@@ -1870,6 +1897,43 @@ mod tests {
         fs::read(path).unwrap()
     }
 
+    fn repeated_gprwcntr_encoder_blob() -> Vec<u8> {
+        let mut shader_profiler_data = Vec::new();
+        for (timestamp, size, count, flags) in
+            [(120_u64, 4096_u64, 6_u64, 3_u32), (150, 8192, 7, 4)]
+        {
+            let mut record = vec![0u8; 80];
+            record[0..8].copy_from_slice(b"GPRWCNTR");
+            record[8..16].copy_from_slice(&timestamp.to_le_bytes());
+            record[16..24].copy_from_slice(&size.to_le_bytes());
+            record[24..32].copy_from_slice(&count.to_le_bytes());
+            record[48..52].copy_from_slice(&flags.to_le_bytes());
+            shader_profiler_data.extend_from_slice(&record);
+        }
+
+        let blob = dict(&[
+            ("$top", dict(&[("root", uid(1))])),
+            (
+                "$objects",
+                Value::Array(vec![
+                    string("$null"),
+                    dict_uids(&[2, 3, 4], &[5, 6, 7]),
+                    string("Source"),
+                    string("RingBufferIndex"),
+                    string("ShaderProfilerData"),
+                    string("RDE_0"),
+                    integer(2),
+                    data(shader_profiler_data),
+                ]),
+            ),
+        ]);
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("encoder-repeated.plist");
+        blob.to_file_binary(&path).unwrap();
+        fs::read(path).unwrap()
+    }
+
     fn streamdata_fixture_with_timeline() -> Value {
         let mut fixture = streamdata_fixture();
         let objects = fixture
@@ -1885,6 +1949,26 @@ mod tests {
         objects.push(array(&[
             data(vec![0u8; 32]),
             data(encoder_blob()),
+            data(timeline_blob()),
+        ]));
+        fixture
+    }
+
+    fn streamdata_fixture_with_repeated_gprwcntr() -> Value {
+        let mut fixture = streamdata_fixture();
+        let objects = fixture
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("$objects")
+            .and_then(Value::as_array_mut)
+            .unwrap();
+        objects[1]
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("APSTimelineData".to_owned(), uid(12));
+        objects.push(array(&[
+            data(vec![0u8; 32]),
+            data(repeated_gprwcntr_encoder_blob()),
             data(timeline_blob()),
         ]));
         fixture
@@ -1959,6 +2043,26 @@ mod tests {
         assert!(summary.dispatches[0].sampling_density > 0.0);
         assert_eq!(summary.dispatches[0].start_ticks, 100);
         assert_eq!(summary.dispatches[0].end_ticks, 160);
+    }
+
+    #[test]
+    fn parses_repeated_magic_gprwcntr_records() {
+        let dir = tempdir().unwrap();
+        let stream_data_path = dir.path().join("streamData");
+        streamdata_fixture_with_repeated_gprwcntr()
+            .to_file_binary(&stream_data_path)
+            .unwrap();
+
+        let summary = parse_stream_data(&stream_data_path, None).unwrap();
+        let timeline = summary.timeline.expect("timeline metadata");
+        assert_eq!(timeline.encoder_profiles.len(), 1);
+        let profile = &timeline.encoder_profiles[0];
+        assert_eq!(profile.sample_count, 2);
+        assert_eq!(profile.start_ticks, 120);
+        assert_eq!(profile.end_ticks, 150);
+        assert_eq!(profile.timestamps[0].size, 4096);
+        assert_eq!(profile.timestamps[1].count, 7);
+        assert_eq!(profile.timestamps[1].flags, 4);
     }
 
     #[test]

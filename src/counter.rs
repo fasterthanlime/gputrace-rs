@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::counter_names::ALL_COUNTER_NAMES;
 use crate::profiler;
+use crate::trace::TraceBundle;
+use crate::xcode_counters;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CounterLimiter {
@@ -42,10 +44,195 @@ pub struct CounterFileMetric {
     pub confidence: f64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterProbeReport {
+    pub profiler_directory: PathBuf,
+    pub csv_source: Option<PathBuf>,
+    pub targets: Vec<RawCounterProbeTarget>,
+    pub files: Vec<RawCounterProbeFile>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterProbeTarget {
+    pub metric: String,
+    pub row_index: usize,
+    pub encoder_label: String,
+    pub value: f64,
+    pub tolerance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterProbeFile {
+    pub file_index: usize,
+    pub file_name: String,
+    pub byte_len: usize,
+    pub page_count_4k: Option<usize>,
+    pub marker_count: usize,
+    pub top_record_shapes: Vec<RawCounterRecordShape>,
+    pub matches: Vec<RawCounterProbeMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterRecordShape {
+    pub tag: String,
+    pub size: usize,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterProbeMatch {
+    pub metric: String,
+    pub row_index: usize,
+    pub encoder_label: String,
+    pub target: f64,
+    pub tolerance: f64,
+    pub encoding: String,
+    pub count: usize,
+    pub examples: Vec<RawCounterProbeExample>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterProbeExample {
+    pub offset: usize,
+    pub page_4k: usize,
+    pub value: f64,
+    pub record_tag: Option<String>,
+    pub record_size: Option<usize>,
+}
+
 pub fn counter_file_metric_name(file_index: usize) -> Option<&'static str> {
     file_index
         .checked_sub(4)
         .and_then(|index| ALL_COUNTER_NAMES.get(index).copied())
+}
+
+pub fn probe_raw_counters(
+    trace: &TraceBundle,
+    csv_path: Option<PathBuf>,
+    metric_filter: Option<&str>,
+) -> crate::Result<RawCounterProbeReport> {
+    let profiler_directory = profiler::find_profiler_directory(&trace.path)
+        .ok_or_else(|| crate::Error::NotFound(trace.path.clone()))?;
+    let csv_data = xcode_counters::parse(trace, csv_path).ok();
+    let mut targets = Vec::new();
+    if let Some(csv_data) = &csv_data {
+        for row in &csv_data.encoders {
+            for (metric, value) in &row.counters {
+                if let Some(filter) = metric_filter
+                    && !metric.contains(filter)
+                {
+                    continue;
+                }
+                if is_probe_metric(metric) && value.is_finite() {
+                    targets.push(RawCounterProbeTarget {
+                        metric: metric.clone(),
+                        row_index: row.index,
+                        encoder_label: row.encoder_label.clone(),
+                        value: *value,
+                        tolerance: raw_probe_tolerance(*value),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut files = fs::read_dir(&profiler_directory)?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_index = name
+                .strip_prefix("Counters_f_")
+                .and_then(|rest| rest.strip_suffix(".raw"))
+                .and_then(|rest| rest.parse::<usize>().ok())?;
+            path.is_file().then_some((file_index, name, path))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|(file_index, _, _)| *file_index);
+
+    let mut file_reports = Vec::new();
+    for (file_index, file_name, path) in files {
+        let data = fs::read(path)?;
+        let markers = find_raw_counter_markers(&data);
+        let top_record_shapes = summarize_raw_counter_shapes(&data, &markers);
+        let matches = probe_counter_targets(&data, &markers, &targets);
+        file_reports.push(RawCounterProbeFile {
+            file_index,
+            file_name,
+            byte_len: data.len(),
+            page_count_4k: (data.len() % 4096 == 0).then_some(data.len() / 4096),
+            marker_count: markers.len(),
+            top_record_shapes,
+            matches,
+        });
+    }
+
+    Ok(RawCounterProbeReport {
+        profiler_directory,
+        csv_source: csv_data.map(|data| data.source),
+        targets,
+        files: file_reports,
+    })
+}
+
+pub fn format_raw_counter_probe(report: &RawCounterProbeReport) -> String {
+    let mut out = String::new();
+    out.push_str("Raw Counter Probe\n");
+    out.push_str("=================\n");
+    out.push_str(&format!(
+        "profiler_directory={}\n",
+        report.profiler_directory.display()
+    ));
+    if let Some(csv_source) = &report.csv_source {
+        out.push_str(&format!("csv_source={}\n", csv_source.display()));
+    }
+    out.push_str(&format!("targets={}\n\n", report.targets.len()));
+
+    for file in &report.files {
+        out.push_str(&format!(
+            "Counters_f_{}: bytes={} pages4k={} markers={}\n",
+            file.file_index,
+            file.byte_len,
+            file.page_count_4k
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            file.marker_count,
+        ));
+        if !file.top_record_shapes.is_empty() {
+            out.push_str("  top shapes:");
+            for shape in file.top_record_shapes.iter().take(8) {
+                out.push_str(&format!(" {}:{}x{}", shape.tag, shape.size, shape.count));
+            }
+            out.push('\n');
+        }
+        for matched in file.matches.iter().take(12) {
+            out.push_str(&format!(
+                "  {} row={} target={:.4} +/- {:.4} {} hits={}",
+                matched.metric,
+                matched.row_index,
+                matched.target,
+                matched.tolerance,
+                matched.encoding,
+                matched.count
+            ));
+            for example in matched.examples.iter().take(3) {
+                out.push_str(&format!(
+                    " @{}(p{} {} {} {:.4})",
+                    example.offset,
+                    example.page_4k,
+                    example.record_tag.as_deref().unwrap_or("-"),
+                    example
+                        .record_size
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    example.value
+                ));
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
 }
 
 pub fn extract_counter_file_metrics(profiler_dir: &Path) -> Vec<CounterFileMetric> {
@@ -221,6 +408,197 @@ fn extract_counter_file_metrics_from_data(
             )
         })
         .collect()
+}
+
+fn is_probe_metric(metric: &str) -> bool {
+    matches!(
+        metric,
+        "ALU Utilization"
+            | "Kernel Occupancy"
+            | "Device Memory Bandwidth"
+            | "GPU Read Bandwidth"
+            | "GPU Write Bandwidth"
+            | "Buffer L1 Miss Rate"
+            | "Buffer L1 Read Accesses"
+            | "Buffer L1 Read Bandwidth"
+            | "Buffer L1 Write Accesses"
+            | "Buffer L1 Write Bandwidth"
+            | "Kernel Invocations"
+    )
+}
+
+fn raw_probe_tolerance(value: f64) -> f64 {
+    if value.abs() >= 1000.0 {
+        (value.abs() * 0.001).max(1.0)
+    } else {
+        (value.abs() * 0.005).max(0.02)
+    }
+}
+
+fn find_raw_counter_markers(data: &[u8]) -> Vec<usize> {
+    const TAGS: &[u8] = &[0x0e, 0x2e, 0x4e, 0x6e, 0x8e, 0xae, 0xce, 0xee];
+    let mut offsets = Vec::new();
+    for offset in 0..data.len().saturating_sub(3) {
+        if TAGS.contains(&data[offset])
+            && data[offset + 1] == 0
+            && data[offset + 2] == 0
+            && data[offset + 3] == 0
+        {
+            offsets.push(offset);
+        }
+    }
+    offsets
+}
+
+fn summarize_raw_counter_shapes(data: &[u8], markers: &[usize]) -> Vec<RawCounterRecordShape> {
+    let mut counts = BTreeMap::<(u8, usize), usize>::new();
+    for (index, offset) in markers.iter().enumerate() {
+        let next = markers.get(index + 1).copied().unwrap_or(data.len());
+        if next <= *offset {
+            continue;
+        }
+        let tag = data[*offset];
+        let size = next - *offset;
+        *counts.entry((tag, size)).or_default() += 1;
+    }
+    let mut shapes = counts
+        .into_iter()
+        .map(|((tag, size), count)| RawCounterRecordShape {
+            tag: format!("0x{tag:02x}"),
+            size,
+            count,
+        })
+        .collect::<Vec<_>>();
+    shapes.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.size.cmp(&right.size))
+            .then_with(|| left.tag.cmp(&right.tag))
+    });
+    shapes
+}
+
+fn probe_counter_targets(
+    data: &[u8],
+    markers: &[usize],
+    targets: &[RawCounterProbeTarget],
+) -> Vec<RawCounterProbeMatch> {
+    let mut accum = BTreeMap::<(usize, &'static str), RawProbeAccum>::new();
+    for offset in (0..data.len().saturating_sub(mem::size_of::<u32>())).step_by(4) {
+        let float_value = f32::from_bits(u32::from_le_bytes(
+            data[offset..offset + 4].try_into().unwrap(),
+        )) as f64;
+        if float_value.is_finite() {
+            for (target_index, target) in targets.iter().enumerate() {
+                if (float_value - target.value).abs() <= target.tolerance {
+                    push_probe_match(
+                        &mut accum,
+                        target_index,
+                        "f32",
+                        data,
+                        markers,
+                        offset,
+                        float_value,
+                    );
+                }
+            }
+        }
+
+        if offset + mem::size_of::<u64>() <= data.len() {
+            let uint_value = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            for (target_index, target) in targets.iter().enumerate() {
+                if !target_allows_integer_encoding(&target.metric) {
+                    continue;
+                }
+                let value = uint_value as f64;
+                if (value - target.value).abs() <= target.tolerance {
+                    push_probe_match(
+                        &mut accum,
+                        target_index,
+                        "u64",
+                        data,
+                        markers,
+                        offset,
+                        value,
+                    );
+                }
+            }
+        }
+    }
+
+    let mut matches = accum
+        .into_iter()
+        .filter_map(|((target_index, encoding), accum)| {
+            let target = targets.get(target_index)?;
+            Some(RawCounterProbeMatch {
+                metric: target.metric.clone(),
+                row_index: target.row_index,
+                encoder_label: target.encoder_label.clone(),
+                target: target.value,
+                tolerance: target.tolerance,
+                encoding: encoding.to_owned(),
+                count: accum.count,
+                examples: accum.examples,
+            })
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.metric.cmp(&right.metric))
+            .then_with(|| left.row_index.cmp(&right.row_index))
+            .then_with(|| left.encoding.cmp(&right.encoding))
+    });
+    matches
+}
+
+fn target_allows_integer_encoding(metric: &str) -> bool {
+    metric.contains("Invocations") || metric.contains("Bytes")
+}
+
+#[derive(Default)]
+struct RawProbeAccum {
+    count: usize,
+    examples: Vec<RawCounterProbeExample>,
+}
+
+fn push_probe_match(
+    accum: &mut BTreeMap<(usize, &'static str), RawProbeAccum>,
+    target_index: usize,
+    encoding: &'static str,
+    data: &[u8],
+    markers: &[usize],
+    offset: usize,
+    value: f64,
+) {
+    let entry = accum.entry((target_index, encoding)).or_default();
+    entry.count += 1;
+    if entry.examples.len() >= 5 {
+        return;
+    }
+    let (record_tag, record_size) = marker_for_offset(data, markers, offset)
+        .map(|(tag, size)| (Some(format!("0x{tag:02x}")), Some(size)))
+        .unwrap_or((None, None));
+    entry.examples.push(RawCounterProbeExample {
+        offset,
+        page_4k: offset / 4096,
+        value,
+        record_tag,
+        record_size,
+    });
+}
+
+fn marker_for_offset(data: &[u8], markers: &[usize], offset: usize) -> Option<(u8, usize)> {
+    let index = match markers.binary_search(&offset) {
+        Ok(index) => index,
+        Err(0) => return None,
+        Err(index) => index - 1,
+    };
+    let start = markers[index];
+    let next = markers.get(index + 1).copied().unwrap_or(data.len());
+    (next > start).then_some((data[start], next - start))
 }
 
 fn summarize_counter_values(

@@ -14,6 +14,7 @@ use crate::buffers;
 use crate::clear_buffers;
 use crate::commands;
 use crate::correlate;
+use crate::counter;
 use crate::counter_export;
 use crate::diff;
 use crate::dump;
@@ -49,6 +50,8 @@ enum CommandSet {
     Dump(DumpArgs),
     DumpRecords(DumpRecordsArgs),
     ExportCounters(ExportCountersArgs),
+    #[command(hide = true)]
+    RawCounterProbe(RawCounterProbeArgs),
     #[command(alias = "perfcounters-validate")]
     ValidateCounters(ValidateCountersArgs),
     Fences(FencesArgs),
@@ -236,6 +239,17 @@ struct DumpRecordsArgs {
 struct ExportCountersArgs {
     trace: PathBuf,
     #[arg(short, long, default_value = "csv")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct RawCounterProbeArgs {
+    trace: PathBuf,
+    #[arg(long)]
+    csv: Option<PathBuf>,
+    #[arg(long)]
+    metric: Option<String>,
+    #[arg(short, long, default_value = "text")]
     format: String,
 }
 
@@ -810,6 +824,19 @@ pub fn run() -> Result<()> {
                 "internal-csv" => print!("{}", counter_export::format_csv(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown export-counters format")),
+            }
+        }
+        CommandSet::RawCounterProbe(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = counter::probe_raw_counters(&trace, args.csv, args.metric.as_deref())?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", counter::format_raw_counter_probe(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown raw-counter-probe format",
+                    ));
+                }
             }
         }
         CommandSet::ValidateCounters(args) => {
