@@ -108,6 +108,25 @@ pub struct RawCounterDecodedMetric {
     pub encoder_ids: Vec<u64>,
     pub kick_trace_ids: Vec<u64>,
     pub source_ids: Vec<u64>,
+    pub derived_counter_matches: Vec<RawCounterDerivedCounterMatch>,
+    pub hardware_selectors: Vec<RawCounterHardwareSelector>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RawCounterDerivedCounterMatch {
+    pub key: String,
+    pub name: String,
+    pub counter_type: Option<String>,
+    pub description: Option<String>,
+    pub sources: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RawCounterHardwareSelector {
+    pub partition: Option<u64>,
+    pub select: Option<u64>,
+    pub flag: Option<u64>,
+    pub sources: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -369,6 +388,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         .ok_or_else(|| crate::Error::NotFound(trace.path.clone()))?;
     let (schema_map, fallback_counter_names, _) =
         counter_schemas_and_sample_blobs(&trace.path).unwrap_or_default();
+    let catalog = load_agx_counter_catalog();
     let aggregate_metadata = probe_aggregate_counter_metadata(&trace.path);
     let structured_layouts = probe_structured_counter_layouts(&trace.path);
     let normalized_counters = probe_normalized_counter_metrics(&trace.path);
@@ -401,20 +421,34 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         .collect::<Vec<_>>();
     let metrics = normalized_counters
         .into_iter()
-        .map(|metric| RawCounterDecodedMetric {
-            path: metric.path,
-            sample_group: metric.sample_group,
-            source_index: metric.source_index,
-            ring_index: metric.ring_index,
-            counter_index: metric.counter_index,
-            raw_name: metric.raw_name,
-            sample_count: metric.sample_count,
-            min_percent_of_gpu_cycles: metric.min_percent,
-            mean_percent_of_gpu_cycles: metric.mean_percent,
-            max_percent_of_gpu_cycles: metric.max_percent,
-            encoder_ids: metric.encoder_ids,
-            kick_trace_ids: metric.kick_trace_ids,
-            source_ids: metric.source_ids,
+        .map(|metric| {
+            let derived_counter_matches = catalog
+                .derived_by_hash
+                .get(&metric.raw_name)
+                .cloned()
+                .unwrap_or_default();
+            let hardware_selectors = catalog
+                .hardware_by_hash
+                .get(&metric.raw_name)
+                .cloned()
+                .unwrap_or_default();
+            RawCounterDecodedMetric {
+                path: metric.path,
+                sample_group: metric.sample_group,
+                source_index: metric.source_index,
+                ring_index: metric.ring_index,
+                counter_index: metric.counter_index,
+                raw_name: metric.raw_name,
+                sample_count: metric.sample_count,
+                min_percent_of_gpu_cycles: metric.min_percent,
+                mean_percent_of_gpu_cycles: metric.mean_percent,
+                max_percent_of_gpu_cycles: metric.max_percent,
+                encoder_ids: metric.encoder_ids,
+                kick_trace_ids: metric.kick_trace_ids,
+                source_ids: metric.source_ids,
+                derived_counter_matches,
+                hardware_selectors,
+            }
         })
         .collect::<Vec<_>>();
     let mut warnings = Vec::new();
@@ -533,7 +567,7 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
                 metric.mean_percent_of_gpu_cycles,
                 metric.min_percent_of_gpu_cycles,
                 metric.max_percent_of_gpu_cycles,
-                metric.raw_name
+                format_raw_counter_metric_label(metric)
             ));
         }
     }
@@ -558,16 +592,19 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
 
 pub fn format_raw_counters_csv(report: &RawCountersReport) -> String {
     let mut out = String::new();
-    out.push_str("path,sample_group,source_index,ring_index,counter_index,raw_name,sample_count,min_percent_of_gpu_cycles,mean_percent_of_gpu_cycles,max_percent_of_gpu_cycles,encoder_id_count,kick_trace_id_count,source_id_count\n");
+    out.push_str("path,sample_group,source_index,ring_index,counter_index,raw_name,derived_counter_names,derived_counter_keys,hardware_selector_count,sample_count,min_percent_of_gpu_cycles,mean_percent_of_gpu_cycles,max_percent_of_gpu_cycles,encoder_id_count,kick_trace_id_count,source_id_count\n");
     for metric in &report.metrics {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{}\n",
             csv_escape(&metric.path),
             optional_usize_csv(metric.sample_group),
             optional_usize_csv(metric.source_index),
             optional_usize_csv(metric.ring_index),
             metric.counter_index,
             csv_escape(&metric.raw_name),
+            csv_escape(&derived_counter_names(metric)),
+            csv_escape(&derived_counter_keys(metric)),
+            metric.hardware_selectors.len(),
             metric.sample_count,
             metric.min_percent_of_gpu_cycles,
             metric.mean_percent_of_gpu_cycles,
@@ -580,6 +617,40 @@ pub fn format_raw_counters_csv(report: &RawCountersReport) -> String {
     out
 }
 
+fn format_raw_counter_metric_label(metric: &RawCounterDecodedMetric) -> String {
+    let Some(first) = metric.derived_counter_matches.first() else {
+        return metric.raw_name.clone();
+    };
+    let extra = metric.derived_counter_matches.len().saturating_sub(1);
+    if extra == 0 {
+        format!("{} ({})", first.name, metric.raw_name)
+    } else {
+        format!("{} +{} ({})", first.name, extra, metric.raw_name)
+    }
+}
+
+fn derived_counter_names(metric: &RawCounterDecodedMetric) -> String {
+    metric
+        .derived_counter_matches
+        .iter()
+        .map(|matched| matched.name.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn derived_counter_keys(metric: &RawCounterDecodedMetric) -> String {
+    metric
+        .derived_counter_matches
+        .iter()
+        .map(|matched| matched.key.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 fn optional_usize_csv(value: Option<usize>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
@@ -589,6 +660,199 @@ fn csv_escape(value: &str) -> String {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_owned()
+    }
+}
+
+#[derive(Debug, Default)]
+struct RawCounterCatalog {
+    derived_by_hash: BTreeMap<String, Vec<RawCounterDerivedCounterMatch>>,
+    hardware_by_hash: BTreeMap<String, Vec<RawCounterHardwareSelector>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawCounterDerivedCounterMatchKey {
+    key: String,
+    name: String,
+    counter_type: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawCounterHardwareSelectorKey {
+    partition: Option<u64>,
+    select: Option<u64>,
+    flag: Option<u64>,
+}
+
+fn load_agx_counter_catalog() -> RawCounterCatalog {
+    let mut statistics_files = Vec::new();
+    let mut perf_files = Vec::new();
+    collect_agx_counter_catalog_files(
+        Path::new("/System/Library/Extensions"),
+        &mut statistics_files,
+        &mut perf_files,
+    );
+
+    let mut derived =
+        BTreeMap::<String, BTreeMap<RawCounterDerivedCounterMatchKey, BTreeSet<PathBuf>>>::new();
+    for path in statistics_files {
+        add_statistics_counter_catalog(&path, &mut derived);
+    }
+
+    let mut hardware =
+        BTreeMap::<String, BTreeMap<RawCounterHardwareSelectorKey, BTreeSet<PathBuf>>>::new();
+    for path in perf_files {
+        add_perf_counter_catalog(&path, &mut hardware);
+    }
+
+    RawCounterCatalog {
+        derived_by_hash: derived
+            .into_iter()
+            .map(|(hash, matches)| {
+                let matches = matches
+                    .into_iter()
+                    .map(|(key, sources)| RawCounterDerivedCounterMatch {
+                        key: key.key,
+                        name: key.name,
+                        counter_type: key.counter_type,
+                        description: key.description,
+                        sources: sources.into_iter().collect(),
+                    })
+                    .collect();
+                (hash, matches)
+            })
+            .collect(),
+        hardware_by_hash: hardware
+            .into_iter()
+            .map(|(hash, selectors)| {
+                let selectors = selectors
+                    .into_iter()
+                    .map(|(key, sources)| RawCounterHardwareSelector {
+                        partition: key.partition,
+                        select: key.select,
+                        flag: key.flag,
+                        sources: sources.into_iter().collect(),
+                    })
+                    .collect();
+                (hash, selectors)
+            })
+            .collect(),
+    }
+}
+
+fn collect_agx_counter_catalog_files(
+    directory: &Path,
+    statistics_files: &mut Vec<PathBuf>,
+    perf_files: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_agx_counter_catalog_files(&path, statistics_files, perf_files);
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|file_name| file_name.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with("AGXMetalStatisticsExternal")
+            && file_name.ends_with("-counters.plist")
+        {
+            statistics_files.push(path);
+        } else if file_name == "AGXMetalPerfCountersExternal.plist" {
+            perf_files.push(path);
+        }
+    }
+}
+
+fn add_statistics_counter_catalog(
+    path: &Path,
+    derived: &mut BTreeMap<String, BTreeMap<RawCounterDerivedCounterMatchKey, BTreeSet<PathBuf>>>,
+) {
+    let Ok(value) = Value::from_file(path) else {
+        return;
+    };
+    let Some(root) = value.as_dictionary() else {
+        return;
+    };
+    let Some(counters) = root.get("DerivedCounters").and_then(Value::as_dictionary) else {
+        return;
+    };
+
+    for (key, value) in counters {
+        let Some(counter) = value.as_dictionary() else {
+            continue;
+        };
+        let Some(raw_hashes) = counter.get("counters").and_then(Value::as_array) else {
+            continue;
+        };
+        let name = counter
+            .get("name")
+            .and_then(Value::as_string)
+            .unwrap_or(key)
+            .to_owned();
+        let counter_type = counter
+            .get("type")
+            .and_then(Value::as_string)
+            .map(str::to_owned);
+        let description = counter
+            .get("description")
+            .and_then(Value::as_string)
+            .map(str::to_owned);
+        let match_key = RawCounterDerivedCounterMatchKey {
+            key: key.clone(),
+            name,
+            counter_type,
+            description,
+        };
+        for raw_hash in raw_hashes.iter().filter_map(Value::as_string) {
+            derived
+                .entry(raw_hash.to_owned())
+                .or_default()
+                .entry(match_key.clone())
+                .or_default()
+                .insert(path.to_path_buf());
+        }
+    }
+}
+
+fn add_perf_counter_catalog(
+    path: &Path,
+    hardware: &mut BTreeMap<String, BTreeMap<RawCounterHardwareSelectorKey, BTreeSet<PathBuf>>>,
+) {
+    let Ok(value) = Value::from_file(path) else {
+        return;
+    };
+    let Some(root) = value.as_dictionary() else {
+        return;
+    };
+    for (hash, value) in root {
+        if !hash.starts_with('_') {
+            continue;
+        }
+        let Some(selector) = value.as_dictionary() else {
+            continue;
+        };
+        let key = RawCounterHardwareSelectorKey {
+            partition: selector.get("Partition").and_then(plist_u64),
+            select: selector.get("Select").and_then(plist_u64),
+            flag: selector.get("Flag").and_then(plist_u64),
+        };
+        hardware
+            .entry(hash.clone())
+            .or_default()
+            .entry(key)
+            .or_default()
+            .insert(path.to_path_buf());
+    }
+}
+
+fn plist_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Integer(value) => value.as_unsigned(),
+        _ => None,
     }
 }
 
@@ -2609,6 +2873,8 @@ mod tests {
                     encoder_ids: Vec::new(),
                     kick_trace_ids: Vec::new(),
                     source_ids: Vec::new(),
+                    derived_counter_matches: Vec::new(),
+                    hardware_selectors: Vec::new(),
                 },
                 RawCounterDecodedMetric {
                     path: "APSCounterData[0]/Derived Counter Sample Data/0/1/0".to_owned(),
@@ -2624,6 +2890,8 @@ mod tests {
                     encoder_ids: Vec::new(),
                     kick_trace_ids: Vec::new(),
                     source_ids: Vec::new(),
+                    derived_counter_matches: Vec::new(),
+                    hardware_selectors: Vec::new(),
                 },
             ],
             warnings: Vec::new(),
@@ -2634,6 +2902,54 @@ mod tests {
         assert!(formatted.contains("_hot"));
         assert!(!formatted.contains("_huge"));
         assert!(formatted.contains("1 decoded counters are outside"));
+    }
+
+    #[test]
+    fn formats_raw_counter_catalog_names_when_present() {
+        let metric = RawCounterDecodedMetric {
+            path: "APSCounterData[0]/Derived Counter Sample Data/0/1/0".to_owned(),
+            sample_group: Some(0),
+            source_index: Some(1),
+            ring_index: Some(0),
+            counter_index: 0,
+            raw_name: "_hash".to_owned(),
+            sample_count: 2,
+            min_percent_of_gpu_cycles: 1.0,
+            mean_percent_of_gpu_cycles: 12.0,
+            max_percent_of_gpu_cycles: 20.0,
+            encoder_ids: Vec::new(),
+            kick_trace_ids: Vec::new(),
+            source_ids: Vec::new(),
+            derived_counter_matches: vec![RawCounterDerivedCounterMatch {
+                key: "ALUUtilization".to_owned(),
+                name: "ALU Utilization".to_owned(),
+                counter_type: Some("Percentage".to_owned()),
+                description: None,
+                sources: vec![PathBuf::from("AGXMetalStatisticsExternal-counters.plist")],
+            }],
+            hardware_selectors: vec![RawCounterHardwareSelector {
+                partition: Some(1),
+                select: Some(2),
+                flag: None,
+                sources: vec![PathBuf::from("AGXMetalPerfCountersExternal.plist")],
+            }],
+        };
+        let report = RawCountersReport {
+            trace_source: PathBuf::from("trace.gputrace"),
+            profiler_directory: PathBuf::from("trace.gputrace/raw"),
+            aggregate_metadata: Vec::new(),
+            schemas: Vec::new(),
+            streams: Vec::new(),
+            metrics: vec![metric],
+            warnings: Vec::new(),
+        };
+
+        let text = format_raw_counters_report(&report);
+        let csv = format_raw_counters_csv(&report);
+
+        assert!(text.contains("ALU Utilization (_hash)"));
+        assert!(csv.contains("ALU Utilization"));
+        assert!(csv.contains("ALUUtilization"));
     }
 
     #[test]

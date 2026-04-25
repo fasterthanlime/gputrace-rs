@@ -61,6 +61,9 @@ when a directory contains unrelated `*Counters.csv` files.
 `pipeline_id_scan_costs` field is a debug-only scan of `Profiling_f_*` bytes,
 not Xcode's Performance/Cost percentage.
 
+`raw-counters` reads the profiler bundle directly and enriches raw counter hashes
+with installed AGX Metal catalog names where the local system provides them.
+
 ## Main Commands
 
 | Area | Commands |

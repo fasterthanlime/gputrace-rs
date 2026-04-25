@@ -229,7 +229,8 @@ focused ranked table.
 
 For end-user raw counter inspection without a counter CSV, use `raw-counters`.
 It reports the decoded `.gpuprofiler_raw/streamData` metadata, schemas,
-`GPRWCNTR` streams, and raw counter ids:
+`GPRWCNTR` streams, raw counter ids, and any matching derived counter names from
+installed AGX Metal statistics/perf counter catalogs:
 
 ```bash
 gputrace raw-counters /abs/path/input-perfdata.gputrace --format text

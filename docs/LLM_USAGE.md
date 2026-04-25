@@ -157,7 +157,9 @@ or `validate-counters`.
 
 For end-user raw counter inspection without a counter CSV, use `raw-counters`.
 It reads `.gpuprofiler_raw/streamData` and reports aggregate metadata,
-per-sample-group schemas, decoded `GPRWCNTR` streams, and raw counter ids:
+per-sample-group schemas, decoded `GPRWCNTR` streams, and raw counter ids. When
+available, it enriches raw hashes from installed AGX Metal statistics/perf
+counter plists under `/System/Library/Extensions`:
 
 ```bash
 gputrace raw-counters trace-perfdata.gputrace --format text
