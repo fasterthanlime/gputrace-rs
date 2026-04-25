@@ -883,6 +883,13 @@ struct RawCounterDerivedDefinition {
     source_script: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+struct RawCounterLoadedDerivedScript {
+    path: PathBuf,
+    source: String,
+    definitions: Vec<RawCounterDerivedDefinition>,
+}
+
 fn load_agx_counter_catalog() -> RawCounterCatalog {
     let mut statistics_files = Vec::new();
     let mut perf_files = Vec::new();
@@ -1070,6 +1077,16 @@ fn evaluate_agx_derived_metrics(
         return Vec::new();
     }
 
+    let Some(script) = load_agx_derived_script(catalog, device_identifier) else {
+        return Vec::new();
+    };
+    evaluate_loaded_agx_derived_metrics(&script, variables)
+}
+
+fn load_agx_derived_script(
+    catalog: &RawCounterCatalog,
+    device_identifier: Option<&str>,
+) -> Option<RawCounterLoadedDerivedScript> {
     let definitions_by_script = catalog
         .derived_definitions
         .iter()
@@ -1087,23 +1104,28 @@ fn evaluate_agx_derived_metrics(
             },
         );
 
-    let Some((script_path, definitions)) =
-        choose_agx_derived_script(definitions_by_script, device_identifier)
-    else {
-        return Vec::new();
+    let (script_path, definitions) =
+        choose_agx_derived_script(definitions_by_script, device_identifier)?;
+    let Ok(script_source) = fs::read_to_string(&script_path) else {
+        return None;
     };
-    let mut metrics = Vec::new();
-    {
-        let Ok(script_source) = fs::read_to_string(&script_path) else {
-            return Vec::new();
-        };
-        metrics.extend(evaluate_agx_derived_script(
-            &script_path,
-            &script_source,
-            &definitions,
-            variables,
-        ));
+    Some(RawCounterLoadedDerivedScript {
+        path: script_path,
+        source: script_source,
+        definitions,
+    })
+}
+
+fn evaluate_loaded_agx_derived_metrics(
+    script: &RawCounterLoadedDerivedScript,
+    variables: &BTreeMap<String, f64>,
+) -> Vec<RawCounterJsDerivedMetric> {
+    if variables.is_empty() {
+        return Vec::new();
     }
+
+    let mut metrics =
+        evaluate_agx_derived_script(&script.path, &script.source, &script.definitions, variables);
     metrics.sort_by(|left, right| {
         right
             .value
@@ -1121,11 +1143,13 @@ fn evaluate_agx_derived_metric_groups(
     groups: Vec<RawCounterJsVariableGroup>,
     device_identifier: Option<&str>,
 ) -> Vec<RawCounterJsDerivedMetricGroup> {
+    let Some(script) = load_agx_derived_script(catalog, device_identifier) else {
+        return Vec::new();
+    };
     groups
         .into_iter()
         .filter_map(|group| {
-            let metrics =
-                evaluate_agx_derived_metrics(catalog, &group.variables, device_identifier);
+            let metrics = evaluate_loaded_agx_derived_metrics(&script, &group.variables);
             (!metrics.is_empty()).then_some(RawCounterJsDerivedMetricGroup {
                 group_kind: group.group_kind,
                 group_id: group.group_id,
