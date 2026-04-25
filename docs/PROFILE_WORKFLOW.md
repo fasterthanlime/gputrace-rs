@@ -197,7 +197,8 @@ inner profiler dispatches with real names and durations.
 Use this priority order:
 
 1. `gputrace profiler`: profiler directory inventory, dispatch durations,
-   execution-cost samples, occupancy samples, and pipeline compilation stats.
+   occupancy samples, pipeline compilation stats, and the debug-only
+   `pipeline_id_scan_costs` field.
 2. `gputrace analyze`: compact JSON summary and top timed kernels.
 3. `gputrace insights`: heuristic optimization hints from profiler-backed
    timing/counter data.
@@ -206,10 +207,12 @@ Use this priority order:
 5. `gputrace timeline`: useful for visualization, but some spans can remain
    synthetic when Xcode profiler data does not expose every timestamp directly.
 
-Watch for disagreements between views. For example, dispatch-duration ranking
-and execution-cost sampling can point at different kernels. Treat that as a
-signal to inspect both the dispatch count/duration table and Xcode's own view,
-not as proof that either view is individually complete.
+Watch for disagreements between views. Xcode's Performance/Cost view is not the
+same thing as dispatch-duration ranking. The old Go-style `Profiling_f_*`
+pipeline-id byte scan is retained as `pipeline_id_scan_costs` for
+reverse-engineering only; do not treat it as Xcode Cost. If you need Xcode's
+counter view, export the counter CSV from Xcode and pass it to
+`xcode-counters`/`validate-counters` explicitly.
 
 For Xcode-exported counter CSVs, pass the CSV explicitly unless the filename is
 an exact trace-name match:

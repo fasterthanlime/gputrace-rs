@@ -148,6 +148,13 @@ Profiler-backed exports may have little structural dispatch data while
 `encoders`, `shaders`, `shader-source`, `shader-hotspots`, and
 `mtlb functions --used-only` use profiler timing/name fallbacks where possible.
 
+Do not interpret `profiler.stream_data_summary.pipeline_id_scan_costs` as
+Xcode Cost. It is a retained debug signal from scanning `Profiling_f_*` bytes
+for known pipeline IDs and is known to disagree with Xcode's Cost view on real
+exports. For ranking without a counter CSV, use profiler duration fields. For
+Xcode counter parity, use an exported Xcode counter CSV with `xcode-counters`
+or `validate-counters`.
+
 ## Markdown Rendering
 
 Use built-in Markdown commands when producing human-readable summaries:

@@ -53,6 +53,10 @@ gputrace xcode-profile run trace.gputrace --output trace-perfdata.gputrace
 `xcode-counters` auto-discovers only exact trace-name CSV matches. Pass `--csv`
 when a directory contains unrelated `*Counters.csv` files.
 
+`profiler` reports real `streamData` dispatch timing. Its
+`pipeline_id_scan_costs` field is a debug-only scan of `Profiling_f_*` bytes,
+not Xcode's Performance/Cost percentage.
+
 ## Main Commands
 
 | Area | Commands |

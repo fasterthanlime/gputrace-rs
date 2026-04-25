@@ -125,6 +125,7 @@ pub struct GprwcntrTimestamp {
 pub struct ProfilerStreamDataSummary {
     pub function_names: Vec<String>,
     pub pipelines: Vec<ProfilerPipeline>,
+    pub pipeline_id_scan_costs: Vec<ProfilerExecutionCost>,
     pub execution_costs: Vec<ProfilerExecutionCost>,
     pub occupancies: Vec<ProfilerOccupancy>,
     pub dispatches: Vec<ProfilerDispatch>,
@@ -220,7 +221,7 @@ pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
         );
     }
     notes.push(
-        "Profiling_f_* is parsed for execution-cost and occupancy samples; Counters_f_* is mapped through Xcode counter names and summarized per encoder."
+        "Profiling_f_* occupancy candidates and Counters_f_* limiter metrics are parsed offline; pipeline-id byte scans are retained as a debug signal, not treated as Xcode Cost."
             .to_owned(),
     );
 
@@ -416,6 +417,19 @@ pub fn format_report(report: &ProfilerReport) -> String {
                     .unwrap_or_else(|| format!("pipeline_{}", cost.pipeline_id));
                 out.push_str(&format!(
                     "  - {name}: {:.2}% ({} samples)\n",
+                    cost.cost_percent, cost.sample_count
+                ));
+            }
+        }
+        if !summary.pipeline_id_scan_costs.is_empty() {
+            out.push_str("pipeline-id scan costs (debug only, not Xcode Cost)\n");
+            for cost in summary.pipeline_id_scan_costs.iter().take(5) {
+                let name = cost
+                    .function_name
+                    .clone()
+                    .unwrap_or_else(|| format!("pipeline_{}", cost.pipeline_id));
+                out.push_str(&format!(
+                    "  - {name}: {:.2}% ({} matches)\n",
                     cost.cost_percent, cost.sample_count
                 ));
             }
@@ -620,8 +634,8 @@ fn parse_stream_data(
     let (pipeline_addresses, pipeline_functions) =
         extract_pipeline_info(objects, root, &function_names);
     let pipelines = extract_pipelines(objects, root, &pipeline_addresses, &pipeline_functions);
-    let execution_costs = profiler_dir
-        .map(|dir| extract_execution_costs(dir, &pipelines))
+    let pipeline_id_scan_costs = profiler_dir
+        .map(|dir| extract_pipeline_id_scan_costs(dir, &pipelines))
         .unwrap_or_default();
     let occupancies = profiler_dir.map(extract_occupancies).unwrap_or_default();
     let encoder_timings = extract_encoder_timings(objects, root);
@@ -641,7 +655,8 @@ fn parse_stream_data(
             .map(|encoder| encoder.duration_micros)
             .sum(),
         pipelines,
-        execution_costs,
+        pipeline_id_scan_costs,
+        execution_costs: Vec::new(),
         occupancies,
         dispatches,
         encoder_timings,
@@ -649,7 +664,7 @@ fn parse_stream_data(
     })
 }
 
-fn extract_execution_costs(
+fn extract_pipeline_id_scan_costs(
     profiler_dir: &Path,
     pipelines: &[ProfilerPipeline],
 ) -> Vec<ProfilerExecutionCost> {
@@ -1957,13 +1972,22 @@ mod tests {
             .to_file_binary(profiler_dir.join("streamData"))
             .unwrap();
         fs::write(profiler_dir.join("Timeline_f_0.raw"), [0u8; 16]).unwrap();
+        fs::write(
+            profiler_dir.join("Profiling_f_0.raw"),
+            [27u32.to_le_bytes(), 27u32.to_le_bytes()].concat(),
+        )
+        .unwrap();
 
         let report = report(&trace_path).unwrap();
         assert!(report.stream_data_present);
-        assert!(report.stream_data_summary.is_some());
+        let summary = report.stream_data_summary.as_ref().unwrap();
+        assert!(summary.execution_costs.is_empty());
+        assert_eq!(summary.pipeline_id_scan_costs.len(), 1);
+        assert_eq!(summary.pipeline_id_scan_costs[0].sample_count, 2);
         let text = format_report(&report);
         assert!(text.contains("streamData summary"));
         assert!(text.contains("kernel_main"));
+        assert!(text.contains("pipeline-id scan costs (debug only, not Xcode Cost)"));
     }
 
     #[test]
@@ -2005,6 +2029,12 @@ mod tests {
                         compilation_time_ms: 2.5,
                         line_instruction_counts: BTreeMap::new(),
                     }),
+                }],
+                pipeline_id_scan_costs: vec![ProfilerExecutionCost {
+                    pipeline_id: 27,
+                    function_name: Some("kernel_main".to_owned()),
+                    sample_count: 5,
+                    cost_percent: 62.5,
                 }],
                 execution_costs: vec![ProfilerExecutionCost {
                     pipeline_id: 27,
