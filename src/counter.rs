@@ -1,14 +1,18 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Cursor;
 use std::mem;
 use std::path::{Path, PathBuf};
 
+use plist::{Dictionary, Uid, Value};
 use serde::Serialize;
 
 use crate::counter_names::ALL_COUNTER_NAMES;
 use crate::profiler;
 use crate::trace::TraceBundle;
 use crate::xcode_counters;
+
+type SampleBlob = (String, Vec<u8>);
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CounterLimiter {
@@ -49,6 +53,10 @@ pub struct RawCounterProbeReport {
     pub profiler_directory: PathBuf,
     pub csv_source: Option<PathBuf>,
     pub targets: Vec<RawCounterProbeTarget>,
+    pub stream_archives: Vec<RawCounterStreamArchive>,
+    pub structured_layouts: Vec<RawCounterStructuredLayout>,
+    pub normalized_counters: Vec<RawCounterNormalizedMetric>,
+    pub structured_samples: Vec<RawCounterStructuredSample>,
     pub files: Vec<RawCounterProbeFile>,
 }
 
@@ -77,6 +85,79 @@ pub struct RawCounterRecordShape {
     pub tag: String,
     pub size: usize,
     pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterStreamArchive {
+    pub group: String,
+    pub index: usize,
+    pub byte_len: usize,
+    pub source: Option<String>,
+    pub serial: Option<u64>,
+    pub source_index: Option<u64>,
+    pub ring_buffer_index: Option<u64>,
+    pub data_file: Option<String>,
+    pub shader_profiler_data_len: Option<usize>,
+    pub fields: Vec<RawCounterFieldSummary>,
+    pub data_fields: Vec<RawCounterDataField>,
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterFieldSummary {
+    pub key: String,
+    pub kind: String,
+    pub len: Option<usize>,
+    pub keys: Vec<String>,
+    pub children: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterDataField {
+    pub key: String,
+    pub byte_len: usize,
+    pub prefix_hex: String,
+    pub f32_preview: Vec<f64>,
+    pub u32_preview: Vec<u32>,
+    pub u64_preview: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterStructuredSample {
+    pub path: String,
+    pub byte_len: usize,
+    pub gprw_record_size: Option<usize>,
+    pub gprw_record_count: Option<usize>,
+    pub matches: Vec<RawCounterProbeMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterStructuredLayout {
+    pub path: String,
+    pub byte_len: usize,
+    pub gprw_record_size: usize,
+    pub gprw_record_count: usize,
+    pub u64_columns: Vec<RawCounterColumnStat>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterColumnStat {
+    pub index: usize,
+    pub min: u64,
+    pub max: u64,
+    pub mean: f64,
+    pub nonzero_count: usize,
+    pub first_values: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterNormalizedMetric {
+    pub path: String,
+    pub counter_index: usize,
+    pub raw_name: String,
+    pub sample_count: usize,
+    pub mean_percent: f64,
+    pub max_percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -167,10 +248,16 @@ pub fn probe_raw_counters(
         });
     }
 
+    let structured_samples = probe_structured_counter_samples(&trace.path, &targets);
+
     Ok(RawCounterProbeReport {
         profiler_directory,
         csv_source: csv_data.map(|data| data.source),
         targets,
+        stream_archives: probe_stream_archives(&trace.path),
+        structured_layouts: probe_structured_counter_layouts(&trace.path),
+        normalized_counters: probe_normalized_counter_metrics(&trace.path),
+        structured_samples,
         files: file_reports,
     })
 }
@@ -187,6 +274,143 @@ pub fn format_raw_counter_probe(report: &RawCounterProbeReport) -> String {
         out.push_str(&format!("csv_source={}\n", csv_source.display()));
     }
     out.push_str(&format!("targets={}\n\n", report.targets.len()));
+
+    if !report.stream_archives.is_empty() {
+        out.push_str("streamData archives\n");
+        for archive in &report.stream_archives {
+            out.push_str(&format!(
+                "  {}[{}]: bytes={} source={} serial={} source_index={} ring_buffer={} file={} shader_data={} keys={}\n",
+                archive.group,
+                archive.index,
+                archive.byte_len,
+                archive.source.as_deref().unwrap_or("-"),
+                archive.serial.map(|value| value.to_string()).unwrap_or_else(|| "-".to_owned()),
+                archive
+                    .source_index
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                archive
+                    .ring_buffer_index
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                archive.data_file.as_deref().unwrap_or("-"),
+                archive
+                    .shader_profiler_data_len
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                archive.keys.join(",")
+            ));
+            for field in archive.data_fields.iter().take(8) {
+                out.push_str(&format!(
+                    "    data {}: bytes={} prefix={} u32={:?} u64={:?} f32={:?}\n",
+                    field.key,
+                    field.byte_len,
+                    field.prefix_hex,
+                    field.u32_preview,
+                    field.u64_preview,
+                    field.f32_preview
+                ));
+            }
+            for field in archive
+                .fields
+                .iter()
+                .filter(|field| field.kind != "data")
+                .take(8)
+            {
+                out.push_str(&format!(
+                    "    field {}: kind={} len={} keys={} children={}\n",
+                    field.key,
+                    field.kind,
+                    field
+                        .len
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    field.keys.join(","),
+                    field.children.join(",")
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    if !report.structured_samples.is_empty() {
+        out.push_str("structured derived samples\n");
+        for sample in report.structured_samples.iter().take(32) {
+            out.push_str(&format!(
+                "  {}: bytes={} record_size={} records={}\n",
+                sample.path,
+                sample.byte_len,
+                sample
+                    .gprw_record_size
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                sample
+                    .gprw_record_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned())
+            ));
+            for matched in sample.matches.iter().take(6) {
+                out.push_str(&format!(
+                    "    {} row={} target={:.4} {} hits={}",
+                    matched.metric,
+                    matched.row_index,
+                    matched.target,
+                    matched.encoding,
+                    matched.count
+                ));
+                for example in matched.examples.iter().take(3) {
+                    out.push_str(&format!(
+                        " @{}(p{} {:.4})",
+                        example.offset, example.page_4k, example.value
+                    ));
+                }
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+
+    if !report.structured_layouts.is_empty() {
+        out.push_str("structured derived layouts\n");
+        for layout in report.structured_layouts.iter().take(32) {
+            out.push_str(&format!(
+                "  {}: bytes={} record_size={} records={} columns={}\n",
+                layout.path,
+                layout.byte_len,
+                layout.gprw_record_size,
+                layout.gprw_record_count,
+                layout.u64_columns.len()
+            ));
+            for column in layout.u64_columns.iter().take(10) {
+                out.push_str(&format!(
+                    "    u64[{}]: min={} max={} mean={:.2} nonzero={} first={:?}\n",
+                    column.index,
+                    column.min,
+                    column.max,
+                    column.mean,
+                    column.nonzero_count,
+                    column.first_values
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    if !report.normalized_counters.is_empty() {
+        out.push_str("normalized derived counters\n");
+        for metric in report.normalized_counters.iter().take(32) {
+            out.push_str(&format!(
+                "  {} [{}] {}: mean={:.2}% max={:.2}% samples={}\n",
+                metric.path,
+                metric.counter_index,
+                metric.raw_name,
+                metric.mean_percent,
+                metric.max_percent,
+                metric.sample_count
+            ));
+        }
+        out.push('\n');
+    }
 
     for file in &report.files {
         out.push_str(&format!(
@@ -233,6 +457,707 @@ pub fn format_raw_counter_probe(report: &RawCounterProbeReport) -> String {
         out.push('\n');
     }
     out
+}
+
+fn probe_stream_archives(trace_path: &Path) -> Vec<RawCounterStreamArchive> {
+    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
+        return Vec::new();
+    };
+    let stream_data_path = profiler_dir.join("streamData");
+    let Ok(plist) = Value::from_file(stream_data_path) else {
+        return Vec::new();
+    };
+    let Some(archive) = plist.as_dictionary() else {
+        return Vec::new();
+    };
+    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
+        return Vec::new();
+    };
+
+    ["APSData", "APSCounterData", "APSTimelineData"]
+        .into_iter()
+        .flat_map(|group| {
+            ns_data_array_from_root_key(objects, root, group)
+                .into_iter()
+                .enumerate()
+                .filter_map(move |(index, bytes)| summarize_stream_archive(group, index, &bytes))
+        })
+        .collect()
+}
+
+fn probe_structured_counter_samples(
+    trace_path: &Path,
+    targets: &[RawCounterProbeTarget],
+) -> Vec<RawCounterStructuredSample> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
+        return Vec::new();
+    };
+    let stream_data_path = profiler_dir.join("streamData");
+    let Ok(plist) = Value::from_file(stream_data_path) else {
+        return Vec::new();
+    };
+    let Some(archive) = plist.as_dictionary() else {
+        return Vec::new();
+    };
+    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for (archive_index, bytes) in ns_data_array_from_root_key(objects, root, "APSCounterData")
+        .into_iter()
+        .enumerate()
+    {
+        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+            continue;
+        };
+        let Some(samples) = keyed.get("Derived Counter Sample Data") else {
+            continue;
+        };
+        let mut blobs = Vec::new();
+        collect_data_blobs(
+            &format!("APSCounterData[{archive_index}]/Derived Counter Sample Data"),
+            samples,
+            &mut blobs,
+        );
+        for (path, data) in blobs {
+            if !data.starts_with(b"GPRWCNTR") {
+                continue;
+            }
+            let matches = probe_counter_targets(&data, &[], targets);
+            if matches.is_empty() {
+                continue;
+            }
+            let (gprw_record_size, gprw_record_count) = gprw_record_info(&data).unwrap_or((0, 0));
+            out.push(RawCounterStructuredSample {
+                path,
+                byte_len: data.len(),
+                gprw_record_size: (gprw_record_size > 0).then_some(gprw_record_size),
+                gprw_record_count: (gprw_record_count > 0).then_some(gprw_record_count),
+                matches,
+            });
+        }
+    }
+    out.sort_by(|left, right| {
+        let left_hits: usize = left.matches.iter().map(|matched| matched.count).sum();
+        let right_hits: usize = right.matches.iter().map(|matched| matched.count).sum();
+        right_hits
+            .cmp(&left_hits)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    out
+}
+
+fn probe_structured_counter_layouts(trace_path: &Path) -> Vec<RawCounterStructuredLayout> {
+    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
+        return Vec::new();
+    };
+    let stream_data_path = profiler_dir.join("streamData");
+    let Ok(plist) = Value::from_file(stream_data_path) else {
+        return Vec::new();
+    };
+    let Some(archive) = plist.as_dictionary() else {
+        return Vec::new();
+    };
+    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
+        return Vec::new();
+    };
+
+    let mut layouts = Vec::new();
+    for (archive_index, bytes) in ns_data_array_from_root_key(objects, root, "APSCounterData")
+        .into_iter()
+        .enumerate()
+    {
+        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+            continue;
+        };
+        let Some(samples) = keyed.get("Derived Counter Sample Data") else {
+            continue;
+        };
+        let mut blobs = Vec::new();
+        collect_data_blobs(
+            &format!("APSCounterData[{archive_index}]/Derived Counter Sample Data"),
+            samples,
+            &mut blobs,
+        );
+        for (path, data) in blobs {
+            let Some((record_size, record_count)) = gprw_record_info(&data) else {
+                continue;
+            };
+            if record_count < 2 {
+                continue;
+            }
+            layouts.push(RawCounterStructuredLayout {
+                path,
+                byte_len: data.len(),
+                gprw_record_size: record_size,
+                gprw_record_count: record_count,
+                u64_columns: summarize_gprw_u64_columns(&data, record_size),
+            });
+        }
+    }
+    layouts.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| right.gprw_record_count.cmp(&left.gprw_record_count))
+    });
+    layouts
+}
+
+fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormalizedMetric> {
+    let Some((counter_names, sample_blobs)) = counter_names_and_sample_blobs(trace_path) else {
+        return Vec::new();
+    };
+    if counter_names.is_empty() {
+        return Vec::new();
+    }
+
+    let mut metrics = Vec::new();
+    for (path, data) in sample_blobs {
+        if !path.contains("/Derived Counter Sample Data/")
+            || path.split('/').nth_back(1) != Some("1")
+        {
+            continue;
+        }
+        let Some((record_size, _)) = gprw_record_info(&data) else {
+            continue;
+        };
+        let records = gprw_u64_records(&data, record_size);
+        if records.is_empty() {
+            continue;
+        }
+        for (counter_index, raw_name) in counter_names.iter().enumerate() {
+            let value_column = 8 + counter_index;
+            let mut values = Vec::new();
+            for record in &records {
+                let Some(denominator) = record.get(2).copied() else {
+                    continue;
+                };
+                let Some(value) = record.get(value_column).copied() else {
+                    continue;
+                };
+                if denominator == 0 {
+                    continue;
+                }
+                values.push(value as f64 / denominator as f64 * 100.0);
+            }
+            if values.is_empty() {
+                continue;
+            }
+            let max_percent = values.iter().copied().fold(0.0, f64::max);
+            let mean_percent = values.iter().sum::<f64>() / values.len() as f64;
+            metrics.push(RawCounterNormalizedMetric {
+                path: path.clone(),
+                counter_index,
+                raw_name: raw_name.clone(),
+                sample_count: values.len(),
+                mean_percent,
+                max_percent,
+            });
+        }
+    }
+    metrics.sort_by(|left, right| {
+        right
+            .mean_percent
+            .partial_cmp(&left.mean_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.counter_index.cmp(&right.counter_index))
+    });
+    metrics
+}
+
+fn counter_names_and_sample_blobs(trace_path: &Path) -> Option<(Vec<String>, Vec<SampleBlob>)> {
+    let profiler_dir = profiler::find_profiler_directory(trace_path)?;
+    let stream_data_path = profiler_dir.join("streamData");
+    let plist = Value::from_file(stream_data_path).ok()?;
+    let archive = plist.as_dictionary()?;
+    let objects = archive.get("$objects").and_then(Value::as_array)?;
+    let root = objects.get(1).and_then(Value::as_dictionary)?;
+    let counter_archives = ns_data_array_from_root_key(objects, root, "APSCounterData");
+
+    let mut counter_names = Vec::new();
+    let mut sample_blobs = Vec::new();
+    for (archive_index, bytes) in counter_archives.into_iter().enumerate() {
+        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+            continue;
+        };
+        if counter_names.is_empty()
+            && let Some(names) = keyed.get("limiter sample counters")
+        {
+            counter_names = string_array_values(names);
+        }
+        if let Some(samples) = keyed.get("Derived Counter Sample Data") {
+            collect_data_blobs(
+                &format!("APSCounterData[{archive_index}]/Derived Counter Sample Data"),
+                samples,
+                &mut sample_blobs,
+            );
+        }
+    }
+    Some((counter_names, sample_blobs))
+}
+
+fn string_array_values(value: &StreamArchiveValue) -> Vec<String> {
+    let StreamArchiveValue::Array(children) = value else {
+        return Vec::new();
+    };
+    children
+        .iter()
+        .filter_map(|child| match child {
+            StreamArchiveValue::String(value) => Some(value.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn gprw_u64_records(data: &[u8], record_size: usize) -> Vec<Vec<u64>> {
+    let mut records = Vec::new();
+    for offset in gprw_magic_offsets(data) {
+        let Some(record) = data.get(offset..offset + record_size) else {
+            continue;
+        };
+        records.push(
+            record
+                .chunks_exact(mem::size_of::<u64>())
+                .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                .collect(),
+        );
+    }
+    records
+}
+
+fn summarize_gprw_u64_columns(data: &[u8], record_size: usize) -> Vec<RawCounterColumnStat> {
+    if record_size < mem::size_of::<u64>() {
+        return Vec::new();
+    }
+    let columns = record_size / mem::size_of::<u64>();
+    let mut values_by_column = vec![Vec::<u64>::new(); columns];
+    for offset in gprw_magic_offsets(data) {
+        let Some(record) = data.get(offset..offset + record_size) else {
+            continue;
+        };
+        for (index, chunk) in record.chunks_exact(mem::size_of::<u64>()).enumerate() {
+            values_by_column[index].push(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+    }
+    values_by_column
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, values)| summarize_u64_column(index, values))
+        .collect()
+}
+
+fn summarize_u64_column(index: usize, values: Vec<u64>) -> Option<RawCounterColumnStat> {
+    if values.is_empty() {
+        return None;
+    }
+    let min = values.iter().min().copied()?;
+    let max = values.iter().max().copied()?;
+    let total = values
+        .iter()
+        .fold(0.0, |total, value| total + *value as f64);
+    let nonzero_count = values.iter().filter(|value| **value != 0).count();
+    Some(RawCounterColumnStat {
+        index,
+        min,
+        max,
+        mean: total / values.len() as f64,
+        nonzero_count,
+        first_values: values.into_iter().take(6).collect(),
+    })
+}
+
+fn collect_data_blobs(path: &str, value: &StreamArchiveValue, out: &mut Vec<(String, Vec<u8>)>) {
+    match value {
+        StreamArchiveValue::Data(data) => out.push((path.to_owned(), data.clone())),
+        StreamArchiveValue::Array(children) => {
+            for (index, child) in children.iter().enumerate() {
+                collect_data_blobs(&format!("{path}/{index}"), child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn summarize_stream_archive(
+    group: &str,
+    index: usize,
+    bytes: &[u8],
+) -> Option<RawCounterStreamArchive> {
+    let keyed = parse_keyed_archive_dictionary(bytes)?;
+    let keys = keyed.keys().cloned().collect::<Vec<_>>();
+    let data_file = keyed
+        .get("APSCounterDataFile")
+        .or_else(|| keyed.get("APSTraceDataFile"))
+        .or_else(|| keyed.get("File"))
+        .and_then(StreamArchiveValue::as_string)
+        .map(ToOwned::to_owned);
+    Some(RawCounterStreamArchive {
+        group: group.to_owned(),
+        index,
+        byte_len: bytes.len(),
+        source: keyed
+            .get("Source")
+            .and_then(StreamArchiveValue::as_string)
+            .map(ToOwned::to_owned),
+        serial: keyed.get("Serial").and_then(StreamArchiveValue::as_u64),
+        source_index: keyed
+            .get("SourceIndex")
+            .and_then(StreamArchiveValue::as_u64),
+        ring_buffer_index: keyed
+            .get("RingBufferIndex")
+            .and_then(StreamArchiveValue::as_u64),
+        data_file,
+        shader_profiler_data_len: keyed
+            .get("ShaderProfilerData")
+            .and_then(StreamArchiveValue::as_data_len),
+        fields: keyed
+            .iter()
+            .map(|(key, value)| summarize_field(key, value))
+            .collect(),
+        data_fields: keyed
+            .iter()
+            .filter_map(|(key, value)| {
+                let StreamArchiveValue::Data(data) = value else {
+                    return None;
+                };
+                Some(summarize_data_field(key, data))
+            })
+            .collect(),
+        keys,
+    })
+}
+
+fn summarize_field(key: &str, value: &StreamArchiveValue) -> RawCounterFieldSummary {
+    let (kind, len, keys) = match value {
+        StreamArchiveValue::String(_) => ("string", None, Vec::new()),
+        StreamArchiveValue::Integer(_) => ("integer", None, Vec::new()),
+        StreamArchiveValue::Data(data) => ("data", Some(data.len()), Vec::new()),
+        StreamArchiveValue::Array(children) => ("array", Some(children.len()), Vec::new()),
+        StreamArchiveValue::Dictionary(keys) => ("dictionary", Some(keys.len()), keys.clone()),
+        StreamArchiveValue::Other => ("other", None, Vec::new()),
+    };
+    let children = match value {
+        StreamArchiveValue::Array(children) => children
+            .iter()
+            .take(32)
+            .enumerate()
+            .map(|(index, child)| format!("{index}:{}", child.short_summary()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    RawCounterFieldSummary {
+        key: key.to_owned(),
+        kind: kind.to_owned(),
+        len,
+        keys,
+        children,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum StreamArchiveValue {
+    String(String),
+    Integer(u64),
+    Data(Vec<u8>),
+    Array(Vec<StreamArchiveValue>),
+    Dictionary(Vec<String>),
+    Other,
+}
+
+impl StreamArchiveValue {
+    fn as_string(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Integer(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn as_data_len(&self) -> Option<usize> {
+        match self {
+            Self::Data(value) => Some(value.len()),
+            _ => None,
+        }
+    }
+
+    fn short_summary(&self) -> String {
+        match self {
+            Self::String(value) => format!("string:{value}"),
+            Self::Integer(value) => format!("integer:{value}"),
+            Self::Data(data) => match summarize_gprw_data(data) {
+                Some(summary) => summary,
+                None => format!("data:{}:{}", data.len(), format_hex_prefix(data, 16)),
+            },
+            Self::Array(children) => {
+                let nested = children
+                    .iter()
+                    .take(8)
+                    .map(StreamArchiveValue::short_summary)
+                    .collect::<Vec<_>>()
+                    .join("|");
+                format!("array:{}:[{}]", children.len(), nested)
+            }
+            Self::Dictionary(keys) => format!("dictionary:{}:{}", keys.len(), keys.join("|")),
+            Self::Other => "other".to_owned(),
+        }
+    }
+}
+
+fn summarize_gprw_data(data: &[u8]) -> Option<String> {
+    let (record_size, record_count) = gprw_record_info(data)?;
+    let magic_offsets = gprw_magic_offsets(data);
+    let repeated_magic = magic_offsets.len() > 1;
+    let first = if repeated_magic {
+        data.get(..record_size)?
+    } else {
+        data.get(8..8 + record_size)?
+    };
+    let fields = preview_u64_values(first, 8)
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("|");
+    let magic_deltas = summarize_magic_deltas(&magic_offsets);
+    Some(format!(
+        "gprw:{}:record_size={record_size}:records={record_count}:magics={}:deltas={}:u64={fields}",
+        data.len(),
+        magic_offsets.len(),
+        magic_deltas
+    ))
+}
+
+fn gprw_record_info(data: &[u8]) -> Option<(usize, usize)> {
+    if data.get(..8)? != b"GPRWCNTR" {
+        return None;
+    }
+    let magic_offsets = gprw_magic_offsets(data);
+    if let Some(record_size) = dominant_magic_delta(&magic_offsets)
+        && record_size > 0
+    {
+        return Some((record_size, magic_offsets.len()));
+    }
+    let record_size = 168;
+    let record_count = data[8..].len() / record_size;
+    Some((record_size, record_count))
+}
+
+fn gprw_magic_offsets(data: &[u8]) -> Vec<usize> {
+    data.windows(8)
+        .enumerate()
+        .filter_map(|(offset, window)| (window == b"GPRWCNTR").then_some(offset))
+        .collect()
+}
+
+fn summarize_magic_deltas(offsets: &[usize]) -> String {
+    let mut counts = BTreeMap::<usize, usize>::new();
+    for pair in offsets.windows(2) {
+        *counts.entry(pair[1] - pair[0]).or_default() += 1;
+    }
+    let mut counts = counts.into_iter().collect::<Vec<_>>();
+    counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    counts
+        .into_iter()
+        .take(4)
+        .map(|(delta, count)| format!("{delta}x{count}"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn dominant_magic_delta(offsets: &[usize]) -> Option<usize> {
+    let mut counts = BTreeMap::<usize, usize>::new();
+    for pair in offsets.windows(2) {
+        *counts.entry(pair[1] - pair[0]).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+        .map(|(delta, _)| delta)
+}
+
+fn parse_keyed_archive_dictionary(bytes: &[u8]) -> Option<BTreeMap<String, StreamArchiveValue>> {
+    let plist = Value::from_reader(Cursor::new(bytes)).ok()?;
+    let archive = plist.as_dictionary()?;
+    let objects = archive.get("$objects").and_then(Value::as_array)?;
+    let top = archive.get("$top").and_then(Value::as_dictionary)?;
+    let root_uid = top.get("root").and_then(as_uid)?;
+    let root = object_dictionary(objects, root_uid)?;
+    keyed_dictionary_values(objects, root)
+}
+
+fn keyed_dictionary_values(
+    objects: &[Value],
+    root: &Dictionary,
+) -> Option<BTreeMap<String, StreamArchiveValue>> {
+    let keys = root.get("NS.keys").and_then(Value::as_array)?;
+    let values = root.get("NS.objects").and_then(Value::as_array)?;
+    if keys.len() != values.len() {
+        return None;
+    }
+
+    let mut out = BTreeMap::new();
+    for (key, value) in keys.iter().zip(values.iter()) {
+        let key_uid = as_uid(key)?;
+        let key_name = object(objects, key_uid).and_then(Value::as_string)?;
+        let resolved = resolve_value(objects, value)?;
+        out.insert(
+            key_name.to_owned(),
+            summarize_stream_archive_value(objects, resolved),
+        );
+    }
+    Some(out)
+}
+
+fn summarize_stream_archive_value(objects: &[Value], value: &Value) -> StreamArchiveValue {
+    if let Some(value) = value.as_string() {
+        return StreamArchiveValue::String(value.to_owned());
+    }
+    if let Some(value) = as_u64(value) {
+        return StreamArchiveValue::Integer(value);
+    }
+    if let Some(data) = ns_data_from_value(value) {
+        return StreamArchiveValue::Data(data.to_vec());
+    }
+    if let Some(array) = value
+        .as_dictionary()
+        .and_then(|dict| dict.get("NS.objects"))
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+    {
+        return StreamArchiveValue::Array(
+            array
+                .iter()
+                .take(512)
+                .filter_map(|value| resolve_value(objects, value))
+                .map(|value| summarize_stream_archive_value(objects, value))
+                .collect(),
+        );
+    }
+    if let Some(dict) = value.as_dictionary()
+        && let Some(values) = keyed_dictionary_values(objects, dict)
+    {
+        return StreamArchiveValue::Dictionary(values.keys().cloned().collect());
+    }
+    StreamArchiveValue::Other
+}
+
+fn summarize_data_field(key: &str, data: &[u8]) -> RawCounterDataField {
+    RawCounterDataField {
+        key: key.to_owned(),
+        byte_len: data.len(),
+        prefix_hex: format_hex_prefix(data, 32),
+        f32_preview: preview_f32_values(data, 8),
+        u32_preview: preview_u32_values(data, 8),
+        u64_preview: preview_u64_values(data, 4),
+    }
+}
+
+fn format_hex_prefix(data: &[u8], max_len: usize) -> String {
+    data.iter()
+        .take(max_len)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn preview_f32_values(data: &[u8], max_count: usize) -> Vec<f64> {
+    data.chunks_exact(mem::size_of::<f32>())
+        .take(max_count)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()) as f64)
+        .collect()
+}
+
+fn preview_u32_values(data: &[u8], max_count: usize) -> Vec<u32> {
+    data.chunks_exact(mem::size_of::<u32>())
+        .take(max_count)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+fn preview_u64_values(data: &[u8], max_count: usize) -> Vec<u64> {
+    data.chunks_exact(mem::size_of::<u64>())
+        .take(max_count)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+fn ns_data_array_from_root_key(objects: &[Value], root: &Dictionary, key: &str) -> Vec<Vec<u8>> {
+    let Some(uid) = root.get(key).and_then(as_uid) else {
+        return Vec::new();
+    };
+    let Some(array_dict) = object_dictionary(objects, uid) else {
+        return Vec::new();
+    };
+    let Some(values) = array_dict.get("NS.objects").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    values
+        .iter()
+        .filter_map(|value| resolve_value(objects, value))
+        .filter_map(ns_data_from_value)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn ns_data_from_value(value: &Value) -> Option<&[u8]> {
+    value
+        .as_dictionary()
+        .and_then(|dict| dict.get("NS.data"))
+        .and_then(Value::as_data)
+        .or_else(|| value.as_data())
+}
+
+fn object(objects: &[Value], uid: Uid) -> Option<&Value> {
+    objects.get(uid.get() as usize)
+}
+
+fn object_dictionary(objects: &[Value], uid: Uid) -> Option<&Dictionary> {
+    object(objects, uid).and_then(Value::as_dictionary)
+}
+
+fn resolve_value<'a>(objects: &'a [Value], value: &'a Value) -> Option<&'a Value> {
+    match value {
+        Value::Uid(uid) => object(objects, *uid),
+        value => Some(value),
+    }
+}
+
+fn as_uid(value: &Value) -> Option<Uid> {
+    match value {
+        Value::Uid(uid) => Some(*uid),
+        _ => None,
+    }
+}
+
+fn as_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Integer(value) => value.as_unsigned().or_else(|| {
+            value
+                .as_signed()
+                .and_then(|value| u64::try_from(value).ok())
+        }),
+        _ => None,
+    }
 }
 
 pub fn extract_counter_file_metrics(profiler_dir: &Path) -> Vec<CounterFileMetric> {
@@ -990,5 +1915,23 @@ mod tests {
         assert_eq!(metrics[0].total_value, 28_672.0);
         assert_eq!(metrics[0].representative_value, 28_672.0);
         assert!((metrics[0].mean_value - 9557.333).abs() < 0.01);
+    }
+
+    #[test]
+    fn detects_gprw_record_size_from_magic_stride() {
+        let mut data = Vec::new();
+        for index in 0..3u64 {
+            let mut record = vec![0u8; 64];
+            record[0..8].copy_from_slice(b"GPRWCNTR");
+            record[8..16].copy_from_slice(&(100 + index).to_le_bytes());
+            record[16..24].copy_from_slice(&(200 + index).to_le_bytes());
+            data.extend_from_slice(&record);
+        }
+
+        assert_eq!(gprw_record_info(&data), Some((64, 3)));
+        let stats = summarize_gprw_u64_columns(&data, 64);
+        assert_eq!(stats[0].min, u64::from_le_bytes(*b"GPRWCNTR"));
+        assert_eq!(stats[1].first_values, vec![100, 101, 102]);
+        assert_eq!(stats[2].first_values, vec![200, 201, 202]);
     }
 }
