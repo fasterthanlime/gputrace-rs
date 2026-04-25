@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -95,22 +95,17 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
     let limiters = counter::extract_limiters_for_trace(&trace.path);
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     let raw_counter_report = counter::raw_counters_report(trace).ok();
-
-    if let Some(raw_counter_report) = &raw_counter_report
-        && let Some(rows) = aps_counter_rows(
-            trace,
-            &timeline,
-            profiler_summary.as_ref(),
-            raw_counter_report,
-        )
-    {
-        return Ok(CounterExportReport {
-            trace_source: trace.path.clone(),
-            source: "aps-counter-samples".to_owned(),
-            total_rows: rows.len(),
-            rows,
-        });
-    }
+    let mut aps_rows = raw_counter_report
+        .as_ref()
+        .and_then(|raw_counter_report| {
+            aps_counter_rows(
+                trace,
+                &timeline,
+                profiler_summary.as_ref(),
+                raw_counter_report,
+            )
+        })
+        .unwrap_or_default();
 
     let limiters_by_encoder = limiters
         .into_iter()
@@ -120,6 +115,8 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
     let mut execution_cost_by_name = BTreeMap::<String, (f64, usize)>::new();
     let mut sample_stats_by_name = BTreeMap::<String, (usize, f64, usize)>::new();
     let mut pipeline_stats_by_name = BTreeMap::<String, profiler::ProfilerPipelineStats>::new();
+    let mut profiler_dispatches_by_name =
+        BTreeMap::<String, Vec<&profiler::ProfilerDispatch>>::new();
     let mut occupancy_by_encoder = BTreeMap::<usize, (f64, f64)>::new();
     if let Some(summary) = &profiler_summary {
         for cost in &summary.execution_costs {
@@ -136,10 +133,14 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
                 .function_name
                 .clone()
                 .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
-            let entry = sample_stats_by_name.entry(name).or_default();
+            let entry = sample_stats_by_name.entry(name.clone()).or_default();
             entry.0 += dispatch.sample_count;
             entry.1 += dispatch.sampling_density;
             entry.2 += 1;
+            profiler_dispatches_by_name
+                .entry(name)
+                .or_default()
+                .push(dispatch);
         }
         for pipeline in &summary.pipelines {
             if let (Some(name), Some(stats)) = (&pipeline.function_name, &pipeline.stats) {
@@ -167,6 +168,7 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
     }
 
     let mut rows = Vec::new();
+    let mut represented_kernels = BTreeSet::new();
     for encoder in &timeline.encoders {
         let encoder_dispatches = dispatches_by_encoder
             .get(&encoder.index)
@@ -191,6 +193,11 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             .and_then(|name| execution_cost_by_name.get(name).copied())
             .map(|(percent, samples)| (Some(percent), samples))
             .unwrap_or((None, 0));
+        if execution_cost_percent.is_some()
+            && let Some(kernel_name) = &kernel_name
+        {
+            represented_kernels.insert(kernel_name.clone());
+        }
         let (sample_count, avg_sampling_density) = kernel_name
             .as_ref()
             .and_then(|name| sample_stats_by_name.get(name).copied())
@@ -327,12 +334,185 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
         });
     }
 
+    append_profiler_rows(
+        &mut rows,
+        &execution_cost_by_name,
+        &sample_stats_by_name,
+        &pipeline_stats_by_name,
+        &profiler_dispatches_by_name,
+        &occupancy_by_encoder,
+        &represented_kernels,
+    );
+
+    let source = if aps_rows.is_empty() {
+        timeline.source
+    } else {
+        format!("{}+aps-counter-samples", timeline.source)
+    };
+    for mut row in aps_rows.drain(..) {
+        row.row_index = rows.len();
+        rows.push(row);
+    }
+
     Ok(CounterExportReport {
         trace_source: trace.path.clone(),
-        source: timeline.source,
+        source,
         total_rows: rows.len(),
         rows,
     })
+}
+
+fn append_profiler_rows(
+    rows: &mut Vec<CounterExportRow>,
+    execution_cost_by_name: &BTreeMap<String, (f64, usize)>,
+    sample_stats_by_name: &BTreeMap<String, (usize, f64, usize)>,
+    pipeline_stats_by_name: &BTreeMap<String, profiler::ProfilerPipelineStats>,
+    profiler_dispatches_by_name: &BTreeMap<String, Vec<&profiler::ProfilerDispatch>>,
+    occupancy_by_encoder: &BTreeMap<usize, (f64, f64)>,
+    represented_kernels: &BTreeSet<String>,
+) {
+    let total_dispatch_time_us = profiler_dispatches_by_name
+        .values()
+        .flatten()
+        .map(|dispatch| dispatch.duration_us)
+        .sum::<u64>();
+    let mut costs = profiler_dispatches_by_name
+        .keys()
+        .chain(execution_cost_by_name.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|kernel_name| {
+            let dispatch_time_us = profiler_dispatches_by_name
+                .get(&kernel_name)
+                .into_iter()
+                .flatten()
+                .map(|dispatch| dispatch.duration_us)
+                .sum::<u64>();
+            let cost_percent = execution_cost_by_name
+                .get(&kernel_name)
+                .map(|(percent, _)| *percent)
+                .or_else(|| {
+                    (total_dispatch_time_us != 0)
+                        .then(|| dispatch_time_us as f64 / total_dispatch_time_us as f64 * 100.0)
+                })
+                .unwrap_or_default();
+            (kernel_name, cost_percent)
+        })
+        .collect::<Vec<_>>();
+    costs.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    for (kernel_name, execution_cost_percent) in costs {
+        if represented_kernels.contains(&kernel_name) {
+            continue;
+        }
+        let dispatches = profiler_dispatches_by_name
+            .get(&kernel_name)
+            .cloned()
+            .unwrap_or_default();
+        let first_dispatch = dispatches.first().copied();
+        let command_buffer_index = first_dispatch
+            .map(|dispatch| dispatch.encoder_index)
+            .unwrap_or_default();
+        let encoder_index = first_dispatch
+            .map(|dispatch| dispatch.encoder_index)
+            .unwrap_or_default();
+        let start_time_ns = first_dispatch
+            .map(|dispatch| {
+                dispatch
+                    .cumulative_us
+                    .saturating_sub(dispatch.duration_us)
+                    .saturating_mul(1000)
+            })
+            .unwrap_or_default();
+        let end_time_ns = first_dispatch
+            .map(|dispatch| dispatch.cumulative_us.saturating_mul(1000))
+            .unwrap_or(start_time_ns);
+        let duration_ns = first_dispatch.map(|dispatch| dispatch.duration_us.saturating_mul(1000));
+        let (sample_count, avg_sampling_density, dispatch_count) = sample_stats_by_name
+            .get(&kernel_name)
+            .copied()
+            .map(|(samples, density_sum, density_count)| {
+                let avg = (density_count != 0).then(|| density_sum / density_count as f64);
+                (samples, avg, density_count)
+            })
+            .unwrap_or((0, None, dispatches.len()));
+        let execution_cost_samples = execution_cost_by_name
+            .get(&kernel_name)
+            .map(|(_, samples)| *samples)
+            .unwrap_or(sample_count);
+        let pipeline_stats = pipeline_stats_by_name.get(&kernel_name);
+        let occupancy = occupancy_by_encoder.get(&encoder_index).copied();
+        let metric_source = if execution_cost_by_name.contains_key(&kernel_name) {
+            "profile-execution-cost"
+        } else {
+            "profile-dispatch-time"
+        };
+
+        rows.push(CounterExportRow {
+            row_index: rows.len(),
+            command_buffer_index,
+            encoder_index,
+            encoder_label: kernel_name.clone(),
+            kernel_name: Some(kernel_name.clone()),
+            pipeline_addr: None,
+            start_time_ns,
+            end_time_ns,
+            duration_ns,
+            dispatch_count,
+            kernel_invocations: dispatch_count,
+            metric_source: metric_source.to_owned(),
+            execution_cost_percent: Some(execution_cost_percent),
+            execution_cost_samples,
+            sample_count,
+            avg_sampling_density,
+            occupancy_percent: occupancy.map(|(percent, _)| percent),
+            occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
+            occupancy_manager_percent: None,
+            alu_utilization_percent: None,
+            shader_launch_limiter_percent: None,
+            instruction_throughput_percent: None,
+            integer_complex_percent: None,
+            f32_limiter_percent: None,
+            l1_cache_percent: None,
+            last_level_cache_percent: None,
+            control_flow_percent: None,
+            device_memory_bandwidth_gbps: None,
+            gpu_read_bandwidth_gbps: None,
+            gpu_write_bandwidth_gbps: None,
+            buffer_device_memory_bytes_read: None,
+            buffer_device_memory_bytes_written: None,
+            bytes_read_from_device_memory: None,
+            bytes_written_to_device_memory: None,
+            buffer_l1_miss_rate_percent: None,
+            buffer_l1_read_accesses: None,
+            buffer_l1_read_bandwidth_gbps: None,
+            buffer_l1_write_accesses: None,
+            buffer_l1_write_bandwidth_gbps: None,
+            compute_shader_launch_utilization_percent: None,
+            control_flow_utilization_percent: None,
+            instruction_throughput_utilization_percent: None,
+            integer_complex_utilization_percent: None,
+            integer_conditional_utilization_percent: None,
+            f32_utilization_percent: None,
+            temporary_register_count: pipeline_stats.map(|stats| stats.temporary_register_count),
+            uniform_register_count: pipeline_stats.map(|stats| stats.uniform_register_count),
+            spilled_bytes: pipeline_stats.map(|stats| stats.spilled_bytes),
+            threadgroup_memory: pipeline_stats.map(|stats| stats.threadgroup_memory),
+            instruction_count: pipeline_stats.map(|stats| stats.instruction_count),
+            alu_instruction_count: pipeline_stats.map(|stats| stats.alu_instruction_count),
+            branch_instruction_count: pipeline_stats.map(|stats| stats.branch_instruction_count),
+            compilation_time_ms: pipeline_stats.map(|stats| stats.compilation_time_ms),
+            metrics: BTreeMap::new(),
+            metric_metadata: BTreeMap::new(),
+        });
+    }
 }
 
 fn aps_counter_rows(
