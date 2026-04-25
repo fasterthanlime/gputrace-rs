@@ -75,6 +75,19 @@ pub struct CounterExportRow {
     pub branch_instruction_count: Option<i64>,
     pub compilation_time_ms: Option<f64>,
     pub metrics: BTreeMap<String, f64>,
+    pub metric_metadata: BTreeMap<String, CounterExportMetricMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CounterExportMetricMetadata {
+    pub key: String,
+    pub counter_type: Option<String>,
+    pub description: Option<String>,
+    pub unit: Option<String>,
+    pub groups: Vec<String>,
+    pub timeline_groups: Vec<String>,
+    pub visible: Option<bool>,
+    pub batch_filtered: Option<bool>,
 }
 
 pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
@@ -310,6 +323,7 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             branch_instruction_count: pipeline_stats.map(|stats| stats.branch_instruction_count),
             compilation_time_ms: pipeline_stats.map(|stats| stats.compilation_time_ms),
             metrics: row_metrics,
+            metric_metadata: BTreeMap::new(),
         });
     }
 
@@ -357,8 +371,21 @@ fn aps_counter_rows(
     let mut rows = Vec::new();
     for (row_index, group) in groups_by_row {
         let mut metrics = BTreeMap::new();
+        let mut metric_metadata = BTreeMap::new();
         for metric in &group.derived_metrics {
             insert_metric(&mut metrics, &metric.name, metric.value);
+            metric_metadata
+                .entry(metric.name.clone())
+                .or_insert_with(|| CounterExportMetricMetadata {
+                    key: metric.key.clone(),
+                    counter_type: metric.counter_type.clone(),
+                    description: metric.description.clone(),
+                    unit: metric.unit.clone(),
+                    groups: metric.groups.clone(),
+                    timeline_groups: metric.timeline_groups.clone(),
+                    visible: metric.visible,
+                    batch_filtered: metric.batch_filtered,
+                });
         }
 
         let sample_index = group
@@ -512,6 +539,7 @@ fn aps_counter_rows(
             branch_instruction_count: None,
             compilation_time_ms: None,
             metrics,
+            metric_metadata,
         });
     }
     Some(rows)
@@ -1173,6 +1201,7 @@ mod tests {
                 branch_instruction_count: Some(20),
                 compilation_time_ms: Some(1.2),
                 metrics: BTreeMap::new(),
+                metric_metadata: BTreeMap::new(),
             }],
         };
 

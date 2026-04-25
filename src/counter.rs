@@ -142,6 +142,11 @@ pub struct RawCounterDerivedCounterMatch {
     pub name: String,
     pub counter_type: Option<String>,
     pub description: Option<String>,
+    pub unit: Option<String>,
+    pub groups: Vec<String>,
+    pub timeline_groups: Vec<String>,
+    pub visible: Option<bool>,
+    pub batch_filtered: Option<bool>,
     pub sources: Vec<PathBuf>,
 }
 
@@ -159,6 +164,11 @@ pub struct RawCounterJsDerivedMetric {
     pub name: String,
     pub counter_type: Option<String>,
     pub description: Option<String>,
+    pub unit: Option<String>,
+    pub groups: Vec<String>,
+    pub timeline_groups: Vec<String>,
+    pub visible: Option<bool>,
+    pub batch_filtered: Option<bool>,
     pub value: f64,
     pub source_script: PathBuf,
     pub source_catalog: PathBuf,
@@ -1182,6 +1192,11 @@ struct RawCounterDerivedCounterMatchKey {
     name: String,
     counter_type: Option<String>,
     description: Option<String>,
+    unit: Option<String>,
+    groups: Vec<String>,
+    timeline_groups: Vec<String>,
+    visible: Option<bool>,
+    batch_filtered: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1197,8 +1212,43 @@ struct RawCounterDerivedDefinition {
     name: String,
     counter_type: Option<String>,
     description: Option<String>,
+    raw_counters: Vec<String>,
+    unit: Option<String>,
+    groups: Vec<String>,
+    timeline_groups: Vec<String>,
+    visible: Option<bool>,
+    batch_filtered: Option<bool>,
     source_catalog: PathBuf,
     source_script: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RawCounterGraphCatalog {
+    entries: BTreeMap<String, RawCounterGraphEntry>,
+    aliases: BTreeMap<String, String>,
+    groups_by_counter: BTreeMap<String, BTreeSet<String>>,
+    timeline_groups_by_counter: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RawCounterGraphEntry {
+    key: String,
+    name: String,
+    description: Option<String>,
+    unit: Option<String>,
+    vendor_counters: Vec<String>,
+    visible: Option<bool>,
+    batch_filtered: Option<bool>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RawCounterGraphMetadata {
+    description: Option<String>,
+    unit: Option<String>,
+    groups: Vec<String>,
+    timeline_groups: Vec<String>,
+    visible: Option<bool>,
+    batch_filtered: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -1212,6 +1262,7 @@ fn load_agx_counter_catalog() -> RawCounterCatalog {
     let mut statistics_files = Vec::new();
     let mut perf_files = Vec::new();
     let mut derived_script_files = Vec::new();
+    let graph_catalog = load_gpu_counter_graph_catalog();
     collect_agx_counter_catalog_files(
         Path::new("/System/Library/Extensions"),
         &mut statistics_files,
@@ -1233,6 +1284,7 @@ fn load_agx_counter_catalog() -> RawCounterCatalog {
         add_statistics_counter_catalog(
             &path,
             script_path.as_deref(),
+            &graph_catalog,
             &mut derived,
             &mut derived_definitions,
         );
@@ -1255,6 +1307,11 @@ fn load_agx_counter_catalog() -> RawCounterCatalog {
                         name: key.name,
                         counter_type: key.counter_type,
                         description: key.description,
+                        unit: key.unit,
+                        groups: key.groups,
+                        timeline_groups: key.timeline_groups,
+                        visible: key.visible,
+                        batch_filtered: key.batch_filtered,
                         sources: sources.into_iter().collect(),
                     })
                     .collect();
@@ -1317,9 +1374,149 @@ fn collect_agx_counter_catalog_files(
     }
 }
 
+fn load_gpu_counter_graph_catalog() -> RawCounterGraphCatalog {
+    let mut catalog = RawCounterGraphCatalog::default();
+    for path in gpu_counter_graph_paths() {
+        add_gpu_counter_graph_catalog(&path, &mut catalog);
+    }
+    catalog
+}
+
+fn gpu_counter_graph_paths() -> Vec<PathBuf> {
+    [
+        "/Applications/Xcode.app/Contents/PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/Versions/A/Resources/GPUCounterGraph.plist",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+fn add_gpu_counter_graph_catalog(path: &Path, catalog: &mut RawCounterGraphCatalog) {
+    let Ok(value) = Value::from_file(path) else {
+        return;
+    };
+    let Some(root) = value.as_dictionary() else {
+        return;
+    };
+
+    if let Some(groups) = root.get("groups").and_then(Value::as_array) {
+        add_gpu_counter_graph_groups(groups, &mut catalog.groups_by_counter);
+    }
+    if let Some(groups) = root.get("timelineGroups").and_then(Value::as_array) {
+        add_gpu_counter_graph_groups(groups, &mut catalog.timeline_groups_by_counter);
+    }
+
+    let Some(counters) = root.get("counters").and_then(Value::as_dictionary) else {
+        return;
+    };
+    for (key, value) in counters {
+        let Some(counter) = value.as_dictionary() else {
+            continue;
+        };
+        let name = counter
+            .get("name")
+            .and_then(Value::as_string)
+            .unwrap_or(key)
+            .to_owned();
+        let vendor_counters = counter
+            .get("vendorCounters")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_string)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let entry = RawCounterGraphEntry {
+            key: key.clone(),
+            name: name.clone(),
+            description: counter
+                .get("description")
+                .and_then(Value::as_string)
+                .map(str::to_owned),
+            unit: counter
+                .get("unit")
+                .and_then(Value::as_string)
+                .map(str::to_owned),
+            vendor_counters,
+            visible: counter.get("visible").and_then(plist_bool),
+            batch_filtered: counter.get("batchfiltered").and_then(plist_bool),
+        };
+        catalog.aliases.insert(key.clone(), key.clone());
+        catalog.aliases.insert(name.clone(), key.clone());
+        for vendor_counter in &entry.vendor_counters {
+            catalog.aliases.insert(vendor_counter.clone(), key.clone());
+        }
+        catalog.entries.insert(key.clone(), entry);
+    }
+}
+
+fn add_gpu_counter_graph_groups(
+    groups: &[Value],
+    groups_by_counter: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    for group in groups {
+        let Some(group) = group.as_dictionary() else {
+            continue;
+        };
+        let Some(name) = group.get("name").and_then(Value::as_string) else {
+            continue;
+        };
+        let Some(counters) = group.get("counters").and_then(Value::as_array) else {
+            continue;
+        };
+        for counter in counters.iter().filter_map(Value::as_string) {
+            groups_by_counter
+                .entry(counter.to_owned())
+                .or_default()
+                .insert(name.to_owned());
+        }
+    }
+}
+
+impl RawCounterGraphCatalog {
+    fn metadata_for(&self, key: &str, name: &str) -> RawCounterGraphMetadata {
+        let entry_key = self
+            .aliases
+            .get(key)
+            .or_else(|| self.aliases.get(name))
+            .cloned();
+        let entry = entry_key
+            .as_deref()
+            .and_then(|entry_key| self.entries.get(entry_key));
+
+        let mut groups = BTreeSet::new();
+        let mut timeline_groups = BTreeSet::new();
+        for candidate in [key, name]
+            .into_iter()
+            .chain(entry.iter().flat_map(|entry| {
+                std::iter::once(entry.key.as_str())
+                    .chain(std::iter::once(entry.name.as_str()))
+                    .chain(entry.vendor_counters.iter().map(String::as_str))
+            }))
+        {
+            if let Some(values) = self.groups_by_counter.get(candidate) {
+                groups.extend(values.iter().cloned());
+            }
+            if let Some(values) = self.timeline_groups_by_counter.get(candidate) {
+                timeline_groups.extend(values.iter().cloned());
+            }
+        }
+
+        RawCounterGraphMetadata {
+            description: entry.and_then(|entry| entry.description.clone()),
+            unit: entry.and_then(|entry| entry.unit.clone()),
+            groups: groups.into_iter().collect(),
+            timeline_groups: timeline_groups.into_iter().collect(),
+            visible: entry.and_then(|entry| entry.visible),
+            batch_filtered: entry.and_then(|entry| entry.batch_filtered),
+        }
+    }
+}
+
 fn add_statistics_counter_catalog(
     path: &Path,
     script_path: Option<&Path>,
+    graph_catalog: &RawCounterGraphCatalog,
     derived: &mut BTreeMap<String, BTreeMap<RawCounterDerivedCounterMatchKey, BTreeSet<PathBuf>>>,
     derived_definitions: &mut BTreeSet<RawCounterDerivedDefinition>,
 ) {
@@ -1340,6 +1537,11 @@ fn add_statistics_counter_catalog(
         let Some(raw_hashes) = counter.get("counters").and_then(Value::as_array) else {
             continue;
         };
+        let raw_hashes = raw_hashes
+            .iter()
+            .filter_map(Value::as_string)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         let name = counter
             .get("name")
             .and_then(Value::as_string)
@@ -1353,23 +1555,36 @@ fn add_statistics_counter_catalog(
             .get("description")
             .and_then(Value::as_string)
             .map(str::to_owned);
+        let graph = graph_catalog.metadata_for(key, &name);
+        let description = description.or(graph.description);
         let match_key = RawCounterDerivedCounterMatchKey {
             key: key.clone(),
             name: name.clone(),
             counter_type: counter_type.clone(),
             description: description.clone(),
+            unit: graph.unit.clone(),
+            groups: graph.groups.clone(),
+            timeline_groups: graph.timeline_groups.clone(),
+            visible: graph.visible,
+            batch_filtered: graph.batch_filtered,
         };
         derived_definitions.insert(RawCounterDerivedDefinition {
             key: key.clone(),
             name,
             counter_type,
             description,
+            raw_counters: raw_hashes.clone(),
+            unit: graph.unit,
+            groups: graph.groups,
+            timeline_groups: graph.timeline_groups,
+            visible: graph.visible,
+            batch_filtered: graph.batch_filtered,
             source_catalog: path.to_path_buf(),
             source_script: script_path.map(Path::to_path_buf),
         });
-        for raw_hash in raw_hashes.iter().filter_map(Value::as_string) {
+        for raw_hash in raw_hashes {
             derived
-                .entry(raw_hash.to_owned())
+                .entry(raw_hash)
                 .or_default()
                 .entry(match_key.clone())
                 .or_default()
@@ -1395,7 +1610,7 @@ fn evaluate_agx_derived_metrics(
         return Vec::new();
     }
 
-    let Some(script) = load_agx_derived_script(catalog, device_identifier) else {
+    let Some(script) = load_agx_derived_script(catalog, device_identifier, Some(variables)) else {
         return Vec::new();
     };
     evaluate_loaded_agx_derived_metrics(&script, variables)
@@ -1404,6 +1619,7 @@ fn evaluate_agx_derived_metrics(
 fn load_agx_derived_script(
     catalog: &RawCounterCatalog,
     device_identifier: Option<&str>,
+    variables: Option<&BTreeMap<String, f64>>,
 ) -> Option<RawCounterLoadedDerivedScript> {
     let definitions_by_script = catalog
         .derived_definitions
@@ -1423,7 +1639,7 @@ fn load_agx_derived_script(
         );
 
     let (script_path, definitions) =
-        choose_agx_derived_script(definitions_by_script, device_identifier)?;
+        choose_agx_derived_script(definitions_by_script, device_identifier, variables)?;
     let Ok(script_source) = fs::read_to_string(&script_path) else {
         return None;
     };
@@ -1461,12 +1677,11 @@ fn evaluate_agx_derived_metric_groups(
     groups: Vec<RawCounterJsVariableGroup>,
     device_identifier: Option<&str>,
 ) -> Vec<RawCounterJsDerivedMetricGroup> {
-    let Some(script) = load_agx_derived_script(catalog, device_identifier) else {
-        return Vec::new();
-    };
     groups
         .into_iter()
         .filter_map(|group| {
+            let script =
+                load_agx_derived_script(catalog, device_identifier, Some(&group.variables))?;
             let metrics = evaluate_loaded_agx_derived_metrics(&script, &group.variables);
             (!metrics.is_empty()).then_some(RawCounterJsDerivedMetricGroup {
                 group_kind: group.group_kind,
@@ -1497,14 +1712,16 @@ fn evaluate_agx_derived_metric_groups(
 fn choose_agx_derived_script(
     definitions_by_script: BTreeMap<PathBuf, Vec<RawCounterDerivedDefinition>>,
     device_identifier: Option<&str>,
+    variables: Option<&BTreeMap<String, f64>>,
 ) -> Option<(PathBuf, Vec<RawCounterDerivedDefinition>)> {
     definitions_by_script.into_iter().max_by(
         |(left_path, left_definitions), (right_path, right_definitions)| {
-            agx_derived_script_score(left_path, left_definitions, device_identifier)
+            agx_derived_script_score(left_path, left_definitions, device_identifier, variables)
                 .cmp(&agx_derived_script_score(
                     right_path,
                     right_definitions,
                     device_identifier,
+                    variables,
                 ))
                 .then_with(|| right_path.cmp(left_path))
         },
@@ -1515,13 +1732,31 @@ fn agx_derived_script_score(
     path: &Path,
     definitions: &[RawCounterDerivedDefinition],
     device_identifier: Option<&str>,
-) -> (u8, u8, usize) {
+    variables: Option<&BTreeMap<String, f64>>,
+) -> (usize, u8, u8, usize) {
     let stem = agx_statistics_stem(path).unwrap_or_default();
+    let raw_hash_overlap = variables
+        .map(|variables| {
+            definitions
+                .iter()
+                .flat_map(|definition| definition.raw_counters.iter())
+                .filter(|raw_counter| {
+                    variables.contains_key(raw_counter.as_str())
+                        || variables.contains_key(format!("{raw_counter}_norm").as_str())
+                })
+                .count()
+        })
+        .unwrap_or_default();
     let direct_match = device_identifier
         .filter(|identifier| stem.contains(identifier) || identifier.contains(&stem))
         .is_some() as u8;
     let compatibility = agx_derived_script_compatibility_rank(&stem, device_identifier);
-    (direct_match, compatibility, definitions.len())
+    (
+        raw_hash_overlap,
+        direct_match,
+        compatibility,
+        definitions.len(),
+    )
 }
 
 fn agx_derived_script_compatibility_rank(stem: &str, device_identifier: Option<&str>) -> u8 {
@@ -1608,6 +1843,11 @@ fn evaluate_agx_derived_script(
                 name: definition.name.clone(),
                 counter_type: definition.counter_type.clone(),
                 description: definition.description.clone(),
+                unit: definition.unit.clone(),
+                groups: definition.groups.clone(),
+                timeline_groups: definition.timeline_groups.clone(),
+                visible: definition.visible,
+                batch_filtered: definition.batch_filtered,
                 value,
                 source_script: script_path.to_path_buf(),
                 source_catalog: definition.source_catalog.clone(),
@@ -2367,6 +2607,13 @@ fn add_perf_counter_catalog(
 fn plist_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Integer(value) => value.as_unsigned(),
+        _ => None,
+    }
+}
+
+fn plist_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Boolean(value) => Some(*value),
         _ => None,
     }
 }
@@ -4633,6 +4880,11 @@ mod tests {
                         name: "Texture Cache Limiter".to_owned(),
                         counter_type: Some("Percentage".to_owned()),
                         description: None,
+                        unit: Some("%".to_owned()),
+                        groups: Vec::new(),
+                        timeline_groups: Vec::new(),
+                        visible: Some(true),
+                        batch_filtered: None,
                         sources: Vec::new(),
                     }],
                     hardware_selectors: Vec::new(),
@@ -4689,6 +4941,11 @@ mod tests {
                 name: "ALU Utilization".to_owned(),
                 counter_type: Some("Percentage".to_owned()),
                 description: None,
+                unit: Some("%".to_owned()),
+                groups: vec!["Performance Limiters".to_owned()],
+                timeline_groups: Vec::new(),
+                visible: Some(true),
+                batch_filtered: None,
                 sources: vec![PathBuf::from("AGXMetalStatisticsExternal-counters.plist")],
             }],
             hardware_selectors: vec![RawCounterHardwareSelector {
@@ -4728,6 +4985,12 @@ mod tests {
             name: "ALU Utilization".to_owned(),
             counter_type: Some("Percentage".to_owned()),
             description: None,
+            raw_counters: vec!["_hash".to_owned()],
+            unit: Some("%".to_owned()),
+            groups: Vec::new(),
+            timeline_groups: Vec::new(),
+            visible: Some(true),
+            batch_filtered: None,
             source_catalog: PathBuf::from("AGXMetalStatisticsExternalTest-counters.plist"),
             source_script: Some(PathBuf::from("AGXMetalStatisticsExternalTest-derived.js")),
         }];
@@ -4754,6 +5017,12 @@ mod tests {
                     name: "A".to_owned(),
                     counter_type: None,
                     description: None,
+                    raw_counters: Vec::new(),
+                    unit: None,
+                    groups: Vec::new(),
+                    timeline_groups: Vec::new(),
+                    visible: None,
+                    batch_filtered: None,
                     source_catalog: PathBuf::from("AGXMetalStatisticsExternalG14S-counters.plist"),
                     source_script: None,
                 }],
@@ -4765,17 +5034,74 @@ mod tests {
                     name: "B".to_owned(),
                     counter_type: None,
                     description: None,
+                    raw_counters: Vec::new(),
+                    unit: None,
+                    groups: Vec::new(),
+                    timeline_groups: Vec::new(),
+                    visible: None,
+                    batch_filtered: None,
                     source_catalog: PathBuf::from("AGXMetalStatisticsExternalG14D-counters.plist"),
                     source_script: None,
                 }],
             ),
         ]);
 
-        let (path, _) = choose_agx_derived_script(definitions_by_script, Some("G16X")).unwrap();
+        let (path, _) =
+            choose_agx_derived_script(definitions_by_script, Some("G16X"), None).unwrap();
 
         assert_eq!(
             path,
             PathBuf::from("AGXMetalStatisticsExternalG14D-derived.js")
+        );
+    }
+
+    #[test]
+    fn chooses_agx_derived_script_by_raw_hash_overlap() {
+        let definitions_by_script = BTreeMap::from([
+            (
+                PathBuf::from("AGXMetalStatisticsExternalG14D-derived.js"),
+                vec![RawCounterDerivedDefinition {
+                    key: "A".to_owned(),
+                    name: "A".to_owned(),
+                    counter_type: None,
+                    description: None,
+                    raw_counters: vec!["_missing".to_owned()],
+                    unit: None,
+                    groups: Vec::new(),
+                    timeline_groups: Vec::new(),
+                    visible: None,
+                    batch_filtered: None,
+                    source_catalog: PathBuf::from("AGXMetalStatisticsExternalG14D-counters.plist"),
+                    source_script: None,
+                }],
+            ),
+            (
+                PathBuf::from("AGXMetalStatisticsExternalG14G-derived.js"),
+                vec![RawCounterDerivedDefinition {
+                    key: "B".to_owned(),
+                    name: "B".to_owned(),
+                    counter_type: None,
+                    description: None,
+                    raw_counters: vec!["_present".to_owned()],
+                    unit: None,
+                    groups: Vec::new(),
+                    timeline_groups: Vec::new(),
+                    visible: None,
+                    batch_filtered: None,
+                    source_catalog: PathBuf::from("AGXMetalStatisticsExternalG14G-counters.plist"),
+                    source_script: None,
+                }],
+            ),
+        ]);
+        let variables = BTreeMap::from([("_present_norm".to_owned(), 1.0)]);
+
+        let (path, _) =
+            choose_agx_derived_script(definitions_by_script, Some("G16X"), Some(&variables))
+                .unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from("AGXMetalStatisticsExternalG14G-derived.js")
         );
     }
 
