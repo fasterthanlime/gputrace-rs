@@ -739,14 +739,14 @@ pub fn run() -> Result<()> {
                 }
             } else {
                 if !args.yes && !confirm_clear_buffers(&report)? {
-                    print!("Cancelled\n");
+                    println!("Cancelled");
                     return Ok(());
                 }
                 let run = clear_buffers::clear_report(&report)?;
                 match args.format.as_str() {
                     "text" | "table" => {
-                        print!(
-                            "Zeroed {} buffer files ({})\n",
+                        println!(
+                            "Zeroed {} buffer files ({})",
                             run.files_cleared,
                             clear_buffers::format_byte_size(run.bytes_cleared)
                         );
@@ -1007,10 +1007,10 @@ pub fn run() -> Result<()> {
                 print!("{}", timing::format_report(&report));
                 if args.verbose {
                     print!("\n=== Detailed Information ===\n");
-                    print!("Data Source: {}\n", trace.path.display());
-                    print!("Encoders with timing: {}\n", report.encoders.len());
-                    print!("Dispatches with timing: {}\n", report.dispatch_count);
-                    print!("Timing source: {}\n", report.source);
+                    println!("Data Source: {}", trace.path.display());
+                    println!("Encoders with timing: {}", report.encoders.len());
+                    println!("Dispatches with timing: {}", report.dispatch_count);
+                    println!("Timing source: {}", report.source);
                 }
             }
         }

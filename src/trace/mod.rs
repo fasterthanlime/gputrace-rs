@@ -576,8 +576,9 @@ fn collect_pipeline_mappings_from_data(
         if record.record_type != RecordType::Ctt {
             continue;
         }
-        let ctt = record.parse_ctt_record()?;
-        if let Some(label) = labels.get(&ctt.function_addr) {
+        if let Ok(ctt) = record.parse_ctt_record()
+            && let Some(label) = labels.get(&ctt.function_addr)
+        {
             result.insert(ctt.pipeline_addr, label.clone());
         }
     }
@@ -889,6 +890,33 @@ mod tests {
     }
 
     #[test]
+    fn skips_short_ctt_records_when_collecting_pipeline_mappings() {
+        let mut data = Vec::new();
+        let mut short_ctt = vec![0u8; 24];
+        short_ctt[0..4].copy_from_slice(&(24u32).to_le_bytes());
+        short_ctt[8..12].copy_from_slice(b"Ctt\0");
+        data.extend_from_slice(&short_ctt);
+
+        let mut full_ctt = vec![0u8; 64];
+        full_ctt[0..4].copy_from_slice(&(64u32).to_le_bytes());
+        full_ctt[8..12].copy_from_slice(b"Ctt\0");
+        full_ctt[20..28].copy_from_slice(&0x7000u64.to_le_bytes());
+        full_ctt[40..48].copy_from_slice(&0x9000u64.to_le_bytes());
+        data.extend_from_slice(&full_ctt);
+
+        let mut labels = BTreeMap::new();
+        labels.insert(0x7000, "kernel_main".to_owned());
+        let mut mappings = BTreeMap::new();
+
+        collect_pipeline_mappings_from_data(&data, &labels, &mut mappings).unwrap();
+
+        assert_eq!(
+            mappings.get(&0x9000).map(String::as_str),
+            Some("kernel_main")
+        );
+    }
+
+    #[test]
     fn builds_command_buffer_regions() {
         let command_buffers = vec![
             CommandBuffer {
@@ -969,7 +997,7 @@ mod tests {
         pipeline_map.insert(20, "kb".into());
 
         let regions = build_command_buffer_regions(
-            &vec![0; 100],
+            &[0; 100],
             command_buffers,
             encoders,
             pipeline_events,

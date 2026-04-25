@@ -234,6 +234,7 @@ pub fn format_kernels(report: &KernelReport, verbose: bool) -> String {
 pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
     let encoders = trace.compute_encoders()?;
     let regions = trace.command_buffer_regions()?;
+    let timing = timing::report(trace).ok();
     let mut dispatch_counts: BTreeMap<u64, usize> = BTreeMap::new();
     let mut command_buffer_sets: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
     let mut command_buffers = Vec::new();
@@ -272,6 +273,48 @@ pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
                 .map_or(0, BTreeSet::len),
         })
         .collect();
+    if entries.is_empty()
+        && let Some(timing) = &timing
+        && timing.dispatch_count > 0
+        && !timing.encoders.is_empty()
+    {
+        entries = timing
+            .encoders
+            .iter()
+            .enumerate()
+            .map(|(index, encoder)| EncoderEntry {
+                index,
+                label: encoder.label.clone(),
+                address: encoder.address,
+                dispatch_count: encoder.dispatch_count,
+                command_buffer_count: 0,
+            })
+            .collect();
+        command_buffers = timing
+            .command_buffers
+            .iter()
+            .map(|cb| CommandBufferEncoderSummary {
+                index: cb.index,
+                encoder_count: cb.encoder_count,
+                dispatch_count: cb.dispatch_count,
+            })
+            .collect();
+    }
+    if command_buffers
+        .iter()
+        .all(|command_buffer| command_buffer.dispatch_count == 0)
+        && let Some(timing) = &timing
+        && timing.dispatch_count > 0
+        && let Some(timing_cb) = timing
+            .command_buffers
+            .iter()
+            .min_by_key(|cb| duration_distance(cb.duration_ns, timing.total_duration_ns))
+        && let Some(summary) = command_buffers
+            .iter_mut()
+            .find(|summary| summary.index == timing_cb.index)
+    {
+        summary.dispatch_count = timing.dispatch_count;
+    }
     entries.sort_by(|left, right| left.index.cmp(&right.index));
 
     let command_buffer_count = command_buffers.len();
@@ -483,11 +526,24 @@ fn merge_hazards(existing: &str, new_hazard: &str) -> String {
     hazards.into_iter().collect::<Vec<_>>().join("/")
 }
 
+fn duration_distance(duration: Option<u64>, target: u64) -> u64 {
+    duration
+        .map(|duration| duration.abs_diff(target))
+        .unwrap_or(u64::MAX)
+}
+
 pub fn command_buffers(trace: &TraceBundle) -> Result<CommandBuffersReport> {
     let command_buffers = trace.command_buffers()?;
     let regions = trace.command_buffer_regions()?;
-    let timing = timing::report(trace)?;
-    let timing_by_index: BTreeMap<_, _> = timing
+    let timing_report = timing::report(trace)?;
+    let timing_dispatch_count = timing_report.dispatch_count;
+    let timing_total_duration_ns = timing_report.total_duration_ns;
+    let timing_kernels = timing_report
+        .kernels
+        .iter()
+        .map(|kernel| kernel.name.clone())
+        .collect::<Vec<_>>();
+    let timing_by_index: BTreeMap<_, _> = timing_report
         .command_buffers
         .into_iter()
         .map(|cb| (cb.index, cb))
@@ -528,6 +584,16 @@ pub fn command_buffers(trace: &TraceBundle) -> Result<CommandBuffersReport> {
     }
 
     let total_command_buffers = entries.len();
+    if total_dispatches == 0 && timing_dispatch_count > 0 {
+        total_dispatches = timing_dispatch_count;
+        if let Some(entry) = entries
+            .iter_mut()
+            .min_by_key(|entry| duration_distance(entry.duration_ns, timing_total_duration_ns))
+        {
+            entry.dispatch_count = timing_dispatch_count;
+            entry.kernels = timing_kernels;
+        }
+    }
     let average_encoders_per_buffer = if total_command_buffers == 0 {
         0.0
     } else {

@@ -777,7 +777,7 @@ fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|left, right| left.total_cmp(right));
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
         sorted[mid]
@@ -1469,11 +1469,11 @@ fn classify_file(name: &str) -> String {
     }
 }
 
-fn object<'a>(objects: &'a [Value], uid: Uid) -> Option<&'a Value> {
+fn object(objects: &[Value], uid: Uid) -> Option<&Value> {
     objects.get(uid.get() as usize)
 }
 
-fn object_dictionary<'a>(objects: &'a [Value], uid: Uid) -> Option<&'a Dictionary> {
+fn object_dictionary(objects: &[Value], uid: Uid) -> Option<&Dictionary> {
     object(objects, uid).and_then(Value::as_dictionary)
 }
 

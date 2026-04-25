@@ -35,7 +35,13 @@ const K_AX_VALUE_CGPOINT: c_int = 1;
 const K_AX_VALUE_CGSIZE: c_int = 2;
 const K_CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
 const K_CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
+const K_CG_EVENT_KEY_DOWN: u32 = 10;
+const K_CG_EVENT_KEY_UP: u32 = 11;
 const K_CG_HID_EVENT_TAP: u32 = 0;
+const K_CG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
+const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
+const K_VK_G: u16 = 0x05;
+const K_VK_RETURN: u16 = 0x24;
 const EXPORT_SHEET_SEARCH_LIMIT: usize = 60_000;
 
 #[repr(C)]
@@ -96,6 +102,12 @@ unsafe extern "C" {
         mouse_cursor_position: CGPoint,
         mouse_button: u32,
     ) -> CGEventRef;
+    fn CGEventCreateKeyboardEvent(
+        source: CFTypeRef,
+        virtual_key: u16,
+        key_down: Boolean,
+    ) -> CGEventRef;
+    fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventPost(tap: u32, event: CGEventRef);
 }
 
@@ -281,9 +293,7 @@ pub fn check_accessibility_permissions(prompt: bool) -> Result<XcodePermissionRe
     let xcode_running = is_xcode_running()?;
     let accessibility_granted = unsafe { AXIsProcessTrusted() } != 0;
     let xcode_probe_ok = if accessibility_granted && xcode_running {
-        app()
-            .and_then(|app| Ok(!windows(&app).is_empty()))
-            .unwrap_or(false)
+        app().map(|app| !windows(&app).is_empty()).unwrap_or(false)
     } else {
         accessibility_granted
     };
@@ -481,7 +491,7 @@ pub fn click_button(trace_path: Option<&Path>, button_names: &[&str]) -> Result<
         )));
     }
     let target = button.label();
-    press(&button, Some(&window))?;
+    press(button, Some(&window))?;
     Ok(XcodeActionResult {
         window_title,
         action: "click-button".to_owned(),
@@ -499,7 +509,7 @@ pub fn select_tab(trace_path: Option<&Path>, tab_name: &str) -> Result<XcodeActi
     if let Some(tab) = elements.iter().find(|el| {
         is_tab_role(&el.role(), el.subrole().as_deref()) && normalize(&el.label()) == name
     }) {
-        press(&tab, Some(&window))?;
+        press(tab, Some(&window))?;
         return Ok(XcodeActionResult {
             window_title,
             action: "select-tab".to_owned(),
@@ -701,13 +711,13 @@ pub fn finish_export_sheet(
         thread::sleep(Duration::from_millis(200));
     }
 
+    let _ = navigate_to_parent_best_effort(&window, &sheet, parent);
+
     let output_name = file_name.to_string_lossy();
     if let Some(field) = find_save_as_field(&sheet) {
         field.set_string_value(&output_name)?;
         let _ = field.perform("AXConfirm");
     }
-
-    let _ = navigate_to_parent_best_effort(&sheet, parent);
 
     let Some(button) = find_save_button(&sheet, EXPORT_SHEET_SEARCH_LIMIT) else {
         return Err(Error::InvalidInput(
@@ -971,10 +981,14 @@ fn find_save_as_field(root: &AxElement) -> Option<AxElement> {
     })
 }
 
-fn navigate_to_parent_best_effort(window: &AxElement, parent: &Path) -> Result<()> {
+fn navigate_to_parent_best_effort(
+    window: &AxElement,
+    sheet: &AxElement,
+    parent: &Path,
+) -> Result<()> {
     std::fs::create_dir_all(parent)?;
     let parent = parent.to_string_lossy();
-    if let Some(path_field) = find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, |el| {
+    if let Some(path_field) = find_descendant(sheet, EXPORT_SHEET_SEARCH_LIMIT, |el| {
         matches!(el.role().as_str(), "AXTextField" | "AXComboBox")
             && (el.string_attr("AXIdentifier") == "PathTextField"
                 || normalize(&el.string_attr("AXDescription")).contains("path")
@@ -982,6 +996,44 @@ fn navigate_to_parent_best_effort(window: &AxElement, parent: &Path) -> Result<(
     }) {
         let _ = path_field.set_string_value(&parent);
         let _ = path_field.perform("AXConfirm");
+        thread::sleep(Duration::from_millis(250));
+        return Ok(());
+    }
+
+    let _ = activate_xcode();
+    let _ = window.perform("AXRaise");
+    post_key(
+        K_VK_G,
+        K_CG_EVENT_FLAG_MASK_COMMAND | K_CG_EVENT_FLAG_MASK_SHIFT,
+    )?;
+    thread::sleep(Duration::from_millis(300));
+
+    let Some(go_field) = find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, |el| {
+        matches!(el.role().as_str(), "AXTextField" | "AXComboBox")
+            && (normalize(&el.string_attr("AXDescription")).contains("go to")
+                || normalize(&el.string_attr("AXDescription")).contains("folder")
+                || normalize(&el.title()).contains("go to"))
+    })
+    .or_else(|| {
+        find_descendant(sheet, EXPORT_SHEET_SEARCH_LIMIT, |el| {
+            matches!(el.role().as_str(), "AXTextField" | "AXComboBox")
+                && (normalize(&el.string_attr("AXDescription")).contains("go to")
+                    || normalize(&el.string_attr("AXDescription")).contains("folder")
+                    || normalize(&el.title()).contains("go to"))
+        })
+    }) else {
+        return Ok(());
+    };
+
+    go_field.set_string_value(&parent)?;
+    let _ = go_field.perform("AXConfirm");
+    post_key(K_VK_RETURN, 0)?;
+    thread::sleep(Duration::from_millis(500));
+    if let Some(choose) = find_button(window, "Go", EXPORT_SHEET_SEARCH_LIMIT)
+        .or_else(|| find_button(window, "Choose", EXPORT_SHEET_SEARCH_LIMIT))
+        .filter(AxElement::enabled)
+    {
+        let _ = press(&choose, Some(window));
     }
     Ok(())
 }
@@ -1247,6 +1299,32 @@ fn click_element(el: &AxElement) -> bool {
         CFRelease(up);
     }
     true
+}
+
+fn post_key(key_code: u16, flags: u64) -> Result<()> {
+    unsafe {
+        let down = CGEventCreateKeyboardEvent(std::ptr::null(), key_code, 1);
+        let up = CGEventCreateKeyboardEvent(std::ptr::null(), key_code, 0);
+        if down.is_null() || up.is_null() {
+            if !down.is_null() {
+                CFRelease(down);
+            }
+            if !up.is_null() {
+                CFRelease(up);
+            }
+            return Err(Error::InvalidInput(
+                "failed to create keyboard event".to_owned(),
+            ));
+        }
+        CGEventSetFlags(down, flags);
+        CGEventSetFlags(up, flags);
+        CGEventPost(K_CG_HID_EVENT_TAP, down);
+        thread::sleep(Duration::from_millis(40));
+        CGEventPost(K_CG_HID_EVENT_TAP, up);
+        CFRelease(down);
+        CFRelease(up);
+    }
+    Ok(())
 }
 
 fn ax_ok(err: AXError, operation: &str) -> Result<()> {

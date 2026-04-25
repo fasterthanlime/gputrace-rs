@@ -85,6 +85,14 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
                 "Inventory aliases",
                 report.buffer_inventory_aliases.to_string(),
             ),
+            (
+                "Unused resource entries",
+                report.unused_resource_count.to_string(),
+            ),
+            (
+                "Unused logical bytes",
+                report.unused_resource_bytes.to_string(),
+            ),
         ],
     );
     if report.findings.is_empty() {
@@ -171,6 +179,22 @@ pub fn analysis_report(report: &AnalysisReport) -> String {
                 format!(
                     "- `{}`: {} bytes, {} aliases, {} bindings\n",
                     buffer.filename, buffer.size, buffer.alias_count, buffer.binding_count
+                )
+            }),
+            10,
+        );
+    }
+    if !report.unused_resource_groups.is_empty() {
+        push_section(
+            &mut out,
+            "Unused Resource Groups",
+            report.unused_resource_groups.iter().map(|group| {
+                format!(
+                    "- `{}`: {} entries, {} logical bytes, samples: {}\n",
+                    group.label,
+                    group.count,
+                    group.logical_bytes,
+                    group.sample_buffers.join(", ")
                 )
             }),
             10,
@@ -598,6 +622,8 @@ mod tests {
             buffer_inventory_count: 2,
             buffer_inventory_bytes: 4096,
             buffer_inventory_aliases: 1,
+            unused_resource_count: 3,
+            unused_resource_bytes: 2048,
             kernel_stats: (0..11)
                 .map(|index| KernelStat {
                     name: format!("kernel_{index}"),
@@ -643,6 +669,12 @@ mod tests {
                 alias_count: 1,
                 binding_count: 2,
             }],
+            unused_resource_groups: vec![crate::analysis::UnusedResourceGroupSummary {
+                label: "attention.mask".into(),
+                count: 2,
+                logical_bytes: 2048,
+                sample_buffers: vec!["MTLBuffer-1-0".into()],
+            }],
             findings: vec!["top level summary".into()],
         };
 
@@ -652,6 +684,7 @@ mod tests {
         assert!(rendered.contains("## Buffer Summary"));
         assert!(rendered.contains("## Findings"));
         assert!(rendered.contains("## Kernel Timing"));
+        assert!(rendered.contains("## Unused Resource Groups"));
         assert!(rendered.contains("_Showing 10 of 11 entries._"));
         assert!(rendered.contains("- `kernel_0`: 1 dispatches, 0 buffers"));
     }
@@ -685,11 +718,14 @@ mod tests {
             buffer_inventory_count: 0,
             buffer_inventory_bytes: 0,
             buffer_inventory_aliases: 0,
+            unused_resource_count: 0,
+            unused_resource_bytes: 0,
             kernel_stats: vec![],
             timed_kernel_stats: vec![],
             buffer_stats: vec![],
             buffer_lifecycles: vec![],
             largest_buffers: vec![],
+            unused_resource_groups: vec![],
             findings: vec![],
         };
         let report = DiffReport {

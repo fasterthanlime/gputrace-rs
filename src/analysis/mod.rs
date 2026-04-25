@@ -23,11 +23,14 @@ pub struct AnalysisReport {
     pub buffer_inventory_count: usize,
     pub buffer_inventory_bytes: u64,
     pub buffer_inventory_aliases: usize,
+    pub unused_resource_count: usize,
+    pub unused_resource_bytes: u64,
     pub kernel_stats: Vec<KernelStat>,
     pub timed_kernel_stats: Vec<TimedKernelStat>,
     pub buffer_stats: Vec<BufferStat>,
     pub buffer_lifecycles: Vec<BufferLifecycle>,
     pub largest_buffers: Vec<InventoryBuffer>,
+    pub unused_resource_groups: Vec<UnusedResourceGroupSummary>,
     pub findings: Vec<String>,
 }
 
@@ -73,6 +76,14 @@ pub struct InventoryBuffer {
     pub size: u64,
     pub alias_count: usize,
     pub binding_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnusedResourceGroupSummary {
+    pub label: String,
+    pub count: usize,
+    pub logical_bytes: u64,
+    pub sample_buffers: Vec<String>,
 }
 
 pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
@@ -181,6 +192,23 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
                 .collect()
         })
         .unwrap_or_default();
+    let unused_resource_groups = inventory
+        .as_ref()
+        .map(|inventory| {
+            inventory
+                .unused_resources
+                .groups
+                .iter()
+                .take(10)
+                .map(|group| UnusedResourceGroupSummary {
+                    label: group.label.clone(),
+                    count: group.count,
+                    logical_bytes: group.logical_bytes,
+                    sample_buffers: group.sample_buffers.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut findings = Vec::new();
 
     if summary.device_resource_count == 0 {
@@ -284,6 +312,12 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
             "Bundle buffer inventory: {} files, {} bytes, {} aliases.",
             inventory.total_buffers, inventory.total_bytes, inventory.total_aliases
         ));
+        if buffer_stats.is_empty() && inventory.total_buffers > 0 {
+            findings.push(
+                "Structural buffer attribution is unavailable for this bundle; reporting backing-file inventory instead."
+                    .to_owned(),
+            );
+        }
         if let Some(largest) = inventory.buffers.first() {
             findings.push(format!(
                 "Largest backing buffer: {} ({} bytes, {} aliases, {} bindings)",
@@ -291,6 +325,19 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
                 largest.size,
                 largest.aliases.len(),
                 largest.binding_count
+            ));
+        }
+        if inventory.unused_resources.total_entries > 0 {
+            findings.push(format!(
+                "Unused resource sidecars: {} entries, {} logical bytes.",
+                inventory.unused_resources.total_entries,
+                inventory.unused_resources.total_logical_bytes
+            ));
+        }
+        if let Some(group) = inventory.unused_resources.groups.first() {
+            findings.push(format!(
+                "Top unused resource group: {} ({} entries, {} logical bytes)",
+                group.label, group.count, group.logical_bytes
             ));
         }
     }
@@ -319,11 +366,18 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
         buffer_inventory_count: inventory.as_ref().map_or(0, |inv| inv.total_buffers),
         buffer_inventory_bytes: inventory.as_ref().map_or(0, |inv| inv.total_bytes),
         buffer_inventory_aliases: inventory.as_ref().map_or(0, |inv| inv.total_aliases),
+        unused_resource_count: inventory
+            .as_ref()
+            .map_or(0, |inv| inv.unused_resources.total_entries),
+        unused_resource_bytes: inventory
+            .as_ref()
+            .map_or(0, |inv| inv.unused_resources.total_logical_bytes),
         kernel_stats,
         timed_kernel_stats,
         buffer_stats,
         buffer_lifecycles,
         largest_buffers,
+        unused_resource_groups,
         findings,
     }
 }

@@ -108,16 +108,17 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
         }
     }
 
-    if profiler_summary.is_none() {
-        if let Some(shader_report) = &shader_report {
-            if let Some(top_shader) = shader_report
-                .shaders
-                .iter()
-                .find(|shader| shader.weighted_percent_of_total.is_some())
-            {
-                let weight_percent = top_shader.weighted_percent_of_total.unwrap_or_default();
-                if weight_percent > 50.0 {
-                    insights.push(PerformanceInsight {
+    if profiler_summary.is_none()
+        && let Some(shader_report) = &shader_report
+    {
+        if let Some(top_shader) = shader_report
+            .shaders
+            .iter()
+            .find(|shader| shader.weighted_percent_of_total.is_some())
+        {
+            let weight_percent = top_shader.weighted_percent_of_total.unwrap_or_default();
+            if weight_percent > 50.0 {
+                insights.push(PerformanceInsight {
                         insight_type: InsightType::Bottleneck,
                         severity: InsightSeverity::High,
                         shader_name: Some(top_shader.name.clone()),
@@ -137,14 +138,14 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                                 .to_owned(),
                         ),
                     });
-                }
             }
+        }
 
-            for shader in &shader_report.shaders {
-                if let Some(occupancy) = shader.occupancy_percent
-                    && occupancy < 30.0
-                {
-                    insights.push(PerformanceInsight {
+        for shader in &shader_report.shaders {
+            if let Some(occupancy) = shader.occupancy_percent
+                && occupancy < 30.0
+            {
+                insights.push(PerformanceInsight {
                         insight_type: InsightType::Optimization,
                         severity: if occupancy < 15.0 {
                             InsightSeverity::High
@@ -168,37 +169,36 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                                 .to_owned(),
                         ),
                     });
-                }
+            }
 
-                if let Some(alu) = shader.alu_utilization_percent
-                    && alu > 70.0
-                {
-                    insights.push(PerformanceInsight {
-                        insight_type: InsightType::Info,
-                        severity: InsightSeverity::Medium,
-                        shader_name: Some(shader.name.clone()),
-                        title: format!("{} is ALU-heavy", shader.name),
-                        description: format!(
-                            "{} shows {:.1}% ALU utilization from imported Xcode counters.",
-                            shader.name, alu
-                        ),
-                        recommendations: vec![
-                            "Look for approximation opportunities and repeated math on hot lines."
-                                .to_owned(),
-                            "Use `shader-hotspots` to inspect compute-heavy source regions."
-                                .to_owned(),
-                        ],
-                        impact: Some(
-                            "Suggests arithmetic pressure even when raw profiler data is unavailable."
-                                .to_owned(),
-                        ),
-                    });
-                }
+            if let Some(alu) = shader.alu_utilization_percent
+                && alu > 70.0
+            {
+                insights.push(PerformanceInsight {
+                    insight_type: InsightType::Info,
+                    severity: InsightSeverity::Medium,
+                    shader_name: Some(shader.name.clone()),
+                    title: format!("{} is ALU-heavy", shader.name),
+                    description: format!(
+                        "{} shows {:.1}% ALU utilization from imported Xcode counters.",
+                        shader.name, alu
+                    ),
+                    recommendations: vec![
+                        "Look for approximation opportunities and repeated math on hot lines."
+                            .to_owned(),
+                        "Use `shader-hotspots` to inspect compute-heavy source regions.".to_owned(),
+                    ],
+                    impact: Some(
+                        "Suggests arithmetic pressure even when raw profiler data is unavailable."
+                            .to_owned(),
+                    ),
+                });
+            }
 
-                if let Some(dev_bw) = shader.device_memory_bandwidth_gbps
-                    && dev_bw >= 10.0
-                {
-                    insights.push(PerformanceInsight {
+            if let Some(dev_bw) = shader.device_memory_bandwidth_gbps
+                && dev_bw >= 10.0
+            {
+                insights.push(PerformanceInsight {
                         insight_type: InsightType::Optimization,
                         severity: InsightSeverity::Medium,
                         shader_name: Some(shader.name.clone()),
@@ -216,12 +216,12 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                                 .to_owned(),
                         ),
                     });
-                }
+            }
 
-                if let Some(gpu_read_bw) = shader.gpu_read_bandwidth_gbps
-                    && gpu_read_bw >= 8.0
-                {
-                    insights.push(PerformanceInsight {
+            if let Some(gpu_read_bw) = shader.gpu_read_bandwidth_gbps
+                && gpu_read_bw >= 8.0
+            {
+                insights.push(PerformanceInsight {
                         insight_type: InsightType::Optimization,
                         severity: InsightSeverity::Medium,
                         shader_name: Some(shader.name.clone()),
@@ -241,12 +241,12 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                                 .to_owned(),
                         ),
                     });
-                }
+            }
 
-                if let Some(l1_miss_rate) = shader.buffer_l1_miss_rate_percent
-                    && l1_miss_rate >= 10.0
-                {
-                    insights.push(PerformanceInsight {
+            if let Some(l1_miss_rate) = shader.buffer_l1_miss_rate_percent
+                && l1_miss_rate >= 10.0
+            {
+                insights.push(PerformanceInsight {
                         insight_type: InsightType::Optimization,
                         severity: InsightSeverity::Medium,
                         shader_name: Some(shader.name.clone()),
@@ -266,16 +266,16 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                                 .to_owned(),
                         ),
                     });
-                }
+            }
 
-                if let Some(miss_rate) = shader
-                    .metric_source
-                    .eq("xcode-weighted")
-                    .then_some(shader.last_level_cache_percent)
-                    .flatten()
-                    && miss_rate >= 5.0
-                {
-                    insights.push(PerformanceInsight {
+            if let Some(miss_rate) = shader
+                .metric_source
+                .eq("xcode-weighted")
+                .then_some(shader.last_level_cache_percent)
+                .flatten()
+                && miss_rate >= 5.0
+            {
+                insights.push(PerformanceInsight {
                         insight_type: InsightType::Optimization,
                         severity: InsightSeverity::Low,
                         shader_name: Some(shader.name.clone()),
@@ -295,7 +295,6 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                                 .to_owned(),
                         ),
                     });
-                }
             }
         }
     }

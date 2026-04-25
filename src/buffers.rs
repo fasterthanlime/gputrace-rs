@@ -18,6 +18,7 @@ pub struct BufferInventory {
     pub total_buffers: usize,
     pub total_bytes: u64,
     pub total_aliases: usize,
+    pub unused_resources: UnusedResourceReport,
     pub buffers: Vec<BufferInfo>,
 }
 
@@ -32,12 +33,30 @@ pub struct BufferInfo {
     pub bindings: Vec<BufferBindingInfo>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UnusedResourceReport {
+    pub total_entries: usize,
+    pub total_logical_bytes: u64,
+    pub labeled_entries: usize,
+    pub groups: Vec<UnusedResourceGroup>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UnusedResourceGroup {
+    pub label: String,
+    pub count: usize,
+    pub logical_bytes: u64,
+    pub sample_buffers: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BufferBindingInfo {
     pub encoder_label: String,
     pub index: usize,
     pub dispatch_count: usize,
 }
+
+type BufferBindingSummaryMap = BTreeMap<String, BTreeMap<(String, usize), usize>>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BufferInventoryDiff {
@@ -88,11 +107,13 @@ pub fn analyze_with_options(
         entries.retain(|entry| entry.size >= min_size);
     }
     sort_buffers(&mut entries, options.sort_by.as_deref().unwrap_or("size"))?;
+    let unused_resources = scan_unused_resources(trace)?;
 
     Ok(BufferInventory {
         total_buffers: entries.len(),
         total_bytes: entries.iter().map(|entry| entry.size).sum(),
         total_aliases: entries.iter().map(|entry| entry.aliases.len()).sum(),
+        unused_resources,
         buffers: entries,
     })
 }
@@ -109,6 +130,20 @@ pub fn format_table(report: &BufferInventory) -> String {
         "{} buffers, {} bytes, {} aliases\n\n",
         report.total_buffers, report.total_bytes, report.total_aliases
     ));
+    if report.unused_resources.total_entries > 0 {
+        out.push_str(&format!(
+            "{} unused resource entries, {} logical bytes\n\n",
+            report.unused_resources.total_entries, report.unused_resources.total_logical_bytes
+        ));
+        out.push_str("Top unused resource groups:\n");
+        for group in report.unused_resources.groups.iter().take(10) {
+            out.push_str(&format!(
+                "- {}: {} entries, {} bytes\n",
+                group.label, group.count, group.logical_bytes
+            ));
+        }
+        out.push('\n');
+    }
     out.push_str(&format!(
         "{:<10} {:<28} {:>12} {:>8} {:>8}  {}\n",
         "ID", "Filename", "Size", "Alias", "Bind", "Address"
@@ -222,6 +257,24 @@ pub fn markdown_report(report: &BufferInventory) -> String {
     out.push_str(&format!("* Buffers: `{}`\n", report.total_buffers));
     out.push_str(&format!("* Total bytes: `{}`\n", report.total_bytes));
     out.push_str(&format!("* Aliases: `{}`\n\n", report.total_aliases));
+    if report.unused_resources.total_entries > 0 {
+        out.push_str("## Unused Resources\n\n");
+        out.push_str(&format!(
+            "* Entries: `{}`\n",
+            report.unused_resources.total_entries
+        ));
+        out.push_str(&format!(
+            "* Logical bytes: `{}`\n\n",
+            report.unused_resources.total_logical_bytes
+        ));
+        for group in report.unused_resources.groups.iter().take(20) {
+            out.push_str(&format!(
+                "- `{}`: {} entries, {} bytes\n",
+                group.label, group.count, group.logical_bytes
+            ));
+        }
+        out.push('\n');
+    }
     out.push_str("## Largest Buffers\n\n");
     for buffer in report.buffers.iter().take(20) {
         out.push_str(&format!(
@@ -440,10 +493,8 @@ fn collect_buffer_addresses(trace: &TraceBundle) -> Result<BTreeMap<String, u64>
     Ok(names)
 }
 
-fn collect_binding_summaries(
-    trace: &TraceBundle,
-) -> Result<BTreeMap<String, BTreeMap<(String, usize), usize>>> {
-    let mut bindings: BTreeMap<String, BTreeMap<(String, usize), usize>> = BTreeMap::new();
+fn collect_binding_summaries(trace: &TraceBundle) -> Result<BufferBindingSummaryMap> {
+    let mut bindings: BufferBindingSummaryMap = BTreeMap::new();
     for region in trace.command_buffer_regions()? {
         for dispatch in region.dispatches {
             let label = dispatch
@@ -545,6 +596,68 @@ fn scan_buffer_files(
         });
     }
     Ok(buffers)
+}
+
+pub fn scan_unused_resources(trace: &TraceBundle) -> Result<UnusedResourceReport> {
+    let mut report = UnusedResourceReport::default();
+    let mut groups: BTreeMap<String, UnusedResourceGroup> = BTreeMap::new();
+
+    for dir_entry in fs::read_dir(&trace.path)? {
+        let dir_entry = dir_entry?;
+        let file_name = dir_entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !file_name.starts_with("unused-device-resources-") {
+            continue;
+        }
+
+        let data = fs::read(dir_entry.path())?;
+        let strings = ascii_strings(&data, 3);
+        for (index, value) in strings.iter().enumerate() {
+            if !is_bufferish(value) {
+                continue;
+            }
+
+            let size = fs::metadata(trace.path.join(value)).map_or(0, |meta| meta.len());
+            report.total_entries += 1;
+            report.total_logical_bytes += size;
+
+            let label = strings
+                .iter()
+                .skip(index + 1)
+                .take(32)
+                .take_while(|candidate| !is_bufferish(candidate))
+                .find(|candidate| is_resource_label(candidate));
+
+            let Some(label) = label else {
+                continue;
+            };
+
+            report.labeled_entries += 1;
+            let group = groups
+                .entry((*label).clone())
+                .or_insert_with(|| UnusedResourceGroup {
+                    label: (*label).clone(),
+                    ..Default::default()
+                });
+            group.count += 1;
+            group.logical_bytes += size;
+            if group.sample_buffers.len() < 5 {
+                group.sample_buffers.push(value.clone());
+            }
+        }
+    }
+
+    report.groups = groups.into_values().collect();
+    report.groups.sort_by(|left, right| {
+        right
+            .logical_bytes
+            .cmp(&left.logical_bytes)
+            .then_with(|| right.count.cmp(&left.count))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    Ok(report)
 }
 
 pub fn parse_size(input: &str) -> Result<u64> {
@@ -691,8 +804,7 @@ where
 {
     let values_per_line = 8;
     let mut out = String::new();
-    let mut count = 0usize;
-    for offset in (0..data.len()).step_by(stride) {
+    for (count, offset) in (0..data.len()).step_by(stride).enumerate() {
         if offset + stride > data.len() {
             break;
         }
@@ -704,9 +816,8 @@ where
         }
         out.push_str(&render(&data[offset..offset + stride]));
         out.push(' ');
-        count += 1;
     }
-    if data.len() % stride != 0 {
+    if !data.len().is_multiple_of(stride) {
         out.push_str(&format!(
             "\n\nWarning: trailing {} byte(s) ignored\n",
             data.len() % stride
@@ -722,11 +833,7 @@ fn half_to_f32(bits: u16) -> f32 {
     let exponent = ((bits >> 10) & 0x1f) as u32;
     let mantissa = (bits & 0x03ff) as u32;
     let f32_bits = if exponent == 0 {
-        if mantissa == 0 {
-            sign << 31
-        } else {
-            sign << 31
-        }
+        sign << 31
     } else if exponent == 0x1f {
         (sign << 31) | 0x7f80_0000 | (mantissa << 13)
     } else {
@@ -736,7 +843,7 @@ fn half_to_f32(bits: u16) -> f32 {
 }
 
 fn is_bufferish(name: &str) -> bool {
-    name.starts_with("MTLBuffer-") || name.starts_with("MTLHeap-")
+    has_resource_id(name, "MTLBuffer-") || has_resource_id(name, "MTLHeap-")
 }
 
 fn parse_buffer_id(name: &str) -> String {
@@ -763,6 +870,51 @@ fn normalize_buffer_name(name: &str) -> String {
 
 fn is_primary_variant(name: &str) -> bool {
     name.ends_with("-0")
+}
+
+fn has_resource_id(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((id, suffix)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    !id.is_empty()
+        && !suffix.is_empty()
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_resource_label(value: &str) -> bool {
+    value.contains('.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && !matches!(value, "buffers" | "buffer" | "textures")
+        && !value.starts_with("MTLBuffer-")
+        && !value.starts_with("MTLHeap-")
+}
+
+fn ascii_strings(data: &[u8], min_len: usize) -> Vec<String> {
+    let mut strings = Vec::new();
+    let mut start = None;
+    for (index, byte) in data.iter().copied().enumerate() {
+        if byte.is_ascii_graphic() || byte == b' ' {
+            start.get_or_insert(index);
+            continue;
+        }
+        if let Some(offset) = start.take()
+            && index - offset >= min_len
+        {
+            strings.push(String::from_utf8_lossy(&data[offset..index]).into_owned());
+        }
+    }
+    if let Some(offset) = start
+        && data.len() - offset >= min_len
+    {
+        strings.push(String::from_utf8_lossy(&data[offset..]).into_owned());
+    }
+    strings
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -793,11 +945,47 @@ mod tests {
     }
 
     #[test]
+    fn groups_unused_resources_by_label_with_logical_sizes() {
+        use std::os::unix::fs::symlink;
+
+        use crate::trace::{Metadata, TraceBundle};
+
+        let dir = tempfile::tempdir().unwrap();
+        let trace_path = dir.path().to_path_buf();
+        fs::write(trace_path.join("capture"), b"MTSP").unwrap();
+        fs::write(trace_path.join("MTLBuffer-1-0"), [0u8; 16]).unwrap();
+        symlink("MTLBuffer-1-0", trace_path.join("MTLBuffer-2-0")).unwrap();
+        fs::write(
+            trace_path.join("unused-device-resources-0x1"),
+            b"MTSP\0MTLBuffer-1-0\0Cuwuw\0attention.mask\0MTLBuffer-2-0\0Cuwuw\0attention.mask\0",
+        )
+        .unwrap();
+
+        let trace = TraceBundle {
+            path: trace_path.clone(),
+            metadata: Metadata::default(),
+            capture_path: trace_path.join("capture"),
+            capture_len: 4,
+            device_resources: vec![],
+        };
+
+        let report = scan_unused_resources(&trace).unwrap();
+        assert_eq!(report.total_entries, 2);
+        assert_eq!(report.total_logical_bytes, 32);
+        assert_eq!(report.labeled_entries, 2);
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].label, "attention.mask");
+        assert_eq!(report.groups[0].count, 2);
+        assert_eq!(report.groups[0].logical_bytes, 32);
+    }
+
+    #[test]
     fn computes_inventory_diff() {
         let left = BufferInventory {
             total_buffers: 1,
             total_bytes: 32,
             total_aliases: 0,
+            unused_resources: UnusedResourceReport::default(),
             buffers: vec![BufferInfo {
                 id: "1".into(),
                 filename: "MTLBuffer-1-0".into(),
@@ -812,6 +1000,7 @@ mod tests {
             total_buffers: 2,
             total_bytes: 96,
             total_aliases: 1,
+            unused_resources: UnusedResourceReport::default(),
             buffers: vec![
                 BufferInfo {
                     id: "1".into(),

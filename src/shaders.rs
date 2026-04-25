@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 use crate::counter;
 use crate::error::{Error, Result};
 use crate::profiler;
-use crate::trace::TraceBundle;
+use crate::trace::{KernelStat, TraceBundle};
 use crate::xcode_counters;
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +102,9 @@ pub struct ShaderHotspotReport {
     pub start_line: usize,
     pub end_line: usize,
     pub total_gpu_percent: f64,
+    pub duration_ns: Option<u64>,
+    pub duration_percent_of_total: Option<f64>,
+    pub execution_cost_percent: Option<f64>,
     pub metric_source: String,
     pub lines: Vec<AttributedSourceLine>,
     pub hotspots: Vec<AttributedSourceLine>,
@@ -250,8 +253,17 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
         }
     }
 
-    let mut shaders: Vec<_> = trace
-        .analyze_kernels()?
+    let kernels = trace.analyze_kernels()?;
+    let kernels = if kernels.is_empty() {
+        profiler_summary
+            .as_ref()
+            .map(profiler_kernel_stats)
+            .unwrap_or_default()
+    } else {
+        kernels
+    };
+
+    let mut shaders: Vec<_> = kernels
         .into_values()
         .map(|kernel| {
             let kernel_name = kernel.name.clone();
@@ -588,7 +600,7 @@ pub fn source(
     context: usize,
 ) -> Result<ShaderSourceReport> {
     let index = ShaderSourceIndex::build(search_paths)?;
-    let kernels = trace.analyze_kernels()?;
+    let kernels = shader_kernel_stats(trace)?;
     let kernel = kernels
         .get(shader_name)
         .cloned()
@@ -598,12 +610,9 @@ pub fn source(
             })
         })
         .ok_or_else(|| Error::InvalidInput(format!("shader not found in trace: {shader_name}")))?;
-    let (source_file, source_line) = index
-        .lookup(&kernel.name)
-        .map(|(file, line)| (file, line))
-        .ok_or_else(|| {
-            Error::InvalidInput(format!("source not found for shader: {}", kernel.name))
-        })?;
+    let (source_file, source_line) = index.lookup(&kernel.name).ok_or_else(|| {
+        Error::InvalidInput(format!("source not found for shader: {}", kernel.name))
+    })?;
     let contents = fs::read_to_string(&source_file)?;
     let lines: Vec<_> = contents.lines().map(ToOwned::to_owned).collect();
     let start_line = source_line.saturating_sub(context).max(1);
@@ -626,6 +635,55 @@ pub fn source(
         end_line,
         excerpt,
     })
+}
+
+fn shader_kernel_stats(trace: &TraceBundle) -> Result<BTreeMap<String, KernelStat>> {
+    let kernels = trace.analyze_kernels()?;
+    if !kernels.is_empty() {
+        return Ok(kernels);
+    }
+    Ok(profiler::stream_data_summary(&trace.path)
+        .ok()
+        .as_ref()
+        .map(profiler_kernel_stats)
+        .unwrap_or_default())
+}
+
+fn profiler_kernel_stats(
+    summary: &profiler::ProfilerStreamDataSummary,
+) -> BTreeMap<String, KernelStat> {
+    let pipeline_addresses = summary
+        .pipelines
+        .iter()
+        .map(|pipeline| (pipeline.pipeline_id, pipeline.pipeline_address))
+        .collect::<BTreeMap<_, _>>();
+    let mut stats = BTreeMap::<String, KernelStat>::new();
+    for dispatch in &summary.dispatches {
+        let name = dispatch
+            .function_name
+            .clone()
+            .unwrap_or_else(|| format!("pipeline_{}", dispatch.pipeline_index));
+        let pipeline_addr = dispatch
+            .pipeline_id
+            .and_then(|id| pipeline_addresses.get(&id).copied())
+            .unwrap_or(0);
+        let entry = stats.entry(name.clone()).or_insert_with(|| KernelStat {
+            name,
+            pipeline_addr,
+            dispatch_count: 0,
+            encoder_labels: BTreeMap::new(),
+            buffers: BTreeMap::new(),
+        });
+        entry.dispatch_count += 1;
+        if entry.pipeline_addr == 0 && pipeline_addr != 0 {
+            entry.pipeline_addr = pipeline_addr;
+        }
+        *entry
+            .encoder_labels
+            .entry(format!("encoder_{}", dispatch.encoder_index))
+            .or_default() += 1;
+    }
+    stats
 }
 
 pub fn hotspot_report(
@@ -675,14 +733,16 @@ pub fn hotspot_report(
 
     attribute_line_costs(
         &mut lines,
-        total_gpu_percent,
-        shader.instruction_count,
-        shader.alu_instruction_count,
-        shader.branch_instruction_count,
-        shader.execution_cost_percent,
-        shader.alu_utilization_percent,
-        shader.last_level_cache_percent,
-        shader.device_memory_bandwidth_gbps,
+        LineCostContext {
+            total_gpu_percent,
+            instruction_count: shader.instruction_count,
+            alu_instruction_count: shader.alu_instruction_count,
+            branch_instruction_count: shader.branch_instruction_count,
+            execution_cost_percent: shader.execution_cost_percent,
+            alu_utilization_percent: shader.alu_utilization_percent,
+            last_level_cache_percent: shader.last_level_cache_percent,
+            device_memory_bandwidth_gbps: shader.device_memory_bandwidth_gbps,
+        },
     );
 
     let hotspot_count = lines
@@ -725,6 +785,9 @@ pub fn hotspot_report(
         start_line,
         end_line,
         total_gpu_percent,
+        duration_ns: shader.total_duration_ns,
+        duration_percent_of_total: shader.percent_of_total,
+        execution_cost_percent: shader.execution_cost_percent,
         metric_source,
         lines,
         hotspots,
@@ -1170,6 +1233,27 @@ pub fn format_hotspot_report(report: &ShaderHotspotReport) -> String {
         "Attributed GPU %: {:.2} ({})\n\n",
         report.total_gpu_percent, report.metric_source
     ));
+    if report.duration_ns.is_some()
+        || report.duration_percent_of_total.is_some()
+        || report.execution_cost_percent.is_some()
+    {
+        out.push_str("Profiler metrics:\n");
+        out.push_str(&format!(
+            "  duration_ns={} time_percent={} execution_cost_percent={}\n\n",
+            report
+                .duration_ns
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            report
+                .duration_percent_of_total
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "-".to_owned()),
+            report
+                .execution_cost_percent
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "-".to_owned())
+        ));
+    }
     out.push_str("Hot spots\n");
     for hotspot in &report.hotspots {
         out.push_str(&format!(
@@ -1518,8 +1602,8 @@ fn estimate_line_cost(line: &str, instruction_type: &str, complexity: u32) -> f6
     base_cost
 }
 
-fn attribute_line_costs(
-    lines: &mut [AttributedSourceLine],
+#[derive(Debug, Clone, Copy)]
+struct LineCostContext {
     total_gpu_percent: f64,
     instruction_count: Option<i64>,
     alu_instruction_count: Option<i64>,
@@ -1528,8 +1612,11 @@ fn attribute_line_costs(
     alu_utilization_percent: Option<f64>,
     last_level_cache_percent: Option<f64>,
     device_memory_bandwidth_gbps: Option<f64>,
-) {
+}
+
+fn attribute_line_costs(lines: &mut [AttributedSourceLine], context: LineCostContext) {
     let total_cost: f64 = lines.iter().map(|line| line.estimated_cost).sum();
+    let total_gpu_percent = context.total_gpu_percent;
     if total_cost <= f64::EPSILON || total_gpu_percent <= f64::EPSILON {
         return;
     }
@@ -1537,39 +1624,39 @@ fn attribute_line_costs(
     let mut compute_weight = 1.25;
     let mut memory_weight = 1.5;
     let mut control_weight = 0.75;
-    if let Some(total_instructions) = instruction_count.filter(|value| *value > 0) {
+    if let Some(total_instructions) = context.instruction_count.filter(|value| *value > 0) {
         let total_instructions = total_instructions as f64;
-        if let Some(alu) = alu_instruction_count {
+        if let Some(alu) = context.alu_instruction_count {
             let alu_ratio = (alu.max(0) as f64 / total_instructions).clamp(0.0, 1.0);
             compute_weight += alu_ratio * 1.5;
             memory_weight += (1.0 - alu_ratio) * 0.35;
         }
-        if let Some(branch) = branch_instruction_count {
+        if let Some(branch) = context.branch_instruction_count {
             let branch_ratio = (branch.max(0) as f64 / total_instructions).clamp(0.0, 1.0);
             control_weight += branch_ratio * 3.0;
         }
     }
 
-    if let Some(alu_utilization) = alu_utilization_percent {
+    if let Some(alu_utilization) = context.alu_utilization_percent {
         let normalized = normalize_percent_like(alu_utilization);
         if normalized > 50.0 {
             compute_weight += (normalized - 50.0) / 100.0;
         }
     }
-    if let Some(llc) = last_level_cache_percent {
+    if let Some(llc) = context.last_level_cache_percent {
         let normalized = normalize_percent_like(llc);
         if normalized > 5.0 {
             memory_weight += (normalized / 100.0).min(0.75);
         }
     }
-    if let Some(bandwidth) = device_memory_bandwidth_gbps {
+    if let Some(bandwidth) = context.device_memory_bandwidth_gbps {
         if bandwidth > 10.0 {
             memory_weight += 1.0;
         } else if bandwidth > 2.0 {
             memory_weight += 0.5;
         }
     }
-    if let Some(exec_cost) = execution_cost_percent {
+    if let Some(exec_cost) = context.execution_cost_percent {
         if exec_cost > 40.0 {
             compute_weight += 0.35;
             memory_weight += 0.35;
@@ -1737,6 +1824,62 @@ mod tests {
         assert_eq!(matched.buffer_l1_miss_rate_percent, Some(11.0));
         assert_eq!(matched.buffer_l1_read_accesses, Some(128.0));
         assert_eq!(matched.buffer_l1_write_accesses, Some(16.0));
+    }
+
+    #[test]
+    fn builds_kernel_stats_from_profiler_dispatches() {
+        let summary = profiler::ProfilerStreamDataSummary {
+            function_names: vec!["kernel_a".into()],
+            pipelines: vec![profiler::ProfilerPipeline {
+                pipeline_id: 7,
+                pipeline_address: 0x7000,
+                function_name: Some("kernel_a".into()),
+                stats: None,
+            }],
+            execution_costs: vec![],
+            occupancies: vec![],
+            dispatches: vec![
+                profiler::ProfilerDispatch {
+                    index: 0,
+                    pipeline_index: 0,
+                    pipeline_id: Some(7),
+                    function_name: Some("kernel_a".into()),
+                    encoder_index: 2,
+                    cumulative_us: 10,
+                    duration_us: 10,
+                    sample_count: 1,
+                    sampling_density: 0.1,
+                    start_ticks: 1,
+                    end_ticks: 2,
+                },
+                profiler::ProfilerDispatch {
+                    index: 1,
+                    pipeline_index: 0,
+                    pipeline_id: Some(7),
+                    function_name: Some("kernel_a".into()),
+                    encoder_index: 3,
+                    cumulative_us: 20,
+                    duration_us: 10,
+                    sample_count: 1,
+                    sampling_density: 0.1,
+                    start_ticks: 2,
+                    end_ticks: 3,
+                },
+            ],
+            encoder_timings: vec![],
+            timeline: None,
+            num_pipelines: 1,
+            num_gpu_commands: 2,
+            num_encoders: 2,
+            total_time_us: 20,
+        };
+
+        let stats = profiler_kernel_stats(&summary);
+        let kernel = stats.get("kernel_a").unwrap();
+        assert_eq!(kernel.pipeline_addr, 0x7000);
+        assert_eq!(kernel.dispatch_count, 2);
+        assert_eq!(kernel.encoder_labels.get("encoder_2"), Some(&1));
+        assert_eq!(kernel.encoder_labels.get("encoder_3"), Some(&1));
     }
 
     #[test]
@@ -1986,6 +2129,9 @@ mod tests {
             start_line: 40,
             end_line: 44,
             total_gpu_percent: 55.0,
+            duration_ns: Some(1200),
+            duration_percent_of_total: Some(12.5),
+            execution_cost_percent: Some(55.0),
             metric_source: "execution-cost".into(),
             hotspots: vec![AttributedSourceLine {
                 line_number: 42,
@@ -2013,6 +2159,9 @@ mod tests {
         assert!(output.contains("Hot spots"));
         assert!(output.contains("Annotated source"));
         assert!(output.contains("execution-cost"));
+        assert!(output.contains("duration_ns=1200"));
+        assert!(output.contains("time_percent=12.50"));
+        assert!(output.contains("execution_cost_percent=55.00"));
         assert!(output.contains("22.50%"));
         assert!(output.contains("texture.read(index)"));
     }
@@ -2044,14 +2193,16 @@ mod tests {
 
         attribute_line_costs(
             &mut lines,
-            60.0,
-            Some(1000),
-            Some(850),
-            Some(20),
-            Some(55.0),
-            Some(72.0),
-            Some(0.03),
-            Some(1.2),
+            LineCostContext {
+                total_gpu_percent: 60.0,
+                instruction_count: Some(1000),
+                alu_instruction_count: Some(850),
+                branch_instruction_count: Some(20),
+                execution_cost_percent: Some(55.0),
+                alu_utilization_percent: Some(72.0),
+                last_level_cache_percent: Some(0.03),
+                device_memory_bandwidth_gbps: Some(1.2),
+            },
         );
 
         assert!(lines[0].attributed_gpu_percent > lines[1].attributed_gpu_percent);
@@ -2084,14 +2235,16 @@ mod tests {
 
         attribute_line_costs(
             &mut lines,
-            60.0,
-            Some(1000),
-            Some(150),
-            Some(20),
-            Some(48.0),
-            Some(24.0),
-            Some(0.18),
-            Some(14.0),
+            LineCostContext {
+                total_gpu_percent: 60.0,
+                instruction_count: Some(1000),
+                alu_instruction_count: Some(150),
+                branch_instruction_count: Some(20),
+                execution_cost_percent: Some(48.0),
+                alu_utilization_percent: Some(24.0),
+                last_level_cache_percent: Some(0.18),
+                device_memory_bandwidth_gbps: Some(14.0),
+            },
         );
 
         assert!(lines[1].attributed_gpu_percent > lines[0].attributed_gpu_percent);

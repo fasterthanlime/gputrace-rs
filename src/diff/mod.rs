@@ -948,6 +948,18 @@ pub fn diff_with_options(
             left_report.buffer_inventory_aliases, right_report.buffer_inventory_aliases
         ));
     }
+    if left_report.unused_resource_count != right_report.unused_resource_count {
+        summary.push(format!(
+            "Unused resource entries changed: {} -> {}",
+            left_report.unused_resource_count, right_report.unused_resource_count
+        ));
+    }
+    if left_report.unused_resource_bytes != right_report.unused_resource_bytes {
+        summary.push(format!(
+            "Unused logical bytes changed: {} -> {}",
+            left_report.unused_resource_bytes, right_report.unused_resource_bytes
+        ));
+    }
     if left_report.shared_buffer_count != right_report.shared_buffer_count {
         summary.push(format!(
             "Shared buffer count changed: {} -> {}",
@@ -2949,6 +2961,8 @@ mod tests {
             buffer_inventory_count: 0,
             buffer_inventory_bytes: 0,
             buffer_inventory_aliases: 0,
+            unused_resource_count: 0,
+            unused_resource_bytes: 0,
             kernel_stats: vec![
                 KernelStat {
                     name: "a".into(),
@@ -2982,6 +2996,7 @@ mod tests {
             buffer_stats: vec![],
             buffer_lifecycles: vec![],
             largest_buffers: vec![],
+            unused_resource_groups: vec![],
             findings: vec![],
         };
         let right = AnalysisReport {
@@ -3059,6 +3074,8 @@ mod tests {
             buffer_inventory_count: 0,
             buffer_inventory_bytes: 0,
             buffer_inventory_aliases: 0,
+            unused_resource_count: 0,
+            unused_resource_bytes: 0,
             kernel_stats: vec![],
             timed_kernel_stats: vec![],
             buffer_stats: vec![BufferStat {
@@ -3101,6 +3118,7 @@ mod tests {
                 },
             ],
             largest_buffers: vec![],
+            unused_resource_groups: vec![],
             findings: vec![],
         };
         let right = AnalysisReport {
