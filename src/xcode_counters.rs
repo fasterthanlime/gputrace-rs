@@ -222,7 +222,12 @@ pub fn format_summary(data: &XcodeCounterData, metric: Option<&str>, top: Option
         "GPU Write Bandwidth",
         "Instruction Throughput Utilization",
     ];
-    let encoders = filtered_encoders(data, metric, top);
+    let table_top = if metric.is_none() {
+        top.or(Some(20))
+    } else {
+        top
+    };
+    let encoders = filtered_encoders(data, metric, table_top);
 
     let mut out = String::new();
     out.push_str("Xcode counters\n");
@@ -232,6 +237,40 @@ pub fn format_summary(data: &XcodeCounterData, metric: Option<&str>, top: Option
         data.encoders.len(),
         data.metrics.len()
     ));
+
+    if metric.is_none() {
+        let limit = top.unwrap_or(8);
+        push_ranked_section(
+            &mut out,
+            "Top kernel invocations",
+            &rank_by_metric(data, "Kernel Invocations", limit, false),
+        );
+        push_ranked_section(
+            &mut out,
+            "Top memory bandwidth",
+            &rank_by_score(data, limit, false, |encoder| {
+                metric_value(encoder, "Device Memory Bandwidth").or_else(|| {
+                    let read = metric_value(encoder, "GPU Read Bandwidth").unwrap_or_default();
+                    let write = metric_value(encoder, "GPU Write Bandwidth").unwrap_or_default();
+                    let total = read + write;
+                    (total > 0.0).then_some(total)
+                })
+            }),
+        );
+        push_ranked_section(
+            &mut out,
+            "Lowest active occupancy",
+            &rank_by_metric(data, "Kernel Occupancy", limit, true),
+        );
+        push_ranked_section(
+            &mut out,
+            "Highest buffer L1 miss rate",
+            &rank_by_metric(data, "Buffer L1 Miss Rate", limit, false),
+        );
+        push_limiter_section(&mut out, data, limit);
+        out.push_str("Use --metric <name> --top <n> for a focused ranked table.\n\n");
+    }
+
     out.push_str("idx encoder_label");
     for metric in key_metrics {
         out.push(' ');
@@ -378,6 +417,134 @@ fn filtered_encoders<'a>(
         encoders.truncate(top);
     }
     encoders
+}
+
+fn rank_by_metric<'a>(
+    data: &'a XcodeCounterData,
+    metric: &str,
+    limit: usize,
+    ascending: bool,
+) -> Vec<CounterRankRow<'a>> {
+    rank_by_score(data, limit, ascending, |encoder| {
+        metric_value(encoder, metric)
+    })
+    .into_iter()
+    .map(|mut row| {
+        row.metric = metric.to_owned();
+        row
+    })
+    .collect()
+}
+
+fn rank_by_score<'a>(
+    data: &'a XcodeCounterData,
+    limit: usize,
+    ascending: bool,
+    score: impl Fn(&XcodeEncoderCounters) -> Option<f64>,
+) -> Vec<CounterRankRow<'a>> {
+    let mut rows = data
+        .encoders
+        .iter()
+        .filter(|encoder| active_encoder(encoder))
+        .filter_map(|encoder| {
+            let value = score(encoder)?;
+            value.is_finite().then_some(CounterRankRow {
+                encoder,
+                metric: "score".to_owned(),
+                value,
+            })
+        })
+        .filter(|row| row.value > 0.0)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        let order = left
+            .value
+            .partial_cmp(&right.value)
+            .unwrap_or(std::cmp::Ordering::Equal);
+        if ascending { order } else { order.reverse() }
+    });
+    rows.truncate(limit);
+    rows
+}
+
+fn push_ranked_section(out: &mut String, title: &str, rows: &[CounterRankRow<'_>]) {
+    if rows.is_empty() {
+        return;
+    }
+    out.push_str(title);
+    out.push('\n');
+    for row in rows {
+        out.push_str(&format!(
+            "  {:>3} {:<36} {:>12}  {}\n",
+            row.encoder.index,
+            truncate(display_label(row.encoder), 36),
+            format_metric_value(&row.metric, row.value),
+            truncate(&row.encoder.command_buffer_label, 36)
+        ));
+    }
+    out.push('\n');
+}
+
+fn push_limiter_section(out: &mut String, data: &XcodeCounterData, limit: usize) {
+    let mut rows = Vec::new();
+    for metric in data
+        .metrics
+        .iter()
+        .filter(|metric| metric.ends_with(" Limiter"))
+    {
+        if let Some(row) = rank_by_metric(data, metric, 1, false).into_iter().next()
+            && row.value > 0.0
+        {
+            rows.push(row);
+        }
+    }
+    rows.sort_by(|left, right| {
+        right
+            .value
+            .partial_cmp(&left.value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows.truncate(limit);
+    if rows.is_empty() {
+        return;
+    }
+    out.push_str("Top limiter signals\n");
+    for row in rows {
+        out.push_str(&format!(
+            "  {:>3} {:<34} {:>10}  {:<32} {}\n",
+            row.encoder.index,
+            truncate(display_label(row.encoder), 34),
+            format_metric_value(&row.metric, row.value),
+            truncate(&row.metric, 32),
+            truncate(&row.encoder.command_buffer_label, 32)
+        ));
+    }
+    out.push('\n');
+}
+
+#[derive(Debug, Clone)]
+struct CounterRankRow<'a> {
+    encoder: &'a XcodeEncoderCounters,
+    metric: String,
+    value: f64,
+}
+
+fn metric_value(encoder: &XcodeEncoderCounters, metric: &str) -> Option<f64> {
+    encoder.counters.get(metric).copied()
+}
+
+fn active_encoder(encoder: &XcodeEncoderCounters) -> bool {
+    metric_value(encoder, "Kernel Invocations").unwrap_or_default() > 0.0
+        || metric_value(encoder, "Kernel Occupancy").unwrap_or_default() > 0.0
+        || metric_value(encoder, "ALU Utilization").unwrap_or_default() > 0.0
+}
+
+fn display_label(encoder: &XcodeEncoderCounters) -> &str {
+    if encoder.encoder_label.trim().is_empty() {
+        &encoder.command_buffer_label
+    } else {
+        &encoder.encoder_label
+    }
 }
 
 fn match_reference_encoder<'a>(
@@ -536,6 +703,7 @@ fn find_counters_csv(trace_path: &Path) -> Result<PathBuf> {
     }
 
     let dir = trace_path.parent().unwrap_or(trace_path);
+    let mut loose_matches = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -545,8 +713,20 @@ fn find_counters_csv(trace_path: &Path) -> Result<PathBuf> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.ends_with("Counters.csv"))
         {
-            return Ok(path);
+            loose_matches.push(path);
         }
+    }
+
+    if !loose_matches.is_empty() {
+        let matches = loose_matches
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::InvalidInput(format!(
+            "no counters CSV matches {}; found nearby Counters.csv files ({matches}); pass --csv explicitly",
+            trace_path.display()
+        )));
     }
 
     Err(Error::NotFound(dir.join("Counters.csv")))
@@ -689,6 +869,27 @@ mod tests {
     }
 
     #[test]
+    fn refuses_ambiguous_unrelated_counters_csv() {
+        let dir = tempdir().unwrap();
+        let trace = dir.path().join("bee-run.gputrace");
+        fs::create_dir(&trace).unwrap();
+        fs::write(
+            dir.path().join("speculative-experiment Counters.csv"),
+            "Index,Encoder FunctionIndex,CommandBuffer Label,Encoder Label,\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("other Counters.csv"),
+            "Index,Encoder FunctionIndex,CommandBuffer Label,Encoder Label,\n",
+        )
+        .unwrap();
+
+        let error = find_counters_csv(&trace).unwrap_err().to_string();
+        assert!(error.contains("pass --csv explicitly"));
+        assert!(error.contains("speculative-experiment Counters.csv"));
+    }
+
+    #[test]
     fn summary_can_sort_by_metric() {
         let data = XcodeCounterData {
             source: PathBuf::from("/tmp/example.csv"),
@@ -714,6 +915,51 @@ mod tests {
         let text = format_summary(&data, Some("ALU Utilization"), Some(1));
         assert!(text.contains("fast"));
         assert!(!text.contains("slow"));
+    }
+
+    #[test]
+    fn summary_surfaces_ranked_counter_insights() {
+        let data = XcodeCounterData {
+            source: PathBuf::from("/tmp/example.csv"),
+            metrics: vec![
+                "Kernel Invocations".into(),
+                "Kernel Occupancy".into(),
+                "Device Memory Bandwidth".into(),
+                "Buffer L1 Miss Rate".into(),
+                "L1 Cache Limiter".into(),
+            ],
+            encoders: vec![
+                XcodeEncoderCounters {
+                    index: 0,
+                    function_index: 0,
+                    command_buffer_label: "cb0".into(),
+                    encoder_label: "cold".into(),
+                    counters: BTreeMap::from([
+                        ("Kernel Invocations".into(), 1.0),
+                        ("Kernel Occupancy".into(), 5.0),
+                    ]),
+                },
+                XcodeEncoderCounters {
+                    index: 1,
+                    function_index: 1,
+                    command_buffer_label: "cb1".into(),
+                    encoder_label: "hot".into(),
+                    counters: BTreeMap::from([
+                        ("Kernel Invocations".into(), 80.0),
+                        ("Kernel Occupancy".into(), 12.0),
+                        ("Device Memory Bandwidth".into(), 42.0),
+                        ("Buffer L1 Miss Rate".into(), 7.0),
+                        ("L1 Cache Limiter".into(), 3.0),
+                    ]),
+                },
+            ],
+        };
+
+        let text = format_summary(&data, None, Some(2));
+        assert!(text.contains("Top kernel invocations"));
+        assert!(text.contains("Top memory bandwidth"));
+        assert!(text.contains("Top limiter signals"));
+        assert!(text.contains("hot"));
     }
 
     #[test]
