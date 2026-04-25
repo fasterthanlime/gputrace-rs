@@ -50,6 +50,9 @@ gputrace xcode-check-permissions
 gputrace xcode-profile run trace.gputrace --output trace-perfdata.gputrace
 ```
 
+`xcode-counters` auto-discovers only exact trace-name CSV matches. Pass `--csv`
+when a directory contains unrelated `*Counters.csv` files.
+
 ## Main Commands
 
 | Area | Commands |

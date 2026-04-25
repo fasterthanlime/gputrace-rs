@@ -43,6 +43,15 @@ gputrace profiler /abs/path/trace.gputrace --format json
 gputrace timing /abs/path/trace.gputrace --format json
 ```
 
+For exported Xcode profile bundles, `analyze` and `buffers list` should both
+surface unused-resource sidecars when Xcode recorded them. Check these fields
+before concluding that buffer/resource analysis is empty:
+
+```bash
+gputrace analyze /abs/path/trace-perfdata.gputrace
+gputrace buffers list /abs/path/trace-perfdata.gputrace --format json
+```
+
 If profiler data is missing, the trace may still support structural commands:
 
 ```bash
@@ -116,8 +125,8 @@ gputrace diff --bench-dir /abs/path/bench-traces --json
 ## Shader And Counter Workflow
 
 ```bash
+gputrace xcode-counters trace-perfdata.gputrace --format summary
 gputrace xcode-counters trace-perfdata.gputrace --format json
-gputrace xcode-counters trace-perfdata.gputrace --format detailed --top 20
 gputrace shaders trace-perfdata.gputrace --format json
 gputrace shader-hotspots trace-perfdata.gputrace kernel_name --search-path /abs/path/src --format json
 gputrace shader-source trace-perfdata.gputrace kernel_name --search-path /abs/path/src --format text
@@ -127,8 +136,17 @@ If an Xcode counter CSV was exported separately:
 
 ```bash
 gputrace xcode-counters trace-perfdata.gputrace --csv /abs/path/Counters.csv --format json
+gputrace xcode-counters trace-perfdata.gputrace --csv /abs/path/Counters.csv --metric "Kernel Invocations" --top 20
 gputrace validate-counters trace-perfdata.gputrace --csv /abs/path/Counters.csv --format json
 ```
+
+`xcode-counters` only auto-discovers exact trace-name CSV matches. If there are
+nearby unrelated `*Counters.csv` files, pass `--csv` explicitly.
+
+Profiler-backed exports may have little structural dispatch data while
+`streamData` contains the useful kernel list. In that case, `command-buffers`,
+`encoders`, `shaders`, `shader-source`, `shader-hotspots`, and
+`mtlb functions --used-only` use profiler timing/name fallbacks where possible.
 
 ## Markdown Rendering
 
@@ -165,6 +183,8 @@ Use this decision table:
   and approve the installed binary in System Settings.
 - Empty profiler/timing output: the trace may not contain `.gpuprofiler_raw`;
   use structural analysis or run `xcode-profile run`.
+- `xcode-counters` refuses a nearby CSV: pass the exact Xcode-exported CSV with
+  `--csv`; do not let an agent pick a same-directory CSV by guesswork.
 - Diff has many unmatched dispatches: compare the same workload and prefer
   profiled `-perfdata.gputrace` bundles.
 - Shader source not found: pass all relevant source roots with repeated

@@ -149,6 +149,7 @@ gputrace analyze /abs/path/input-perfdata.gputrace
 gputrace profiler /abs/path/input-perfdata.gputrace --format text
 gputrace profiler /abs/path/input-perfdata.gputrace --format json
 gputrace insights /abs/path/input-perfdata.gputrace --min-level high
+gputrace buffers list /abs/path/input-perfdata.gputrace --format json
 ```
 
 Then inspect structure and attribution:
@@ -160,6 +161,15 @@ gputrace kernels /abs/path/input-perfdata.gputrace
 gputrace api-calls /abs/path/input-perfdata.gputrace
 gputrace shaders /abs/path/input-perfdata.gputrace --format json
 ```
+
+On Xcode-exported profiler bundles, structural parser data can be sparse while
+`.gpuprofiler_raw/streamData` has the useful dispatch list. The structural
+commands above tolerate malformed short records and use profiler-backed
+dispatch/name fallbacks where the bundle shape permits it.
+
+If Xcode reports large unused resources, check `analyze` and `buffers list` for
+`unused_resource_groups`; those are parsed from
+`unused-device-resources-*` sidecars and report logical resource bytes.
 
 For source mapping, search the source tree by the hot kernel names reported by
 `profiler` or `insights`:
@@ -201,6 +211,19 @@ and execution-cost sampling can point at different kernels. Treat that as a
 signal to inspect both the dispatch count/duration table and Xcode's own view,
 not as proof that either view is individually complete.
 
+For Xcode-exported counter CSVs, pass the CSV explicitly unless the filename is
+an exact trace-name match:
+
+```bash
+gputrace xcode-counters /abs/path/input-perfdata.gputrace \
+  --csv '/abs/path/input-perfdata Counters.csv' \
+  --format summary
+```
+
+The summary view highlights top invocations, memory bandwidth, low occupancy,
+buffer L1 misses, and limiter signals. Use `--metric <name> --top <n>` for a
+focused ranked table.
+
 ## 8. Common Failure Modes
 
 - Xcode opens but Replay is not clicked: run `xcode-profile list-buttons` and
@@ -213,3 +236,5 @@ not as proof that either view is individually complete.
   data embedded, or rerun `xcode-profile run`.
 - Raw trace shows one dispatch but profiler shows many: use the profiler report
   for timing and optimization ranking.
+- `xcode-counters` refuses nearby CSVs: pass `--csv` with the exact Xcode CSV;
+  this avoids accidentally analyzing counters from a different trace.
