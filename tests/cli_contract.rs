@@ -28,6 +28,7 @@ fn top_level_help_lists_current_analysis_commands() {
         "dump",
         "dump-records",
         "export-counters",
+        "raw-counters",
         "validate-counters",
         "profiler",
         "mtlb-functions",
@@ -84,6 +85,16 @@ fn export_counters_help_mentions_trace_and_formats() {
 }
 
 #[test]
+fn raw_counters_help_mentions_trace_and_formats() {
+    let help = render_help(&["raw-counters"]);
+
+    assert!(help.contains("raw-counters"));
+    assert!(help.contains("<TRACE>"));
+    assert!(help.contains("--format <FORMAT>"));
+    assert!(help.contains("[default: text]"));
+}
+
+#[test]
 fn validate_counters_help_mentions_csv_and_tolerance() {
     let help = render_help(&["validate-counters"]);
 
@@ -100,6 +111,18 @@ fn perfcounters_validate_alias_parses_to_validate_counters() {
         "trace.gputrace",
         "--csv",
         "Counters.csv",
+    ]);
+    assert!(cli.is_ok());
+}
+
+#[test]
+fn raw_counters_json_parses() {
+    let cli = Cli::try_parse_from([
+        "gputrace",
+        "raw-counters",
+        "trace.gputrace",
+        "--format",
+        "json",
     ]);
     assert!(cli.is_ok());
 }

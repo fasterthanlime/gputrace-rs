@@ -155,8 +155,18 @@ exports. For ranking without a counter CSV, use profiler duration fields. For
 Xcode counter parity, use an exported Xcode counter CSV with `xcode-counters`
 or `validate-counters`.
 
-For raw counter reverse-engineering, use the structured `APSCounterData`
-decoder instead of old `Counters_f_N` assumptions:
+For end-user raw counter inspection without a counter CSV, use `raw-counters`.
+It reads `.gpuprofiler_raw/streamData` and reports aggregate metadata,
+per-sample-group schemas, decoded `GPRWCNTR` streams, and raw counter ids:
+
+```bash
+gputrace raw-counters trace-perfdata.gputrace --format text
+gputrace raw-counters trace-perfdata.gputrace --format json
+gputrace raw-counters trace-perfdata.gputrace --format csv
+```
+
+For raw counter reverse-engineering and CSV correlation, use the hidden
+structured `APSCounterData` probe instead of old `Counters_f_N` assumptions:
 
 ```bash
 gputrace raw-counter-probe trace-perfdata.gputrace --format text
@@ -165,7 +175,7 @@ gputrace raw-counter-probe trace-perfdata.gputrace --metric "ALU Utilization" --
 ```
 
 `raw-counter-probe` is hidden from top-level help because it is a
-format-reversal/debugging command. Its normal path decodes
+format-reversal/debugging command, not the user-facing report. Its normal path decodes
 `.gpuprofiler_raw/streamData` aggregate metadata, `GPRWCNTR` record sizes,
 per-sample-group counter schemas from `Subdivided Dictionary/passList`, and
 normalized `raw_counter / GRC_GPU_CYCLES * 100` candidates. It reports

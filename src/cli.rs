@@ -50,6 +50,7 @@ enum CommandSet {
     Dump(DumpArgs),
     DumpRecords(DumpRecordsArgs),
     ExportCounters(ExportCountersArgs),
+    RawCounters(RawCountersArgs),
     #[command(hide = true)]
     RawCounterProbe(RawCounterProbeArgs),
     #[command(alias = "perfcounters-validate")]
@@ -239,6 +240,13 @@ struct DumpRecordsArgs {
 struct ExportCountersArgs {
     trace: PathBuf,
     #[arg(short, long, default_value = "csv")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct RawCountersArgs {
+    trace: PathBuf,
+    #[arg(short, long, default_value = "text")]
     format: String,
 }
 
@@ -826,6 +834,16 @@ pub fn run() -> Result<()> {
                 "internal-csv" => print!("{}", counter_export::format_csv(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown export-counters format")),
+            }
+        }
+        CommandSet::RawCounters(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = counter::raw_counters_report(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", counter::format_raw_counters_report(&report)),
+                "csv" => print!("{}", counter::format_raw_counters_csv(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown raw-counters format")),
             }
         }
         CommandSet::RawCounterProbe(args) => {

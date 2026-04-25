@@ -64,6 +64,53 @@ pub struct RawCounterProbeReport {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCountersReport {
+    pub trace_source: PathBuf,
+    pub profiler_directory: PathBuf,
+    pub aggregate_metadata: Vec<RawCounterAggregateMetadata>,
+    pub schemas: Vec<RawCounterSchema>,
+    pub streams: Vec<RawCounterDecodedStream>,
+    pub metrics: Vec<RawCounterDecodedMetric>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterSchema {
+    pub sample_group: usize,
+    pub counter_count: usize,
+    pub counter_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterDecodedStream {
+    pub path: String,
+    pub sample_group: Option<usize>,
+    pub source_index: Option<usize>,
+    pub ring_index: Option<usize>,
+    pub byte_len: usize,
+    pub record_size: usize,
+    pub record_count: usize,
+    pub counter_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterDecodedMetric {
+    pub path: String,
+    pub sample_group: Option<usize>,
+    pub source_index: Option<usize>,
+    pub ring_index: Option<usize>,
+    pub counter_index: usize,
+    pub raw_name: String,
+    pub sample_count: usize,
+    pub min_percent_of_gpu_cycles: f64,
+    pub mean_percent_of_gpu_cycles: f64,
+    pub max_percent_of_gpu_cycles: f64,
+    pub encoder_ids: Vec<u64>,
+    pub kick_trace_ids: Vec<u64>,
+    pub source_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RawCounterProbeTarget {
     pub metric: String,
     pub row_index: usize,
@@ -183,6 +230,7 @@ pub struct RawCounterColumnStat {
 pub struct RawCounterNormalizedMetric {
     pub path: String,
     pub sample_group: Option<usize>,
+    pub source_index: Option<usize>,
     pub ring_index: Option<usize>,
     pub encoder_ids: Vec<u64>,
     pub kick_trace_ids: Vec<u64>,
@@ -190,6 +238,7 @@ pub struct RawCounterNormalizedMetric {
     pub counter_index: usize,
     pub raw_name: String,
     pub sample_count: usize,
+    pub min_percent: f64,
     pub mean_percent: f64,
     pub max_percent: f64,
 }
@@ -313,6 +362,234 @@ pub fn probe_raw_counters(
         structured_samples,
         files: file_reports,
     })
+}
+
+pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersReport> {
+    let profiler_directory = profiler::find_profiler_directory(&trace.path)
+        .ok_or_else(|| crate::Error::NotFound(trace.path.clone()))?;
+    let (schema_map, fallback_counter_names, _) =
+        counter_schemas_and_sample_blobs(&trace.path).unwrap_or_default();
+    let aggregate_metadata = probe_aggregate_counter_metadata(&trace.path);
+    let structured_layouts = probe_structured_counter_layouts(&trace.path);
+    let normalized_counters = probe_normalized_counter_metrics(&trace.path);
+    let schemas = schema_map
+        .iter()
+        .map(|(sample_group, counter_names)| RawCounterSchema {
+            sample_group: *sample_group,
+            counter_count: counter_names.len(),
+            counter_names: counter_names.clone(),
+        })
+        .collect::<Vec<_>>();
+    let streams = structured_layouts
+        .iter()
+        .map(|layout| {
+            let path_ids = parse_derived_counter_sample_path(&layout.path);
+            RawCounterDecodedStream {
+                path: layout.path.clone(),
+                sample_group: path_ids.sample_group,
+                source_index: path_ids.source_index,
+                ring_index: path_ids.ring_index,
+                byte_len: layout.byte_len,
+                record_size: layout.gprw_record_size,
+                record_count: layout.gprw_record_count,
+                counter_count: path_ids
+                    .sample_group
+                    .and_then(|group| schema_map.get(&group))
+                    .map(Vec::len),
+            }
+        })
+        .collect::<Vec<_>>();
+    let metrics = normalized_counters
+        .into_iter()
+        .map(|metric| RawCounterDecodedMetric {
+            path: metric.path,
+            sample_group: metric.sample_group,
+            source_index: metric.source_index,
+            ring_index: metric.ring_index,
+            counter_index: metric.counter_index,
+            raw_name: metric.raw_name,
+            sample_count: metric.sample_count,
+            min_percent_of_gpu_cycles: metric.min_percent,
+            mean_percent_of_gpu_cycles: metric.mean_percent,
+            max_percent_of_gpu_cycles: metric.max_percent,
+            encoder_ids: metric.encoder_ids,
+            kick_trace_ids: metric.kick_trace_ids,
+            source_ids: metric.source_ids,
+        })
+        .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+    if schemas.is_empty() && !fallback_counter_names.is_empty() {
+        warnings.push(
+            "using fallback limiter sample counter names; per-pass schemas were not found"
+                .to_owned(),
+        );
+    }
+    if aggregate_metadata.is_empty() {
+        warnings.push("no aggregate APSCounterData metadata was decoded".to_owned());
+    }
+    if metrics.is_empty() {
+        warnings.push("no normalized GPRWCNTR counter metrics were decoded".to_owned());
+    }
+
+    Ok(RawCountersReport {
+        trace_source: trace.path.clone(),
+        profiler_directory,
+        aggregate_metadata,
+        schemas,
+        streams,
+        metrics,
+        warnings,
+    })
+}
+
+pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
+    let mut out = String::new();
+    out.push_str("Raw counter report\n");
+    out.push_str(&format!(
+        "trace={} profiler_directory={}\n",
+        report.trace_source.display(),
+        report.profiler_directory.display()
+    ));
+    out.push_str(&format!(
+        "metadata={} schemas={} streams={} metrics={}\n\n",
+        report.aggregate_metadata.len(),
+        report.schemas.len(),
+        report.streams.len(),
+        report.metrics.len()
+    ));
+    for warning in &report.warnings {
+        out.push_str(&format!("warning: {warning}\n"));
+    }
+    if !report.warnings.is_empty() {
+        out.push('\n');
+    }
+    for metadata in &report.aggregate_metadata {
+        out.push_str(&format!(
+            "APSCounterData[{}]: timebase={}/{} num_encoders={} perf={:?}\n",
+            metadata.archive_index,
+            metadata
+                .timebase_numer
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            metadata
+                .timebase_denom
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            metadata
+                .num_encoders
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            metadata.perf_info
+        ));
+    }
+    if !report.schemas.is_empty() {
+        out.push_str("\nSchemas:\n");
+        for schema in &report.schemas {
+            out.push_str(&format!(
+                "  group {}: counters={}\n",
+                schema.sample_group, schema.counter_count
+            ));
+        }
+    }
+    if !report.streams.is_empty() {
+        out.push_str("\nStreams:\n");
+        for stream in report.streams.iter().take(24) {
+            out.push_str(&format!(
+                "  group={} source={} ring={} records={} record_size={} counters={} {}\n",
+                format_optional_usize(stream.sample_group),
+                format_optional_usize(stream.source_index),
+                format_optional_usize(stream.ring_index),
+                stream.record_count,
+                stream.record_size,
+                stream
+                    .counter_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                stream.path
+            ));
+        }
+    }
+    let plausible_metrics = report
+        .metrics
+        .iter()
+        .filter(|metric| {
+            metric.mean_percent_of_gpu_cycles.is_finite()
+                && metric.mean_percent_of_gpu_cycles >= 0.0
+                && metric.mean_percent_of_gpu_cycles <= 500.0
+                && metric.max_percent_of_gpu_cycles.is_finite()
+                && metric.max_percent_of_gpu_cycles <= 500.0
+        })
+        .collect::<Vec<_>>();
+    if !plausible_metrics.is_empty() {
+        out.push_str("\nTop cycle-normalized counters (bounded estimate):\n");
+        for metric in plausible_metrics.iter().take(32) {
+            out.push_str(&format!(
+                "  group={} source={} ring={} [{}] samples={} mean={:.2}% min={:.2}% max={:.2}% {}\n",
+                format_optional_usize(metric.sample_group),
+                format_optional_usize(metric.source_index),
+                format_optional_usize(metric.ring_index),
+                metric.counter_index,
+                metric.sample_count,
+                metric.mean_percent_of_gpu_cycles,
+                metric.min_percent_of_gpu_cycles,
+                metric.max_percent_of_gpu_cycles,
+                metric.raw_name
+            ));
+        }
+    }
+    let unbounded_count = report
+        .metrics
+        .iter()
+        .filter(|metric| {
+            !metric.mean_percent_of_gpu_cycles.is_finite()
+                || metric.mean_percent_of_gpu_cycles < 0.0
+                || metric.mean_percent_of_gpu_cycles > 500.0
+                || !metric.max_percent_of_gpu_cycles.is_finite()
+                || metric.max_percent_of_gpu_cycles > 500.0
+        })
+        .count();
+    if unbounded_count > 0 {
+        out.push_str(&format!(
+            "\n{unbounded_count} decoded counters are outside the bounded percent-like range; use --format json/csv for the full raw-id table.\n"
+        ));
+    }
+    out
+}
+
+pub fn format_raw_counters_csv(report: &RawCountersReport) -> String {
+    let mut out = String::new();
+    out.push_str("path,sample_group,source_index,ring_index,counter_index,raw_name,sample_count,min_percent_of_gpu_cycles,mean_percent_of_gpu_cycles,max_percent_of_gpu_cycles,encoder_id_count,kick_trace_id_count,source_id_count\n");
+    for metric in &report.metrics {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{}\n",
+            csv_escape(&metric.path),
+            optional_usize_csv(metric.sample_group),
+            optional_usize_csv(metric.source_index),
+            optional_usize_csv(metric.ring_index),
+            metric.counter_index,
+            csv_escape(&metric.raw_name),
+            metric.sample_count,
+            metric.min_percent_of_gpu_cycles,
+            metric.mean_percent_of_gpu_cycles,
+            metric.max_percent_of_gpu_cycles,
+            metric.encoder_ids.len(),
+            metric.kick_trace_ids.len(),
+            metric.source_ids.len()
+        ));
+    }
+    out
+}
+
+fn optional_usize_csv(value: Option<usize>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
 }
 
 pub fn format_raw_counter_probe(report: &RawCounterProbeReport) -> String {
@@ -514,9 +791,10 @@ pub fn format_raw_counter_probe(report: &RawCounterProbeReport) -> String {
         out.push_str("normalized derived counters\n");
         for metric in report.normalized_counters.iter().take(32) {
             out.push_str(&format!(
-                "  {} group={} ring={} encoders={} kicks={} sources={} [{}] {}: mean={:.2}% max={:.2}% samples={}\n",
+                "  {} group={} source={} ring={} encoders={} kicks={} sources={} [{}] {}: mean={:.2}% max={:.2}% samples={}\n",
                 metric.path,
                 format_optional_usize(metric.sample_group),
+                format_optional_usize(metric.source_index),
                 format_optional_usize(metric.ring_index),
                 format_u64_hex_list(&metric.encoder_ids, 4),
                 format_u64_hex_list(&metric.kick_trace_ids, 4),
@@ -908,6 +1186,7 @@ fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormaliz
                     .entry(RawCounterMetricKey {
                         path: path.clone(),
                         sample_group: path_ids.sample_group,
+                        source_index: path_ids.source_index,
                         ring_index: path_ids.ring_index,
                         counter_index,
                         raw_name: raw_name.clone(),
@@ -926,10 +1205,12 @@ fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormaliz
         .into_iter()
         .map(|(key, accum)| {
             let max_percent = accum.values.iter().copied().fold(0.0, f64::max);
+            let min_percent = accum.values.iter().copied().fold(f64::INFINITY, f64::min);
             let mean_percent = accum.values.iter().sum::<f64>() / accum.values.len() as f64;
             RawCounterNormalizedMetric {
                 path: key.path,
                 sample_group: key.sample_group,
+                source_index: key.source_index,
                 ring_index: key.ring_index,
                 encoder_ids: accum.encoder_ids.into_iter().collect(),
                 kick_trace_ids: accum.kick_trace_ids.into_iter().collect(),
@@ -937,6 +1218,7 @@ fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormaliz
                 counter_index: key.counter_index,
                 raw_name: key.raw_name,
                 sample_count: accum.values.len(),
+                min_percent,
                 mean_percent,
                 max_percent,
             }
@@ -1007,6 +1289,7 @@ fn normalized_match_tolerance(target: f64) -> f64 {
 struct RawCounterMetricKey {
     path: String,
     sample_group: Option<usize>,
+    source_index: Option<usize>,
     ring_index: Option<usize>,
     counter_index: usize,
     raw_name: String,
@@ -1044,6 +1327,7 @@ impl RawCounterMetricAccum {
 #[derive(Debug, Clone, Copy)]
 struct DerivedCounterSamplePath {
     sample_group: Option<usize>,
+    source_index: Option<usize>,
     ring_index: Option<usize>,
 }
 
@@ -1053,12 +1337,14 @@ fn parse_derived_counter_sample_path(path: &str) -> DerivedCounterSamplePath {
         if part == "Derived Counter Sample Data" {
             return DerivedCounterSamplePath {
                 sample_group: parts.next().and_then(|part| part.parse().ok()),
-                ring_index: parts.nth(1).and_then(|part| part.parse().ok()),
+                source_index: parts.next().and_then(|part| part.parse().ok()),
+                ring_index: parts.next().and_then(|part| part.parse().ok()),
             };
         }
     }
     DerivedCounterSamplePath {
         sample_group: None,
+        source_index: None,
         ring_index: None,
     }
 }
@@ -2283,6 +2569,71 @@ mod tests {
             record[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         }
         record
+    }
+
+    #[test]
+    fn parses_derived_counter_sample_group_source_and_ring() {
+        let path = "APSCounterData[44]/Derived Counter Sample Data/10/1/0";
+
+        let parsed = parse_derived_counter_sample_path(path);
+
+        assert_eq!(parsed.sample_group, Some(10));
+        assert_eq!(parsed.source_index, Some(1));
+        assert_eq!(parsed.ring_index, Some(0));
+    }
+
+    #[test]
+    fn formats_raw_counter_report_without_unbounded_rows_in_text_summary() {
+        let report = RawCountersReport {
+            trace_source: PathBuf::from("trace.gputrace"),
+            profiler_directory: PathBuf::from("trace.gputrace/raw"),
+            aggregate_metadata: Vec::new(),
+            schemas: vec![RawCounterSchema {
+                sample_group: 0,
+                counter_count: 2,
+                counter_names: vec!["_hot".to_owned(), "_huge".to_owned()],
+            }],
+            streams: Vec::new(),
+            metrics: vec![
+                RawCounterDecodedMetric {
+                    path: "APSCounterData[0]/Derived Counter Sample Data/0/1/0".to_owned(),
+                    sample_group: Some(0),
+                    source_index: Some(1),
+                    ring_index: Some(0),
+                    counter_index: 0,
+                    raw_name: "_hot".to_owned(),
+                    sample_count: 2,
+                    min_percent_of_gpu_cycles: 1.0,
+                    mean_percent_of_gpu_cycles: 12.0,
+                    max_percent_of_gpu_cycles: 20.0,
+                    encoder_ids: Vec::new(),
+                    kick_trace_ids: Vec::new(),
+                    source_ids: Vec::new(),
+                },
+                RawCounterDecodedMetric {
+                    path: "APSCounterData[0]/Derived Counter Sample Data/0/1/0".to_owned(),
+                    sample_group: Some(0),
+                    source_index: Some(1),
+                    ring_index: Some(0),
+                    counter_index: 1,
+                    raw_name: "_huge".to_owned(),
+                    sample_count: 2,
+                    min_percent_of_gpu_cycles: 1.0,
+                    mean_percent_of_gpu_cycles: 12.0,
+                    max_percent_of_gpu_cycles: 900.0,
+                    encoder_ids: Vec::new(),
+                    kick_trace_ids: Vec::new(),
+                    source_ids: Vec::new(),
+                },
+            ],
+            warnings: Vec::new(),
+        };
+
+        let formatted = format_raw_counters_report(&report);
+
+        assert!(formatted.contains("_hot"));
+        assert!(!formatted.contains("_huge"));
+        assert!(formatted.contains("1 decoded counters are outside"));
     }
 
     #[test]

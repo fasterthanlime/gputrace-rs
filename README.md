@@ -33,6 +33,10 @@ gputrace timing trace-perfdata.gputrace --format csv
 gputrace xcode-counters trace-perfdata.gputrace --format summary
 gputrace xcode-counters trace-perfdata.gputrace --csv Counters.csv --format json
 
+# Raw profiler-bundle counter structures, without a counter CSV.
+gputrace raw-counters trace-perfdata.gputrace --format text
+gputrace raw-counters trace-perfdata.gputrace --format json
+
 # Shader and source attribution.
 gputrace shaders trace-perfdata.gputrace --format json
 gputrace shader-source trace-perfdata.gputrace kernel_name --search-path src
@@ -62,7 +66,7 @@ not Xcode's Performance/Cost percentage.
 | Area | Commands |
 | --- | --- |
 | Trace overview | `stats`, `analyze`, `dump`, `dump-records`, `api-calls` |
-| Profiling and timing | `profiler`, `timing`, `timeline`, `xcode-counters`, `export-counters`, `validate-counters` |
+| Profiling and timing | `profiler`, `timing`, `timeline`, `raw-counters`, `xcode-counters`, `export-counters`, `validate-counters` |
 | Diffing | `diff`, `markdown diff` |
 | Shader analysis | `shaders`, `shader-source`, `shader-hotspots`, `correlate` |
 | Command structure | `command-buffers`, `encoders`, `kernels`, `dependencies`, `tree`, `graph`, `fences` |

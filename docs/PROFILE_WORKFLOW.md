@@ -227,8 +227,17 @@ The summary view highlights top invocations, memory bandwidth, low occupancy,
 buffer L1 misses, and limiter signals. Use `--metric <name> --top <n>` for a
 focused ranked table.
 
-If you are debugging Xcode raw counter parity, start with the structured
-`streamData` decoder:
+For end-user raw counter inspection without a counter CSV, use `raw-counters`.
+It reports the decoded `.gpuprofiler_raw/streamData` metadata, schemas,
+`GPRWCNTR` streams, and raw counter ids:
+
+```bash
+gputrace raw-counters /abs/path/input-perfdata.gputrace --format text
+gputrace raw-counters /abs/path/input-perfdata.gputrace --format json
+```
+
+If you are debugging Xcode raw counter parity or correlating against an exported
+counter CSV, use the hidden structured probe:
 
 ```bash
 gputrace raw-counter-probe /abs/path/input-perfdata.gputrace --metric "Instruction Throughput Limiter"
@@ -237,8 +246,8 @@ gputrace raw-counter-probe /abs/path/input-perfdata.gputrace --metric "ALU Utili
 
 The raw probe decodes aggregate metadata such as timebase, encoder sample
 indices, encoder trace-id rows, `GPRWCNTR` record sizes, and per-pass counter
-schemas. It is intentionally separate from the main analysis commands until the
-remaining private counter-name and Xcode aggregation rules are fully mapped.
+schemas. It is intentionally separate from the main analysis commands because it
+also carries CSV-correlation and format-reversal diagnostics.
 
 ## 8. Common Failure Modes
 
