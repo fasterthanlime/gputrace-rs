@@ -73,6 +73,7 @@ pub struct RawCountersReport {
     pub streams: Vec<RawCounterDecodedStream>,
     pub metrics: Vec<RawCounterDecodedMetric>,
     pub derived_metrics: Vec<RawCounterJsDerivedMetric>,
+    pub grouped_derived_metrics: Vec<RawCounterJsDerivedMetricGroup>,
     pub warnings: Vec<String>,
 }
 
@@ -140,6 +141,28 @@ pub struct RawCounterJsDerivedMetric {
     pub value: f64,
     pub source_script: PathBuf,
     pub source_catalog: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterJsDerivedMetricGroup {
+    pub group_kind: String,
+    pub group_id: String,
+    pub sample_group: Option<usize>,
+    pub source_index: Option<usize>,
+    pub ring_indices: Vec<usize>,
+    pub start_ticks: Option<u64>,
+    pub end_ticks: Option<u64>,
+    pub record_count: usize,
+    pub encoder_ids: Vec<u64>,
+    pub kick_trace_ids: Vec<u64>,
+    pub source_ids: Vec<u64>,
+    pub profiler_dispatch_index: Option<usize>,
+    pub profiler_encoder_index: Option<usize>,
+    pub profiler_function_name: Option<String>,
+    pub profiler_pipeline_id: Option<i64>,
+    pub profiler_start_ticks: Option<u64>,
+    pub profiler_end_ticks: Option<u64>,
+    pub derived_metrics: Vec<RawCounterJsDerivedMetric>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -406,9 +429,22 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
     let structured_layouts = probe_structured_counter_layouts(&trace.path);
     let normalized_counters = probe_normalized_counter_metrics(&trace.path);
     let js_variables = raw_counter_js_variables(&trace.path);
+    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    let js_variable_groups = raw_counter_js_variable_groups(
+        &trace.path,
+        profiler_summary
+            .as_ref()
+            .map(|summary| summary.dispatches.as_slice())
+            .unwrap_or(&[]),
+    );
     let device_identifier = trace_agx_device_identifier(&trace.path);
     let derived_metrics =
         evaluate_agx_derived_metrics(&catalog, &js_variables, device_identifier.as_deref());
+    let grouped_derived_metrics = evaluate_agx_derived_metric_groups(
+        &catalog,
+        js_variable_groups,
+        device_identifier.as_deref(),
+    );
     let schemas = schema_map
         .iter()
         .map(|(sample_group, counter_names)| RawCounterSchema {
@@ -484,6 +520,22 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
     if !js_variables.is_empty() && derived_metrics.is_empty() {
         warnings.push("no AGX JavaScript derived counters evaluated to finite values".to_owned());
     }
+    if profiler_summary
+        .as_ref()
+        .is_some_and(|summary| !summary.dispatches.is_empty())
+        && grouped_derived_metrics
+            .iter()
+            .all(|group| group.group_kind != "profiler_dispatch")
+        && grouped_derived_metrics
+            .iter()
+            .any(|group| group.group_kind == "sample_group")
+    {
+        warnings.push(
+            "raw counter sample timestamps did not overlap profiler dispatch tick windows; \
+             dispatch-level derived counters are unavailable for this bundle"
+                .to_owned(),
+        );
+    }
 
     Ok(RawCountersReport {
         trace_source: trace.path.clone(),
@@ -493,6 +545,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         streams,
         metrics,
         derived_metrics,
+        grouped_derived_metrics,
         warnings,
     })
 }
@@ -506,12 +559,13 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
         report.profiler_directory.display()
     ));
     out.push_str(&format!(
-        "metadata={} schemas={} streams={} metrics={} derived_metrics={}\n\n",
+        "metadata={} schemas={} streams={} metrics={} derived_metrics={} derived_groups={}\n\n",
         report.aggregate_metadata.len(),
         report.schemas.len(),
         report.streams.len(),
         report.metrics.len(),
-        report.derived_metrics.len()
+        report.derived_metrics.len(),
+        report.grouped_derived_metrics.len()
     ));
     for warning in &report.warnings {
         out.push_str(&format!("warning: {warning}\n"));
@@ -623,6 +677,59 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
             ));
         }
     }
+    if !report.grouped_derived_metrics.is_empty() {
+        let mut groups = report
+            .grouped_derived_metrics
+            .iter()
+            .filter(|group| !group.derived_metrics.is_empty())
+            .collect::<Vec<_>>();
+        groups.sort_by(|left, right| {
+            group_max_abs_derived_value(right)
+                .partial_cmp(&group_max_abs_derived_value(left))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.record_count.cmp(&left.record_count))
+                .then_with(|| left.group_kind.cmp(&right.group_kind))
+                .then_with(|| left.group_id.cmp(&right.group_id))
+        });
+        out.push_str("\nTop grouped AGX JavaScript-derived counters:\n");
+        for group in groups.iter().take(16) {
+            out.push_str(&format!(
+                "  {}={} records={} ticks={}-{} rings={:?}",
+                group.group_kind,
+                group.group_id,
+                group.record_count,
+                group
+                    .start_ticks
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                group
+                    .end_ticks
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                group.ring_indices
+            ));
+            if let Some(name) = group.profiler_function_name.as_deref() {
+                out.push_str(&format!(
+                    " dispatch={} function={}",
+                    group
+                        .profiler_dispatch_index
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    name
+                ));
+            }
+            out.push('\n');
+            for metric in top_derived_metrics(&group.derived_metrics, 6) {
+                out.push_str(&format!(
+                    "    {:>12.4} {} ({}) type={}\n",
+                    metric.value,
+                    metric.name,
+                    metric.key,
+                    metric.counter_type.as_deref().unwrap_or("-")
+                ));
+            }
+        }
+    }
     let unbounded_count = report
         .metrics
         .iter()
@@ -701,6 +808,35 @@ fn derived_counter_keys(metric: &RawCounterDecodedMetric) -> String {
         .into_iter()
         .collect::<Vec<_>>()
         .join("|")
+}
+
+fn group_max_abs_derived_value(group: &RawCounterJsDerivedMetricGroup) -> f64 {
+    group
+        .derived_metrics
+        .iter()
+        .filter_map(|metric| metric.value.is_finite().then_some(metric.value.abs()))
+        .fold(0.0, f64::max)
+}
+
+fn top_derived_metrics(
+    metrics: &[RawCounterJsDerivedMetric],
+    limit: usize,
+) -> Vec<&RawCounterJsDerivedMetric> {
+    let mut sorted = metrics
+        .iter()
+        .filter(|metric| metric.value.is_finite())
+        .collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        right
+            .value
+            .abs()
+            .partial_cmp(&left.value.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    sorted.truncate(limit);
+    sorted
 }
 
 fn optional_usize_csv(value: Option<usize>) -> String {
@@ -980,6 +1116,40 @@ fn evaluate_agx_derived_metrics(
     metrics
 }
 
+fn evaluate_agx_derived_metric_groups(
+    catalog: &RawCounterCatalog,
+    groups: Vec<RawCounterJsVariableGroup>,
+    device_identifier: Option<&str>,
+) -> Vec<RawCounterJsDerivedMetricGroup> {
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let metrics =
+                evaluate_agx_derived_metrics(catalog, &group.variables, device_identifier);
+            (!metrics.is_empty()).then_some(RawCounterJsDerivedMetricGroup {
+                group_kind: group.group_kind,
+                group_id: group.group_id,
+                sample_group: group.sample_group,
+                source_index: group.source_index,
+                ring_indices: group.ring_indices,
+                start_ticks: group.start_ticks,
+                end_ticks: group.end_ticks,
+                record_count: group.record_count,
+                encoder_ids: group.encoder_ids,
+                kick_trace_ids: group.kick_trace_ids,
+                source_ids: group.source_ids,
+                profiler_dispatch_index: group.profiler_dispatch_index,
+                profiler_encoder_index: group.profiler_encoder_index,
+                profiler_function_name: group.profiler_function_name,
+                profiler_pipeline_id: group.profiler_pipeline_id,
+                profiler_start_ticks: group.profiler_start_ticks,
+                profiler_end_ticks: group.profiler_end_ticks,
+                derived_metrics: metrics,
+            })
+        })
+        .collect()
+}
+
 fn choose_agx_derived_script(
     definitions_by_script: BTreeMap<PathBuf, Vec<RawCounterDerivedDefinition>>,
     device_identifier: Option<&str>,
@@ -1126,9 +1296,7 @@ fn raw_counter_js_variables(trace_path: &Path) -> BTreeMap<String, f64> {
 
     let mut accum = BTreeMap::<String, RawCounterJsVariableAccum>::new();
     for (path, data) in sample_blobs {
-        if !path.contains("/Derived Counter Sample Data/")
-            || path.split('/').nth_back(1) != Some("1")
-        {
+        if !path.contains("/Derived Counter Sample Data/") {
             continue;
         }
         let Some((record_size, _)) = gprw_record_info(&data) else {
@@ -1165,6 +1333,252 @@ fn raw_counter_js_variables(trace_path: &Path) -> BTreeMap<String, f64> {
         }
     }
 
+    let mut variables = BTreeMap::new();
+    for (raw_name, accum) in accum {
+        let Some(raw_mean) = mean(&accum.raw_values) else {
+            continue;
+        };
+        let normalized_mean = mean(&accum.normalized_values).unwrap_or(raw_mean);
+        variables.insert(raw_name.clone(), raw_mean);
+        variables.insert(format!("{raw_name}_norm"), normalized_mean);
+    }
+    variables
+}
+
+fn raw_counter_js_variable_groups(
+    trace_path: &Path,
+    profiler_dispatches: &[profiler::ProfilerDispatch],
+) -> Vec<RawCounterJsVariableGroup> {
+    let Some((counter_schemas, fallback_counter_names, sample_blobs)) =
+        counter_schemas_and_sample_blobs(trace_path)
+    else {
+        return Vec::new();
+    };
+    if counter_schemas.is_empty() && fallback_counter_names.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sample_groups =
+        BTreeMap::<(Option<usize>, Option<usize>), RawCounterJsGroupAccum>::new();
+    let mut dispatch_groups = BTreeMap::<usize, RawCounterJsGroupAccum>::new();
+    for (path, data) in sample_blobs {
+        if !path.contains("/Derived Counter Sample Data/") {
+            continue;
+        }
+        let Some((record_size, _)) = gprw_record_info(&data) else {
+            continue;
+        };
+        let records = gprw_u64_records(&data, record_size);
+        if records.is_empty() {
+            continue;
+        }
+        let path_ids = parse_derived_counter_sample_path(&path);
+        let Some(counter_names) = path_ids
+            .sample_group
+            .and_then(|group| counter_schemas.get(&group))
+            .or((!fallback_counter_names.is_empty()).then_some(&fallback_counter_names))
+        else {
+            continue;
+        };
+        for record in &records {
+            let sample_accum = sample_groups
+                .entry((path_ids.sample_group, path_ids.source_index))
+                .or_default();
+            sample_accum.push_record_metadata(record, &path_ids);
+            push_raw_counter_js_values(sample_accum, record, counter_names);
+
+            let Some(dispatch) =
+                profiler_dispatch_for_raw_counter_record(record, profiler_dispatches)
+            else {
+                continue;
+            };
+            let dispatch_accum = dispatch_groups.entry(dispatch.index).or_default();
+            dispatch_accum.push_record_metadata(record, &path_ids);
+            push_raw_counter_js_values(dispatch_accum, record, counter_names);
+        }
+    }
+
+    let mut groups = Vec::new();
+    groups.extend(
+        sample_groups
+            .into_iter()
+            .filter_map(|((sample_group, source_index), accum)| {
+                let group_id = match (sample_group, source_index) {
+                    (Some(sample_group), Some(source_index)) => {
+                        format!("{sample_group}/source{source_index}")
+                    }
+                    (Some(sample_group), None) => sample_group.to_string(),
+                    (None, Some(source_index)) => format!("source{source_index}"),
+                    (None, None) => "unknown".to_owned(),
+                };
+                RawCounterJsVariableGroup::from_accum(
+                    "sample_group",
+                    group_id,
+                    sample_group,
+                    source_index,
+                    None,
+                    accum,
+                )
+            }),
+    );
+    let dispatches_by_index = profiler_dispatches
+        .iter()
+        .map(|dispatch| (dispatch.index, dispatch))
+        .collect::<BTreeMap<_, _>>();
+    groups.extend(dispatch_groups.into_iter().filter_map(|(index, accum)| {
+        let dispatch = dispatches_by_index.get(&index).copied();
+        RawCounterJsVariableGroup::from_accum(
+            "profiler_dispatch",
+            index.to_string(),
+            None,
+            None,
+            dispatch,
+            accum,
+        )
+    }));
+    groups.sort_by(|left, right| {
+        left.group_kind
+            .cmp(&right.group_kind)
+            .then_with(|| left.group_id.cmp(&right.group_id))
+    });
+    groups
+}
+
+fn profiler_dispatch_for_raw_counter_record<'a>(
+    record: &[u64],
+    dispatches: &'a [profiler::ProfilerDispatch],
+) -> Option<&'a profiler::ProfilerDispatch> {
+    let timestamp = record.get(1).copied()?;
+    let index = dispatches
+        .partition_point(|dispatch| dispatch.end_ticks != 0 && dispatch.end_ticks < timestamp);
+    dispatches
+        .get(index)
+        .filter(|dispatch| dispatch.start_ticks <= timestamp && timestamp <= dispatch.end_ticks)
+}
+
+#[derive(Debug)]
+struct RawCounterJsVariableGroup {
+    group_kind: String,
+    group_id: String,
+    sample_group: Option<usize>,
+    source_index: Option<usize>,
+    ring_indices: Vec<usize>,
+    start_ticks: Option<u64>,
+    end_ticks: Option<u64>,
+    record_count: usize,
+    encoder_ids: Vec<u64>,
+    kick_trace_ids: Vec<u64>,
+    source_ids: Vec<u64>,
+    profiler_dispatch_index: Option<usize>,
+    profiler_encoder_index: Option<usize>,
+    profiler_function_name: Option<String>,
+    profiler_pipeline_id: Option<i64>,
+    profiler_start_ticks: Option<u64>,
+    profiler_end_ticks: Option<u64>,
+    variables: BTreeMap<String, f64>,
+}
+
+impl RawCounterJsVariableGroup {
+    fn from_accum(
+        group_kind: &str,
+        group_id: String,
+        sample_group: Option<usize>,
+        source_index: Option<usize>,
+        dispatch: Option<&profiler::ProfilerDispatch>,
+        accum: RawCounterJsGroupAccum,
+    ) -> Option<Self> {
+        let variables = raw_counter_js_variables_from_accum(accum.counters);
+        (!variables.is_empty()).then(|| Self {
+            group_kind: group_kind.to_owned(),
+            group_id,
+            sample_group,
+            source_index,
+            ring_indices: accum.ring_indices.into_iter().collect(),
+            start_ticks: accum.start_ticks,
+            end_ticks: accum.end_ticks,
+            record_count: accum.record_count,
+            encoder_ids: accum.encoder_ids.into_iter().collect(),
+            kick_trace_ids: accum.kick_trace_ids.into_iter().collect(),
+            source_ids: accum.source_ids.into_iter().collect(),
+            profiler_dispatch_index: dispatch.map(|dispatch| dispatch.index),
+            profiler_encoder_index: dispatch.map(|dispatch| dispatch.encoder_index),
+            profiler_function_name: dispatch.and_then(|dispatch| dispatch.function_name.clone()),
+            profiler_pipeline_id: dispatch.and_then(|dispatch| dispatch.pipeline_id),
+            profiler_start_ticks: dispatch.map(|dispatch| dispatch.start_ticks),
+            profiler_end_ticks: dispatch.map(|dispatch| dispatch.end_ticks),
+            variables,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct RawCounterJsGroupAccum {
+    counters: BTreeMap<String, RawCounterJsVariableAccum>,
+    record_count: usize,
+    ring_indices: BTreeSet<usize>,
+    start_ticks: Option<u64>,
+    end_ticks: Option<u64>,
+    encoder_ids: BTreeSet<u64>,
+    kick_trace_ids: BTreeSet<u64>,
+    source_ids: BTreeSet<u64>,
+}
+
+impl RawCounterJsGroupAccum {
+    fn push_record_metadata(&mut self, record: &[u64], path_ids: &DerivedCounterSamplePath) {
+        self.record_count += 1;
+        if let Some(ring_index) = path_ids.ring_index {
+            self.ring_indices.insert(ring_index);
+        }
+        if let Some(timestamp) = record.get(1).copied() {
+            self.start_ticks = Some(
+                self.start_ticks
+                    .map(|current| current.min(timestamp))
+                    .unwrap_or(timestamp),
+            );
+            self.end_ticks = Some(
+                self.end_ticks
+                    .map(|current| current.max(timestamp))
+                    .unwrap_or(timestamp),
+            );
+        }
+        if let Some(encoder_id) = record.get(4).copied() {
+            self.encoder_ids.insert(encoder_id);
+        }
+        if let Some(kick_trace_id) = record.get(5).copied() {
+            self.kick_trace_ids.insert(kick_trace_id);
+        }
+        if let Some(source_id) = record.get(7).copied() {
+            self.source_ids.insert(source_id);
+        }
+    }
+}
+
+fn push_raw_counter_js_values(
+    accum: &mut RawCounterJsGroupAccum,
+    record: &[u64],
+    counter_names: &[String],
+) {
+    for (counter_index, raw_name) in counter_names.iter().enumerate() {
+        let value_column = 8 + counter_index;
+        let Some(value) = record.get(value_column).copied() else {
+            continue;
+        };
+        let normalized = record
+            .get(2)
+            .copied()
+            .filter(|denominator| *denominator != 0)
+            .map(|denominator| value as f64 / denominator as f64 * 100.0);
+        accum
+            .counters
+            .entry(raw_name.clone())
+            .or_default()
+            .push(value as f64, normalized);
+    }
+}
+
+fn raw_counter_js_variables_from_accum(
+    accum: BTreeMap<String, RawCounterJsVariableAccum>,
+) -> BTreeMap<String, f64> {
     let mut variables = BTreeMap::new();
     for (raw_name, accum) in accum {
         let Some(raw_mean) = mean(&accum.raw_values) else {
@@ -3225,6 +3639,44 @@ mod tests {
     }
 
     #[test]
+    fn matches_raw_counter_record_to_profiler_dispatch_window() {
+        let dispatches = vec![
+            profiler::ProfilerDispatch {
+                index: 7,
+                pipeline_index: 0,
+                pipeline_id: Some(42),
+                function_name: Some("kernel_a".to_owned()),
+                encoder_index: 2,
+                cumulative_us: 10,
+                duration_us: 10,
+                sample_count: 0,
+                sampling_density: 0.0,
+                start_ticks: 100,
+                end_ticks: 200,
+            },
+            profiler::ProfilerDispatch {
+                index: 8,
+                pipeline_index: 0,
+                pipeline_id: Some(43),
+                function_name: Some("kernel_b".to_owned()),
+                encoder_index: 2,
+                cumulative_us: 20,
+                duration_us: 10,
+                sample_count: 0,
+                sampling_density: 0.0,
+                start_ticks: 201,
+                end_ticks: 300,
+            },
+        ];
+        let record = vec![0, 250];
+
+        let matched = profiler_dispatch_for_raw_counter_record(&record, &dispatches).unwrap();
+
+        assert_eq!(matched.index, 8);
+        assert_eq!(matched.function_name.as_deref(), Some("kernel_b"));
+    }
+
+    #[test]
     fn formats_raw_counter_report_without_unbounded_rows_in_text_summary() {
         let report = RawCountersReport {
             trace_source: PathBuf::from("trace.gputrace"),
@@ -3273,6 +3725,7 @@ mod tests {
                 },
             ],
             derived_metrics: Vec::new(),
+            grouped_derived_metrics: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -3321,6 +3774,7 @@ mod tests {
             streams: Vec::new(),
             metrics: vec![metric],
             derived_metrics: Vec::new(),
+            grouped_derived_metrics: Vec::new(),
             warnings: Vec::new(),
         };
 

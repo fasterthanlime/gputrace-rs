@@ -65,7 +65,10 @@ not Xcode's Performance/Cost percentage.
 with installed AGX Metal catalog names where the local system provides them.
 Its JSON output also includes `derived_metrics` computed by running Apple's
 local AGX `*-derived.js` formulas against decoded raw counter variables; it does
-not require an Xcode counter CSV.
+not require an Xcode counter CSV. `grouped_derived_metrics` repeats those
+formula evaluations per raw counter sample group/source, and includes
+profiler-dispatch fields only when the raw counter timestamps overlap
+`streamData` dispatch tick windows.
 
 ## Main Commands
 

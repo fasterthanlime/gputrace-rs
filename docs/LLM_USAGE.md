@@ -162,7 +162,11 @@ available, it enriches raw hashes from installed AGX Metal statistics/perf
 counter plists under `/System/Library/Extensions`. The JSON report includes
 `derived_metrics` when local AGX `*-derived.js` files can be evaluated from
 decoded raw variables. Treat these as offline Apple-formula counter values; they
-do not depend on, or require, an exported Xcode counter CSV:
+do not depend on, or require, an exported Xcode counter CSV.
+`grouped_derived_metrics` contains the same formula output split by raw counter
+sample group/source. It also carries profiler dispatch metadata when a trace's
+raw counter timestamps overlap `streamData` dispatch tick windows; if they do
+not, the report warns rather than fabricating a dispatch join:
 
 ```bash
 gputrace raw-counters trace-perfdata.gputrace --format text

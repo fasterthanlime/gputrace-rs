@@ -232,7 +232,10 @@ It reports the decoded `.gpuprofiler_raw/streamData` metadata, schemas,
 `GPRWCNTR` streams, raw counter ids, and any matching derived counter names from
 installed AGX Metal statistics/perf counter catalogs. In JSON, `derived_metrics`
 contains finite values from running Apple's local AGX `*-derived.js` formulas
-against decoded raw variables, without needing a separate Xcode counter CSV:
+against decoded raw variables, without needing a separate Xcode counter CSV.
+`grouped_derived_metrics` splits those derived values by raw sample group/source
+and includes profiler-dispatch join fields only when the bundle exposes
+overlapping raw counter and `streamData` tick windows:
 
 ```bash
 gputrace raw-counters /abs/path/input-perfdata.gputrace --format text
