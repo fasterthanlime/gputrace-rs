@@ -54,6 +54,7 @@ pub struct RawCounterProbeReport {
     pub profiler_directory: PathBuf,
     pub csv_source: Option<PathBuf>,
     pub targets: Vec<RawCounterProbeTarget>,
+    pub aggregate_metadata: Vec<RawCounterAggregateMetadata>,
     pub stream_archives: Vec<RawCounterStreamArchive>,
     pub structured_layouts: Vec<RawCounterStructuredLayout>,
     pub normalized_counters: Vec<RawCounterNormalizedMetric>,
@@ -69,6 +70,32 @@ pub struct RawCounterProbeTarget {
     pub encoder_label: String,
     pub value: f64,
     pub tolerance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterAggregateMetadata {
+    pub archive_index: usize,
+    pub timebase_numer: Option<u64>,
+    pub timebase_denom: Option<u64>,
+    pub num_encoders: Option<u64>,
+    pub perf_info: BTreeMap<String, u64>,
+    pub encoder_sample_indices: Vec<RawCounterEncoderSampleIndex>,
+    pub encoder_infos: Vec<RawCounterEncoderInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterEncoderSampleIndex {
+    pub row_index: usize,
+    pub word0: u32,
+    pub word1: u32,
+    pub sample_index: u32,
+    pub word3: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterEncoderInfo {
+    pub row_index: usize,
+    pub trace_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -278,6 +305,7 @@ pub fn probe_raw_counters(
         profiler_directory,
         csv_source: csv_data.map(|data| data.source),
         targets,
+        aggregate_metadata: probe_aggregate_counter_metadata(&trace.path),
         stream_archives: probe_stream_archives(&trace.path),
         structured_layouts: probe_structured_counter_layouts(&trace.path),
         normalized_counters,
@@ -299,6 +327,47 @@ pub fn format_raw_counter_probe(report: &RawCounterProbeReport) -> String {
         out.push_str(&format!("csv_source={}\n", csv_source.display()));
     }
     out.push_str(&format!("targets={}\n\n", report.targets.len()));
+
+    if !report.aggregate_metadata.is_empty() {
+        out.push_str("aggregate counter metadata\n");
+        for metadata in &report.aggregate_metadata {
+            out.push_str(&format!(
+                "  APSCounterData[{}]: timebase={}/{} num_encoders={} perf={:?}\n",
+                metadata.archive_index,
+                metadata
+                    .timebase_numer
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                metadata
+                    .timebase_denom
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                metadata
+                    .num_encoders
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                metadata.perf_info
+            ));
+            if !metadata.encoder_sample_indices.is_empty() {
+                out.push_str("    encoder sample indices:");
+                for row in metadata.encoder_sample_indices.iter().take(8) {
+                    out.push_str(&format!(
+                        " #{}=({}, {}, sample={}, {})",
+                        row.row_index, row.word0, row.word1, row.sample_index, row.word3
+                    ));
+                }
+                out.push('\n');
+            }
+            if !metadata.encoder_infos.is_empty() {
+                out.push_str("    encoder infos:");
+                for row in metadata.encoder_infos.iter().take(8) {
+                    out.push_str(&format!(" #{}={:?}", row.row_index, row.trace_ids));
+                }
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
 
     if !report.stream_archives.is_empty() {
         out.push_str("streamData archives\n");
@@ -528,6 +597,110 @@ fn format_u64_hex_list(values: &[u64], limit: usize) -> String {
         formatted.push(format!("+{}", values.len() - limit));
     }
     formatted.join("|")
+}
+
+fn probe_aggregate_counter_metadata(trace_path: &Path) -> Vec<RawCounterAggregateMetadata> {
+    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
+        return Vec::new();
+    };
+    let stream_data_path = profiler_dir.join("streamData");
+    let Ok(plist) = Value::from_file(stream_data_path) else {
+        return Vec::new();
+    };
+    let Some(archive) = plist.as_dictionary() else {
+        return Vec::new();
+    };
+    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
+        return Vec::new();
+    };
+
+    ns_data_array_from_root_key(objects, root, "APSCounterData")
+        .into_iter()
+        .enumerate()
+        .filter_map(|(archive_index, bytes)| {
+            let keyed = parse_keyed_archive_dictionary(&bytes)?;
+            if !keyed.contains_key("Derived Counter Sample Data") {
+                return None;
+            }
+            Some(RawCounterAggregateMetadata {
+                archive_index,
+                timebase_numer: array_integer(&keyed, "Timebase", 0),
+                timebase_denom: array_integer(&keyed, "Timebase", 1),
+                num_encoders: keyed
+                    .get("Num Encoders")
+                    .and_then(StreamArchiveValue::as_u64),
+                perf_info: keyed
+                    .get("Perf Info")
+                    .and_then(StreamArchiveValue::as_dictionary)
+                    .map(dictionary_u64_values)
+                    .unwrap_or_default(),
+                encoder_sample_indices: keyed
+                    .get("Encoder Sample Index Data")
+                    .and_then(StreamArchiveValue::as_data)
+                    .map(parse_encoder_sample_indices)
+                    .unwrap_or_default(),
+                encoder_infos: keyed
+                    .get("Encoder Infos")
+                    .map(parse_encoder_infos)
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn array_integer(
+    keyed: &BTreeMap<String, StreamArchiveValue>,
+    key: &str,
+    index: usize,
+) -> Option<u64> {
+    let StreamArchiveValue::Array(values) = keyed.get(key)? else {
+        return None;
+    };
+    values.get(index).and_then(StreamArchiveValue::as_u64)
+}
+
+fn dictionary_u64_values(values: &BTreeMap<String, StreamArchiveValue>) -> BTreeMap<String, u64> {
+    values
+        .iter()
+        .filter_map(|(key, value)| value.as_u64().map(|value| (key.clone(), value)))
+        .collect()
+}
+
+fn parse_encoder_sample_indices(data: &[u8]) -> Vec<RawCounterEncoderSampleIndex> {
+    data.chunks_exact(16)
+        .enumerate()
+        .map(|(row_index, chunk)| RawCounterEncoderSampleIndex {
+            row_index,
+            word0: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
+            word1: u32::from_le_bytes(chunk[4..8].try_into().unwrap()),
+            sample_index: u32::from_le_bytes(chunk[8..12].try_into().unwrap()),
+            word3: u32::from_le_bytes(chunk[12..16].try_into().unwrap()),
+        })
+        .collect()
+}
+
+fn parse_encoder_infos(value: &StreamArchiveValue) -> Vec<RawCounterEncoderInfo> {
+    let StreamArchiveValue::Array(values) = value else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .enumerate()
+        .filter_map(|(row_index, value)| {
+            let data = value.as_data()?;
+            let trace_ids = data
+                .chunks_exact(mem::size_of::<u32>())
+                .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            Some(RawCounterEncoderInfo {
+                row_index,
+                trace_ids,
+            })
+        })
+        .collect()
 }
 
 fn probe_stream_archives(trace_path: &Path) -> Vec<RawCounterStreamArchive> {
@@ -1156,6 +1329,13 @@ impl StreamArchiveValue {
     fn as_data_len(&self) -> Option<usize> {
         match self {
             Self::Data(value) => Some(value.len()),
+            _ => None,
+        }
+    }
+
+    fn as_data(&self) -> Option<&[u8]> {
+        match self {
+            Self::Data(value) => Some(value),
             _ => None,
         }
     }
