@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Cursor;
 use std::mem;
@@ -13,6 +13,7 @@ use crate::trace::TraceBundle;
 use crate::xcode_counters;
 
 type SampleBlob = (String, Vec<u8>);
+type CounterSchemaByGroup = BTreeMap<usize, Vec<String>>;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CounterLimiter {
@@ -56,6 +57,7 @@ pub struct RawCounterProbeReport {
     pub stream_archives: Vec<RawCounterStreamArchive>,
     pub structured_layouts: Vec<RawCounterStructuredLayout>,
     pub normalized_counters: Vec<RawCounterNormalizedMetric>,
+    pub normalized_matches: Vec<RawCounterNormalizedMatch>,
     pub structured_samples: Vec<RawCounterStructuredSample>,
     pub files: Vec<RawCounterProbeFile>,
 }
@@ -153,11 +155,28 @@ pub struct RawCounterColumnStat {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RawCounterNormalizedMetric {
     pub path: String,
+    pub sample_group: Option<usize>,
+    pub ring_index: Option<usize>,
+    pub encoder_ids: Vec<u64>,
+    pub kick_trace_ids: Vec<u64>,
+    pub source_ids: Vec<u64>,
     pub counter_index: usize,
     pub raw_name: String,
     pub sample_count: usize,
     pub mean_percent: f64,
     pub max_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterNormalizedMatch {
+    pub metric: String,
+    pub row_index: usize,
+    pub encoder_label: String,
+    pub target: f64,
+    pub delta: f64,
+    pub tolerance: f64,
+    pub confidence: f64,
+    pub counter: RawCounterNormalizedMetric,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -191,6 +210,7 @@ pub fn probe_raw_counters(
     trace: &TraceBundle,
     csv_path: Option<PathBuf>,
     metric_filter: Option<&str>,
+    scan_files: bool,
 ) -> crate::Result<RawCounterProbeReport> {
     let profiler_directory = profiler::find_profiler_directory(&trace.path)
         .ok_or_else(|| crate::Error::NotFound(trace.path.clone()))?;
@@ -217,37 +237,41 @@ pub fn probe_raw_counters(
         }
     }
 
-    let mut files = fs::read_dir(&profiler_directory)?
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let file_index = name
-                .strip_prefix("Counters_f_")
-                .and_then(|rest| rest.strip_suffix(".raw"))
-                .and_then(|rest| rest.parse::<usize>().ok())?;
-            path.is_file().then_some((file_index, name, path))
-        })
-        .collect::<Vec<_>>();
-    files.sort_by_key(|(file_index, _, _)| *file_index);
-
     let mut file_reports = Vec::new();
-    for (file_index, file_name, path) in files {
-        let data = fs::read(path)?;
-        let markers = find_raw_counter_markers(&data);
-        let top_record_shapes = summarize_raw_counter_shapes(&data, &markers);
-        let matches = probe_counter_targets(&data, &markers, &targets);
-        file_reports.push(RawCounterProbeFile {
-            file_index,
-            file_name,
-            byte_len: data.len(),
-            page_count_4k: (data.len() % 4096 == 0).then_some(data.len() / 4096),
-            marker_count: markers.len(),
-            top_record_shapes,
-            matches,
-        });
+    if scan_files {
+        let mut files = fs::read_dir(&profiler_directory)?
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let file_index = name
+                    .strip_prefix("Counters_f_")
+                    .and_then(|rest| rest.strip_suffix(".raw"))
+                    .and_then(|rest| rest.parse::<usize>().ok())?;
+                path.is_file().then_some((file_index, name, path))
+            })
+            .collect::<Vec<_>>();
+        files.sort_by_key(|(file_index, _, _)| *file_index);
+
+        for (file_index, file_name, path) in files {
+            let data = fs::read(path)?;
+            let markers = find_raw_counter_markers(&data);
+            let top_record_shapes = summarize_raw_counter_shapes(&data, &markers);
+            let matches = probe_counter_targets(&data, &markers, &targets);
+            file_reports.push(RawCounterProbeFile {
+                file_index,
+                file_name,
+                byte_len: data.len(),
+                page_count_4k: (data.len() % 4096 == 0).then_some(data.len() / 4096),
+                marker_count: markers.len(),
+                top_record_shapes,
+                matches,
+            });
+        }
     }
 
+    let normalized_counters = probe_normalized_counter_metrics(&trace.path);
+    let normalized_matches = match_normalized_counter_targets(&normalized_counters, &targets);
     let structured_samples = probe_structured_counter_samples(&trace.path, &targets);
 
     Ok(RawCounterProbeReport {
@@ -256,7 +280,8 @@ pub fn probe_raw_counters(
         targets,
         stream_archives: probe_stream_archives(&trace.path),
         structured_layouts: probe_structured_counter_layouts(&trace.path),
-        normalized_counters: probe_normalized_counter_metrics(&trace.path),
+        normalized_counters,
+        normalized_matches,
         structured_samples,
         files: file_reports,
     })
@@ -397,11 +422,36 @@ pub fn format_raw_counter_probe(report: &RawCounterProbeReport) -> String {
     }
 
     if !report.normalized_counters.is_empty() {
+        if !report.normalized_matches.is_empty() {
+            out.push_str("normalized counter target matches\n");
+            for matched in report.normalized_matches.iter().take(32) {
+                out.push_str(&format!(
+                    "  {} row={} target={:.2}% delta={:.2}% confidence={:.2} -> {} group={} ring={} [{}] {}\n",
+                    matched.metric,
+                    matched.row_index,
+                    matched.target,
+                    matched.delta,
+                    matched.confidence,
+                    matched.counter.path,
+                    format_optional_usize(matched.counter.sample_group),
+                    format_optional_usize(matched.counter.ring_index),
+                    matched.counter.counter_index,
+                    matched.counter.raw_name
+                ));
+            }
+            out.push('\n');
+        }
+
         out.push_str("normalized derived counters\n");
         for metric in report.normalized_counters.iter().take(32) {
             out.push_str(&format!(
-                "  {} [{}] {}: mean={:.2}% max={:.2}% samples={}\n",
+                "  {} group={} ring={} encoders={} kicks={} sources={} [{}] {}: mean={:.2}% max={:.2}% samples={}\n",
                 metric.path,
+                format_optional_usize(metric.sample_group),
+                format_optional_usize(metric.ring_index),
+                format_u64_hex_list(&metric.encoder_ids, 4),
+                format_u64_hex_list(&metric.kick_trace_ids, 4),
+                format_u64_hex_list(&metric.source_ids, 4),
                 metric.counter_index,
                 metric.raw_name,
                 metric.mean_percent,
@@ -457,6 +507,27 @@ pub fn format_raw_counter_probe(report: &RawCounterProbeReport) -> String {
         out.push('\n');
     }
     out
+}
+
+fn format_optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_u64_hex_list(values: &[u64], limit: usize) -> String {
+    if values.is_empty() {
+        return "-".to_owned();
+    }
+    let mut formatted = values
+        .iter()
+        .take(limit)
+        .map(|value| format!("0x{value:x}"))
+        .collect::<Vec<_>>();
+    if values.len() > limit {
+        formatted.push(format!("+{}", values.len() - limit));
+    }
+    formatted.join("|")
 }
 
 fn probe_stream_archives(trace_path: &Path) -> Vec<RawCounterStreamArchive> {
@@ -617,14 +688,16 @@ fn probe_structured_counter_layouts(trace_path: &Path) -> Vec<RawCounterStructur
 }
 
 fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormalizedMetric> {
-    let Some((counter_names, sample_blobs)) = counter_names_and_sample_blobs(trace_path) else {
+    let Some((counter_schemas, fallback_counter_names, sample_blobs)) =
+        counter_schemas_and_sample_blobs(trace_path)
+    else {
         return Vec::new();
     };
-    if counter_names.is_empty() {
+    if counter_schemas.is_empty() && fallback_counter_names.is_empty() {
         return Vec::new();
     }
 
-    let mut metrics = Vec::new();
+    let mut accum = BTreeMap::<RawCounterMetricKey, RawCounterMetricAccum>::new();
     for (path, data) in sample_blobs {
         if !path.contains("/Derived Counter Sample Data/")
             || path.split('/').nth_back(1) != Some("1")
@@ -638,9 +711,16 @@ fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormaliz
         if records.is_empty() {
             continue;
         }
+        let path_ids = parse_derived_counter_sample_path(&path);
+        let Some(counter_names) = path_ids
+            .sample_group
+            .and_then(|group| counter_schemas.get(&group))
+            .or((!fallback_counter_names.is_empty()).then_some(&fallback_counter_names))
+        else {
+            continue;
+        };
         for (counter_index, raw_name) in counter_names.iter().enumerate() {
             let value_column = 8 + counter_index;
-            let mut values = Vec::new();
             for record in &records {
                 let Some(denominator) = record.get(2).copied() else {
                     continue;
@@ -651,23 +731,44 @@ fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormaliz
                 if denominator == 0 {
                     continue;
                 }
-                values.push(value as f64 / denominator as f64 * 100.0);
+                accum
+                    .entry(RawCounterMetricKey {
+                        path: path.clone(),
+                        sample_group: path_ids.sample_group,
+                        ring_index: path_ids.ring_index,
+                        counter_index,
+                        raw_name: raw_name.clone(),
+                    })
+                    .or_default()
+                    .push(
+                        value as f64 / denominator as f64 * 100.0,
+                        record.get(4).copied(),
+                        record.get(5).copied(),
+                        record.get(7).copied(),
+                    );
             }
-            if values.is_empty() {
-                continue;
-            }
-            let max_percent = values.iter().copied().fold(0.0, f64::max);
-            let mean_percent = values.iter().sum::<f64>() / values.len() as f64;
-            metrics.push(RawCounterNormalizedMetric {
-                path: path.clone(),
-                counter_index,
-                raw_name: raw_name.clone(),
-                sample_count: values.len(),
-                mean_percent,
-                max_percent,
-            });
         }
     }
+    let mut metrics = accum
+        .into_iter()
+        .map(|(key, accum)| {
+            let max_percent = accum.values.iter().copied().fold(0.0, f64::max);
+            let mean_percent = accum.values.iter().sum::<f64>() / accum.values.len() as f64;
+            RawCounterNormalizedMetric {
+                path: key.path,
+                sample_group: key.sample_group,
+                ring_index: key.ring_index,
+                encoder_ids: accum.encoder_ids.into_iter().collect(),
+                kick_trace_ids: accum.kick_trace_ids.into_iter().collect(),
+                source_ids: accum.source_ids.into_iter().collect(),
+                counter_index: key.counter_index,
+                raw_name: key.raw_name,
+                sample_count: accum.values.len(),
+                mean_percent,
+                max_percent,
+            }
+        })
+        .collect::<Vec<_>>();
     metrics.sort_by(|left, right| {
         right
             .mean_percent
@@ -679,7 +780,119 @@ fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormaliz
     metrics
 }
 
-fn counter_names_and_sample_blobs(trace_path: &Path) -> Option<(Vec<String>, Vec<SampleBlob>)> {
+fn match_normalized_counter_targets(
+    counters: &[RawCounterNormalizedMetric],
+    targets: &[RawCounterProbeTarget],
+) -> Vec<RawCounterNormalizedMatch> {
+    let mut matches = Vec::new();
+    for target in targets {
+        if target.value.abs() < 5.0 {
+            continue;
+        }
+        let tolerance = normalized_match_tolerance(target.value);
+        for counter in counters {
+            if counter.sample_count < 20 {
+                continue;
+            }
+            let delta = (counter.mean_percent - target.value).abs();
+            if delta > tolerance {
+                continue;
+            }
+            matches.push(RawCounterNormalizedMatch {
+                metric: target.metric.clone(),
+                row_index: target.row_index,
+                encoder_label: target.encoder_label.clone(),
+                target: target.value,
+                delta,
+                tolerance,
+                confidence: (1.0 - delta / tolerance).clamp(0.0, 1.0),
+                counter: counter.clone(),
+            });
+        }
+    }
+    matches.sort_by(|left, right| {
+        right
+            .confidence
+            .partial_cmp(&left.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.delta
+                    .partial_cmp(&right.delta)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.metric.cmp(&right.metric))
+            .then_with(|| left.row_index.cmp(&right.row_index))
+    });
+    matches
+}
+
+fn normalized_match_tolerance(target: f64) -> f64 {
+    (target.abs() * 0.10).max(2.0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawCounterMetricKey {
+    path: String,
+    sample_group: Option<usize>,
+    ring_index: Option<usize>,
+    counter_index: usize,
+    raw_name: String,
+}
+
+#[derive(Debug, Default)]
+struct RawCounterMetricAccum {
+    values: Vec<f64>,
+    encoder_ids: BTreeSet<u64>,
+    kick_trace_ids: BTreeSet<u64>,
+    source_ids: BTreeSet<u64>,
+}
+
+impl RawCounterMetricAccum {
+    fn push(
+        &mut self,
+        value: f64,
+        encoder_id: Option<u64>,
+        kick_trace_id: Option<u64>,
+        source_id: Option<u64>,
+    ) {
+        self.values.push(value);
+        if let Some(encoder_id) = encoder_id {
+            self.encoder_ids.insert(encoder_id);
+        }
+        if let Some(kick_trace_id) = kick_trace_id {
+            self.kick_trace_ids.insert(kick_trace_id);
+        }
+        if let Some(source_id) = source_id {
+            self.source_ids.insert(source_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DerivedCounterSamplePath {
+    sample_group: Option<usize>,
+    ring_index: Option<usize>,
+}
+
+fn parse_derived_counter_sample_path(path: &str) -> DerivedCounterSamplePath {
+    let mut parts = path.split('/');
+    while let Some(part) = parts.next() {
+        if part == "Derived Counter Sample Data" {
+            return DerivedCounterSamplePath {
+                sample_group: parts.next().and_then(|part| part.parse().ok()),
+                ring_index: parts.nth(1).and_then(|part| part.parse().ok()),
+            };
+        }
+    }
+    DerivedCounterSamplePath {
+        sample_group: None,
+        ring_index: None,
+    }
+}
+
+fn counter_schemas_and_sample_blobs(
+    trace_path: &Path,
+) -> Option<(CounterSchemaByGroup, Vec<String>, Vec<SampleBlob>)> {
     let profiler_dir = profiler::find_profiler_directory(trace_path)?;
     let stream_data_path = profiler_dir.join("streamData");
     let plist = Value::from_file(stream_data_path).ok()?;
@@ -688,16 +901,22 @@ fn counter_names_and_sample_blobs(trace_path: &Path) -> Option<(Vec<String>, Vec
     let root = objects.get(1).and_then(Value::as_dictionary)?;
     let counter_archives = ns_data_array_from_root_key(objects, root, "APSCounterData");
 
-    let mut counter_names = Vec::new();
+    let mut counter_schemas = BTreeMap::new();
+    let mut fallback_counter_names = Vec::new();
     let mut sample_blobs = Vec::new();
     for (archive_index, bytes) in counter_archives.into_iter().enumerate() {
         let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
             continue;
         };
-        if counter_names.is_empty()
+        if fallback_counter_names.is_empty()
             && let Some(names) = keyed.get("limiter sample counters")
         {
-            counter_names = string_array_values(names);
+            fallback_counter_names = string_array_values(names);
+        }
+        if counter_schemas.is_empty()
+            && let Some(subdivided) = keyed.get("Subdivided Dictionary")
+        {
+            counter_schemas = counter_schemas_from_subdivided_dictionary(subdivided);
         }
         if let Some(samples) = keyed.get("Derived Counter Sample Data") {
             collect_data_blobs(
@@ -707,7 +926,44 @@ fn counter_names_and_sample_blobs(trace_path: &Path) -> Option<(Vec<String>, Vec
             );
         }
     }
-    Some((counter_names, sample_blobs))
+    Some((counter_schemas, fallback_counter_names, sample_blobs))
+}
+
+fn counter_schemas_from_subdivided_dictionary(value: &StreamArchiveValue) -> CounterSchemaByGroup {
+    let mut schemas = BTreeMap::new();
+    let Some(pass_list) = value
+        .as_dictionary()
+        .and_then(|values| values.get("passList"))
+    else {
+        return schemas;
+    };
+    let StreamArchiveValue::Array(passes) = pass_list else {
+        return schemas;
+    };
+    for (group_index, pass) in passes.iter().enumerate() {
+        let Some(names) = first_counter_schema(pass) else {
+            continue;
+        };
+        let raw_names = names.into_iter().skip(7).collect::<Vec<_>>();
+        if !raw_names.is_empty() {
+            schemas.insert(group_index, raw_names);
+        }
+    }
+    schemas
+}
+
+fn first_counter_schema(value: &StreamArchiveValue) -> Option<Vec<String>> {
+    match value {
+        StreamArchiveValue::Array(children) => {
+            let direct = string_array_values(value);
+            if direct.first().is_some_and(|name| name == "GRC_TIMESTAMP") && direct.len() > 7 {
+                return Some(direct);
+            }
+            children.iter().find_map(first_counter_schema)
+        }
+        StreamArchiveValue::Dictionary(values) => values.values().find_map(first_counter_schema),
+        _ => None,
+    }
 }
 
 fn string_array_values(value: &StreamArchiveValue) -> Vec<String> {
@@ -847,7 +1103,11 @@ fn summarize_field(key: &str, value: &StreamArchiveValue) -> RawCounterFieldSumm
         StreamArchiveValue::Integer(_) => ("integer", None, Vec::new()),
         StreamArchiveValue::Data(data) => ("data", Some(data.len()), Vec::new()),
         StreamArchiveValue::Array(children) => ("array", Some(children.len()), Vec::new()),
-        StreamArchiveValue::Dictionary(keys) => ("dictionary", Some(keys.len()), keys.clone()),
+        StreamArchiveValue::Dictionary(values) => (
+            "dictionary",
+            Some(values.len()),
+            values.keys().cloned().collect(),
+        ),
         StreamArchiveValue::Other => ("other", None, Vec::new()),
     };
     let children = match value {
@@ -874,7 +1134,7 @@ enum StreamArchiveValue {
     Integer(u64),
     Data(Vec<u8>),
     Array(Vec<StreamArchiveValue>),
-    Dictionary(Vec<String>),
+    Dictionary(BTreeMap<String, StreamArchiveValue>),
     Other,
 }
 
@@ -917,8 +1177,19 @@ impl StreamArchiveValue {
                     .join("|");
                 format!("array:{}:[{}]", children.len(), nested)
             }
-            Self::Dictionary(keys) => format!("dictionary:{}:{}", keys.len(), keys.join("|")),
+            Self::Dictionary(values) => format!(
+                "dictionary:{}:{}",
+                values.len(),
+                values.keys().cloned().collect::<Vec<_>>().join("|")
+            ),
             Self::Other => "other".to_owned(),
+        }
+    }
+
+    fn as_dictionary(&self) -> Option<&BTreeMap<String, StreamArchiveValue>> {
+        match self {
+            Self::Dictionary(values) => Some(values),
+            _ => None,
         }
     }
 }
@@ -1037,6 +1308,11 @@ fn summarize_stream_archive_value(objects: &[Value], value: &Value) -> StreamArc
     if let Some(data) = ns_data_from_value(value) {
         return StreamArchiveValue::Data(data.to_vec());
     }
+    if let Some(dict) = value.as_dictionary()
+        && let Some(values) = keyed_dictionary_values(objects, dict)
+    {
+        return StreamArchiveValue::Dictionary(values);
+    }
     if let Some(array) = value
         .as_dictionary()
         .and_then(|dict| dict.get("NS.objects"))
@@ -1051,11 +1327,6 @@ fn summarize_stream_archive_value(objects: &[Value], value: &Value) -> StreamArc
                 .map(|value| summarize_stream_archive_value(objects, value))
                 .collect(),
         );
-    }
-    if let Some(dict) = value.as_dictionary()
-        && let Some(values) = keyed_dictionary_values(objects, dict)
-    {
-        return StreamArchiveValue::Dictionary(values.keys().cloned().collect());
     }
     StreamArchiveValue::Other
 }

@@ -249,6 +249,8 @@ struct RawCounterProbeArgs {
     csv: Option<PathBuf>,
     #[arg(long)]
     metric: Option<String>,
+    #[arg(long)]
+    scan_files: bool,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -828,7 +830,12 @@ pub fn run() -> Result<()> {
         }
         CommandSet::RawCounterProbe(args) => {
             let trace = TraceBundle::open(args.trace)?;
-            let report = counter::probe_raw_counters(&trace, args.csv, args.metric.as_deref())?;
+            let report = counter::probe_raw_counters(
+                &trace,
+                args.csv,
+                args.metric.as_deref(),
+                args.scan_files,
+            )?;
             match args.format.as_str() {
                 "text" | "table" => print!("{}", counter::format_raw_counter_probe(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
