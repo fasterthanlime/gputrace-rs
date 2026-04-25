@@ -5,6 +5,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 
 use plist::{Dictionary, Uid, Value};
+use rquickjs::{Context, Runtime};
 use serde::Serialize;
 
 use crate::counter_names::ALL_COUNTER_NAMES;
@@ -71,6 +72,7 @@ pub struct RawCountersReport {
     pub schemas: Vec<RawCounterSchema>,
     pub streams: Vec<RawCounterDecodedStream>,
     pub metrics: Vec<RawCounterDecodedMetric>,
+    pub derived_metrics: Vec<RawCounterJsDerivedMetric>,
     pub warnings: Vec<String>,
 }
 
@@ -127,6 +129,17 @@ pub struct RawCounterHardwareSelector {
     pub select: Option<u64>,
     pub flag: Option<u64>,
     pub sources: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterJsDerivedMetric {
+    pub key: String,
+    pub name: String,
+    pub counter_type: Option<String>,
+    pub description: Option<String>,
+    pub value: f64,
+    pub source_script: PathBuf,
+    pub source_catalog: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -392,6 +405,10 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
     let aggregate_metadata = probe_aggregate_counter_metadata(&trace.path);
     let structured_layouts = probe_structured_counter_layouts(&trace.path);
     let normalized_counters = probe_normalized_counter_metrics(&trace.path);
+    let js_variables = raw_counter_js_variables(&trace.path);
+    let device_identifier = trace_agx_device_identifier(&trace.path);
+    let derived_metrics =
+        evaluate_agx_derived_metrics(&catalog, &js_variables, device_identifier.as_deref());
     let schemas = schema_map
         .iter()
         .map(|(sample_group, counter_names)| RawCounterSchema {
@@ -464,6 +481,9 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
     if metrics.is_empty() {
         warnings.push("no normalized GPRWCNTR counter metrics were decoded".to_owned());
     }
+    if !js_variables.is_empty() && derived_metrics.is_empty() {
+        warnings.push("no AGX JavaScript derived counters evaluated to finite values".to_owned());
+    }
 
     Ok(RawCountersReport {
         trace_source: trace.path.clone(),
@@ -472,6 +492,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         schemas,
         streams,
         metrics,
+        derived_metrics,
         warnings,
     })
 }
@@ -485,11 +506,12 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
         report.profiler_directory.display()
     ));
     out.push_str(&format!(
-        "metadata={} schemas={} streams={} metrics={}\n\n",
+        "metadata={} schemas={} streams={} metrics={} derived_metrics={}\n\n",
         report.aggregate_metadata.len(),
         report.schemas.len(),
         report.streams.len(),
-        report.metrics.len()
+        report.metrics.len(),
+        report.derived_metrics.len()
     ));
     for warning in &report.warnings {
         out.push_str(&format!("warning: {warning}\n"));
@@ -568,6 +590,36 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
                 metric.min_percent_of_gpu_cycles,
                 metric.max_percent_of_gpu_cycles,
                 format_raw_counter_metric_label(metric)
+            ));
+        }
+    }
+    if !report.derived_metrics.is_empty() {
+        let mut derived_metrics = report
+            .derived_metrics
+            .iter()
+            .filter(|metric| metric.value.is_finite())
+            .collect::<Vec<_>>();
+        derived_metrics.sort_by(|left, right| {
+            right
+                .value
+                .abs()
+                .partial_cmp(&left.value.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        out.push_str("\nTop AGX JavaScript-derived counters:\n");
+        for metric in derived_metrics.iter().take(32) {
+            out.push_str(&format!(
+                "  {:>12.4} {} ({}) type={} script={}\n",
+                metric.value,
+                metric.name,
+                metric.key,
+                metric.counter_type.as_deref().unwrap_or("-"),
+                metric
+                    .source_script
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("-")
             ));
         }
     }
@@ -667,6 +719,7 @@ fn csv_escape(value: &str) -> String {
 struct RawCounterCatalog {
     derived_by_hash: BTreeMap<String, Vec<RawCounterDerivedCounterMatch>>,
     hardware_by_hash: BTreeMap<String, Vec<RawCounterHardwareSelector>>,
+    derived_definitions: Vec<RawCounterDerivedDefinition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -684,19 +737,44 @@ struct RawCounterHardwareSelectorKey {
     flag: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawCounterDerivedDefinition {
+    key: String,
+    name: String,
+    counter_type: Option<String>,
+    description: Option<String>,
+    source_catalog: PathBuf,
+    source_script: Option<PathBuf>,
+}
+
 fn load_agx_counter_catalog() -> RawCounterCatalog {
     let mut statistics_files = Vec::new();
     let mut perf_files = Vec::new();
+    let mut derived_script_files = Vec::new();
     collect_agx_counter_catalog_files(
         Path::new("/System/Library/Extensions"),
         &mut statistics_files,
         &mut perf_files,
+        &mut derived_script_files,
     );
+    let derived_script_by_stem = derived_script_files
+        .into_iter()
+        .filter_map(|path| agx_statistics_stem(&path).map(|stem| (stem, path)))
+        .collect::<BTreeMap<_, _>>();
 
     let mut derived =
         BTreeMap::<String, BTreeMap<RawCounterDerivedCounterMatchKey, BTreeSet<PathBuf>>>::new();
+    let mut derived_definitions = BTreeSet::<RawCounterDerivedDefinition>::new();
     for path in statistics_files {
-        add_statistics_counter_catalog(&path, &mut derived);
+        let script_path = agx_statistics_stem(&path)
+            .and_then(|stem| derived_script_by_stem.get(&stem))
+            .cloned();
+        add_statistics_counter_catalog(
+            &path,
+            script_path.as_deref(),
+            &mut derived,
+            &mut derived_definitions,
+        );
     }
 
     let mut hardware =
@@ -737,6 +815,7 @@ fn load_agx_counter_catalog() -> RawCounterCatalog {
                 (hash, selectors)
             })
             .collect(),
+        derived_definitions: derived_definitions.into_iter().collect(),
     }
 }
 
@@ -744,6 +823,7 @@ fn collect_agx_counter_catalog_files(
     directory: &Path,
     statistics_files: &mut Vec<PathBuf>,
     perf_files: &mut Vec<PathBuf>,
+    derived_script_files: &mut Vec<PathBuf>,
 ) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
@@ -751,7 +831,12 @@ fn collect_agx_counter_catalog_files(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_agx_counter_catalog_files(&path, statistics_files, perf_files);
+            collect_agx_counter_catalog_files(
+                &path,
+                statistics_files,
+                perf_files,
+                derived_script_files,
+            );
             continue;
         }
         let Some(file_name) = path.file_name().and_then(|file_name| file_name.to_str()) else {
@@ -761,6 +846,10 @@ fn collect_agx_counter_catalog_files(
             && file_name.ends_with("-counters.plist")
         {
             statistics_files.push(path);
+        } else if file_name.starts_with("AGXMetalStatisticsExternal")
+            && file_name.ends_with("-derived.js")
+        {
+            derived_script_files.push(path);
         } else if file_name == "AGXMetalPerfCountersExternal.plist" {
             perf_files.push(path);
         }
@@ -769,7 +858,9 @@ fn collect_agx_counter_catalog_files(
 
 fn add_statistics_counter_catalog(
     path: &Path,
+    script_path: Option<&Path>,
     derived: &mut BTreeMap<String, BTreeMap<RawCounterDerivedCounterMatchKey, BTreeSet<PathBuf>>>,
+    derived_definitions: &mut BTreeSet<RawCounterDerivedDefinition>,
 ) {
     let Ok(value) = Value::from_file(path) else {
         return;
@@ -803,10 +894,18 @@ fn add_statistics_counter_catalog(
             .map(str::to_owned);
         let match_key = RawCounterDerivedCounterMatchKey {
             key: key.clone(),
+            name: name.clone(),
+            counter_type: counter_type.clone(),
+            description: description.clone(),
+        };
+        derived_definitions.insert(RawCounterDerivedDefinition {
+            key: key.clone(),
             name,
             counter_type,
             description,
-        };
+            source_catalog: path.to_path_buf(),
+            source_script: script_path.map(Path::to_path_buf),
+        });
         for raw_hash in raw_hashes.iter().filter_map(Value::as_string) {
             derived
                 .entry(raw_hash.to_owned())
@@ -816,6 +915,290 @@ fn add_statistics_counter_catalog(
                 .insert(path.to_path_buf());
         }
     }
+}
+
+fn agx_statistics_stem(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    file_name
+        .strip_suffix("-counters.plist")
+        .or_else(|| file_name.strip_suffix("-derived.js"))
+        .map(str::to_owned)
+}
+
+fn evaluate_agx_derived_metrics(
+    catalog: &RawCounterCatalog,
+    variables: &BTreeMap<String, f64>,
+    device_identifier: Option<&str>,
+) -> Vec<RawCounterJsDerivedMetric> {
+    if variables.is_empty() {
+        return Vec::new();
+    }
+
+    let definitions_by_script = catalog
+        .derived_definitions
+        .iter()
+        .filter_map(|definition| {
+            definition
+                .source_script
+                .as_ref()
+                .map(|script| (script.clone(), definition.clone()))
+        })
+        .fold(
+            BTreeMap::<PathBuf, Vec<RawCounterDerivedDefinition>>::new(),
+            |mut grouped, (script, definition)| {
+                grouped.entry(script).or_default().push(definition);
+                grouped
+            },
+        );
+
+    let Some((script_path, definitions)) =
+        choose_agx_derived_script(definitions_by_script, device_identifier)
+    else {
+        return Vec::new();
+    };
+    let mut metrics = Vec::new();
+    {
+        let Ok(script_source) = fs::read_to_string(&script_path) else {
+            return Vec::new();
+        };
+        metrics.extend(evaluate_agx_derived_script(
+            &script_path,
+            &script_source,
+            &definitions,
+            variables,
+        ));
+    }
+    metrics.sort_by(|left, right| {
+        right
+            .value
+            .abs()
+            .partial_cmp(&left.value.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    metrics
+}
+
+fn choose_agx_derived_script(
+    definitions_by_script: BTreeMap<PathBuf, Vec<RawCounterDerivedDefinition>>,
+    device_identifier: Option<&str>,
+) -> Option<(PathBuf, Vec<RawCounterDerivedDefinition>)> {
+    definitions_by_script.into_iter().max_by(
+        |(left_path, left_definitions), (right_path, right_definitions)| {
+            agx_derived_script_score(left_path, left_definitions, device_identifier)
+                .cmp(&agx_derived_script_score(
+                    right_path,
+                    right_definitions,
+                    device_identifier,
+                ))
+                .then_with(|| right_path.cmp(left_path))
+        },
+    )
+}
+
+fn agx_derived_script_score(
+    path: &Path,
+    definitions: &[RawCounterDerivedDefinition],
+    device_identifier: Option<&str>,
+) -> (u8, u8, usize) {
+    let stem = agx_statistics_stem(path).unwrap_or_default();
+    let direct_match = device_identifier
+        .filter(|identifier| stem.contains(identifier) || identifier.contains(&stem))
+        .is_some() as u8;
+    let compatibility = agx_derived_script_compatibility_rank(&stem, device_identifier);
+    (direct_match, compatibility, definitions.len())
+}
+
+fn agx_derived_script_compatibility_rank(stem: &str, device_identifier: Option<&str>) -> u8 {
+    if matches!(device_identifier, Some(identifier) if identifier.contains("G16X")) {
+        return match () {
+            _ if stem.contains("G14D") => 80,
+            _ if stem.contains("G14C") => 70,
+            _ if stem.contains("G14S") => 60,
+            _ if stem.contains("G14G") => 50,
+            _ => 0,
+        };
+    }
+    match () {
+        _ if stem.contains("G14D") => 40,
+        _ if stem.contains("G14C") => 35,
+        _ if stem.contains("G14S") => 30,
+        _ if stem.contains("G14G") => 25,
+        _ if stem.contains("A14X") => 15,
+        _ if stem.contains("13_3") => 10,
+        _ => 0,
+    }
+}
+
+fn trace_agx_device_identifier(trace_path: &Path) -> Option<String> {
+    let profiler_directory = profiler::find_profiler_directory(trace_path)?;
+    let stream_data = profiler_directory.join("streamData");
+    let data = fs::read(stream_data).ok()?;
+    let text = String::from_utf8_lossy(&data);
+    for marker in [
+        "AGXMetalG16X",
+        "AGXMetalG16G",
+        "AGXMetalG14X",
+        "AGXMetalG14G",
+    ] {
+        if text.contains(marker) {
+            return Some(marker.trim_start_matches("AGXMetal").to_owned());
+        }
+    }
+    None
+}
+
+fn evaluate_agx_derived_script(
+    script_path: &Path,
+    script_source: &str,
+    definitions: &[RawCounterDerivedDefinition],
+    variables: &BTreeMap<String, f64>,
+) -> Vec<RawCounterJsDerivedMetric> {
+    let Ok(runtime) = Runtime::new() else {
+        return Vec::new();
+    };
+    let Ok(context) = Context::full(&runtime) else {
+        return Vec::new();
+    };
+
+    context.with(|ctx| {
+        let globals = ctx.globals();
+        for (name, value) in variables {
+            let _ = globals.set(name.as_str(), *value);
+        }
+        if ctx.eval::<(), _>(script_source).is_err() {
+            return Vec::new();
+        }
+
+        let mut metrics = Vec::new();
+        for definition in definitions {
+            if !is_javascript_identifier(&definition.key) {
+                continue;
+            }
+            let source = format!(
+                "(function() {{ try {{ if (typeof {key} !== 'function') return null; const v = {key}(); return Number.isFinite(v) ? v : null; }} catch (e) {{ return null; }} }})()",
+                key = definition.key
+            );
+            let Ok(value) = ctx.eval::<Option<f64>, _>(source.as_str()) else {
+                continue;
+            };
+            let Some(value) = value else {
+                continue;
+            };
+            if !value.is_finite() {
+                continue;
+            }
+            metrics.push(RawCounterJsDerivedMetric {
+                key: definition.key.clone(),
+                name: definition.name.clone(),
+                counter_type: definition.counter_type.clone(),
+                description: definition.description.clone(),
+                value,
+                source_script: script_path.to_path_buf(),
+                source_catalog: definition.source_catalog.clone(),
+            });
+        }
+        metrics
+    })
+}
+
+fn is_javascript_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+}
+
+fn raw_counter_js_variables(trace_path: &Path) -> BTreeMap<String, f64> {
+    let Some((counter_schemas, fallback_counter_names, sample_blobs)) =
+        counter_schemas_and_sample_blobs(trace_path)
+    else {
+        return BTreeMap::new();
+    };
+    if counter_schemas.is_empty() && fallback_counter_names.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let mut accum = BTreeMap::<String, RawCounterJsVariableAccum>::new();
+    for (path, data) in sample_blobs {
+        if !path.contains("/Derived Counter Sample Data/")
+            || path.split('/').nth_back(1) != Some("1")
+        {
+            continue;
+        }
+        let Some((record_size, _)) = gprw_record_info(&data) else {
+            continue;
+        };
+        let records = gprw_u64_records(&data, record_size);
+        if records.is_empty() {
+            continue;
+        }
+        let path_ids = parse_derived_counter_sample_path(&path);
+        let Some(counter_names) = path_ids
+            .sample_group
+            .and_then(|group| counter_schemas.get(&group))
+            .or((!fallback_counter_names.is_empty()).then_some(&fallback_counter_names))
+        else {
+            continue;
+        };
+        for (counter_index, raw_name) in counter_names.iter().enumerate() {
+            let value_column = 8 + counter_index;
+            for record in &records {
+                let Some(value) = record.get(value_column).copied() else {
+                    continue;
+                };
+                let normalized = record
+                    .get(2)
+                    .copied()
+                    .filter(|denominator| *denominator != 0)
+                    .map(|denominator| value as f64 / denominator as f64 * 100.0);
+                accum
+                    .entry(raw_name.clone())
+                    .or_default()
+                    .push(value as f64, normalized);
+            }
+        }
+    }
+
+    let mut variables = BTreeMap::new();
+    for (raw_name, accum) in accum {
+        let Some(raw_mean) = mean(&accum.raw_values) else {
+            continue;
+        };
+        let normalized_mean = mean(&accum.normalized_values).unwrap_or(raw_mean);
+        variables.insert(raw_name.clone(), raw_mean);
+        variables.insert(format!("{raw_name}_norm"), normalized_mean);
+        for suffix in ["cmp", "frg", "vtx"] {
+            variables.insert(format!("{raw_name}_{suffix}"), raw_mean);
+            variables.insert(format!("{raw_name}_norm_{suffix}"), normalized_mean);
+            variables.insert(format!("{raw_name}_{suffix}_norm"), normalized_mean);
+        }
+    }
+    variables
+}
+
+#[derive(Debug, Default)]
+struct RawCounterJsVariableAccum {
+    raw_values: Vec<f64>,
+    normalized_values: Vec<f64>,
+}
+
+impl RawCounterJsVariableAccum {
+    fn push(&mut self, raw: f64, normalized: Option<f64>) {
+        self.raw_values.push(raw);
+        if let Some(normalized) = normalized {
+            self.normalized_values.push(normalized);
+        }
+    }
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
 fn add_perf_counter_catalog(
@@ -2894,6 +3277,7 @@ mod tests {
                     hardware_selectors: Vec::new(),
                 },
             ],
+            derived_metrics: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -2941,6 +3325,7 @@ mod tests {
             schemas: Vec::new(),
             streams: Vec::new(),
             metrics: vec![metric],
+            derived_metrics: Vec::new(),
             warnings: Vec::new(),
         };
 
@@ -2950,6 +3335,64 @@ mod tests {
         assert!(text.contains("ALU Utilization (_hash)"));
         assert!(csv.contains("ALU Utilization"));
         assert!(csv.contains("ALUUtilization"));
+    }
+
+    #[test]
+    fn evaluates_agx_derived_javascript_formula() {
+        let definitions = vec![RawCounterDerivedDefinition {
+            key: "ALUUtilization".to_owned(),
+            name: "ALU Utilization".to_owned(),
+            counter_type: Some("Percentage".to_owned()),
+            description: None,
+            source_catalog: PathBuf::from("AGXMetalStatisticsExternalTest-counters.plist"),
+            source_script: Some(PathBuf::from("AGXMetalStatisticsExternalTest-derived.js")),
+        }];
+        let variables = BTreeMap::from([("_hash_norm".to_owned(), 50.0)]);
+        let metrics = evaluate_agx_derived_script(
+            Path::new("AGXMetalStatisticsExternalTest-derived.js"),
+            "var num_cores = 4; function ALUUtilization() { return _hash_norm / (2.0 * num_cores); }",
+            &definitions,
+            &variables,
+        );
+
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].key, "ALUUtilization");
+        assert!((metrics[0].value - 6.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn chooses_single_g16_compatible_agx_derived_script() {
+        let definitions_by_script = BTreeMap::from([
+            (
+                PathBuf::from("AGXMetalStatisticsExternalG14S-derived.js"),
+                vec![RawCounterDerivedDefinition {
+                    key: "A".to_owned(),
+                    name: "A".to_owned(),
+                    counter_type: None,
+                    description: None,
+                    source_catalog: PathBuf::from("AGXMetalStatisticsExternalG14S-counters.plist"),
+                    source_script: None,
+                }],
+            ),
+            (
+                PathBuf::from("AGXMetalStatisticsExternalG14D-derived.js"),
+                vec![RawCounterDerivedDefinition {
+                    key: "B".to_owned(),
+                    name: "B".to_owned(),
+                    counter_type: None,
+                    description: None,
+                    source_catalog: PathBuf::from("AGXMetalStatisticsExternalG14D-counters.plist"),
+                    source_script: None,
+                }],
+            ),
+        ]);
+
+        let (path, _) = choose_agx_derived_script(definitions_by_script, Some("G16X")).unwrap();
+
+        assert_eq!(
+            path,
+            PathBuf::from("AGXMetalStatisticsExternalG14D-derived.js")
+        );
     }
 
     #[test]
