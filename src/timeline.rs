@@ -1934,6 +1934,7 @@ mod tests {
                     alu_instruction_count: 700,
                     branch_instruction_count: 20,
                     compilation_time_ms: 1.2,
+                    line_instruction_counts: BTreeMap::new(),
                 }),
             }],
             execution_costs: vec![],

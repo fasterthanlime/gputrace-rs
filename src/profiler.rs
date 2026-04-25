@@ -35,6 +35,7 @@ pub struct ProfilerPipelineStats {
     pub alu_instruction_count: i64,
     pub branch_instruction_count: i64,
     pub compilation_time_ms: f64,
+    pub line_instruction_counts: BTreeMap<usize, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -970,6 +971,7 @@ fn extract_pipeline_stats(
             }
         }
 
+        let remarks = key_map.get("Remarks").and_then(|value| value.as_string());
         pipelines.insert(
             pipeline_id,
             ProfilerPipelineStats {
@@ -1005,11 +1007,61 @@ fn extract_pipeline_stats(
                     .get("Compilation time in milliseconds")
                     .and_then(|value| as_f64(value))
                     .unwrap_or(0.0),
+                line_instruction_counts: remarks
+                    .map(parse_instruction_mix_by_line)
+                    .unwrap_or_default(),
             },
         );
     }
 
     pipelines
+}
+
+pub(crate) fn parse_instruction_mix_by_line(remarks: &str) -> BTreeMap<usize, u64> {
+    let mut counts = BTreeMap::new();
+    for block in remarks.split("--- !") {
+        if !block.contains("Name:            InstructionMix")
+            || !block.contains("Function:        agc.main")
+            || block.contains("Function:        agc.main.constant_program")
+        {
+            continue;
+        }
+        let Some(line) = debugloc_program_source_line(block) else {
+            continue;
+        };
+        if line == 0 {
+            continue;
+        }
+        let Some(inst) = instruction_mix_count(block) else {
+            continue;
+        };
+        *counts.entry(line).or_default() += inst;
+    }
+    counts
+}
+
+fn debugloc_program_source_line(block: &str) -> Option<usize> {
+    let debugloc = block.lines().find(|line| line.contains("DebugLoc:"))?;
+    if !debugloc.contains("program_source") {
+        return None;
+    }
+    let line_marker = "Line:";
+    let start = debugloc.find(line_marker)? + line_marker.len();
+    let rest = debugloc[start..].trim_start();
+    let digits = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn instruction_mix_count(block: &str) -> Option<u64> {
+    let marker = "INST_:";
+    let line = block.lines().find(|line| line.contains(marker))?;
+    let start = line.find(marker)? + marker.len();
+    let rest = line[start..].trim();
+    let rest = rest.trim_matches('\'').trim_matches('"');
+    rest.parse().ok()
 }
 
 fn extract_encoder_timings(objects: &[Value], root: &Dictionary) -> Vec<ProfilerEncoderTiming> {
@@ -1951,6 +2003,7 @@ mod tests {
                         alu_instruction_count: 512,
                         branch_instruction_count: 12,
                         compilation_time_ms: 2.5,
+                        line_instruction_counts: BTreeMap::new(),
                     }),
                 }],
                 execution_costs: vec![ProfilerExecutionCost {

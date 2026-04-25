@@ -151,7 +151,7 @@ struct ShaderThreadMetrics {
 }
 
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderReport> {
-    let index = ShaderSourceIndex::build(search_paths)?;
+    let index = ShaderSourceIndex::build_for_trace(&trace.path, search_paths)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     let limiter_metrics = counter::extract_limiters_for_trace(&trace.path);
     let xcode_counter_data = xcode_counters::parse(trace, None).ok();
@@ -599,7 +599,7 @@ pub fn source(
     search_paths: &[PathBuf],
     context: usize,
 ) -> Result<ShaderSourceReport> {
-    let index = ShaderSourceIndex::build(search_paths)?;
+    let index = ShaderSourceIndex::build_for_trace(&trace.path, search_paths)?;
     let kernels = shader_kernel_stats(trace)?;
     let kernel = kernels
         .get(shader_name)
@@ -744,6 +744,11 @@ pub fn hotspot_report(
             device_memory_bandwidth_gbps: shader.device_memory_bandwidth_gbps,
         },
     );
+    if let Some(line_instruction_counts) =
+        compiler_line_instruction_counts(trace, &shader, start_line, end_line)
+    {
+        attribute_compiler_line_costs(&mut lines, &line_instruction_counts, total_gpu_percent);
+    }
 
     let hotspot_count = lines
         .iter()
@@ -1297,11 +1302,8 @@ pub fn default_search_paths() -> Vec<PathBuf> {
 }
 
 impl ShaderSourceIndex {
-    fn build(search_paths: &[PathBuf]) -> Result<Self> {
-        let mut index = Self {
-            kernel_to_file: BTreeMap::new(),
-            kernel_to_line: BTreeMap::new(),
-        };
+    fn build_for_trace(trace_path: &Path, search_paths: &[PathBuf]) -> Result<Self> {
+        let mut index = Self::empty();
         let kernel_regex = Regex::new(r"kernel\s+void\s+(\w+)\s*\(")
             .map_err(|error| Error::InvalidInput(format!("invalid kernel regex: {error}")))?;
         let func_regex = Regex::new(
@@ -1309,6 +1311,25 @@ impl ShaderSourceIndex {
         )
         .map_err(|error| Error::InvalidInput(format!("invalid function regex: {error}")))?;
 
+        index.index_embedded_trace_sources(trace_path, &kernel_regex, &func_regex)?;
+        index.index_search_paths(search_paths, &kernel_regex, &func_regex, false)?;
+        Ok(index)
+    }
+
+    fn empty() -> Self {
+        Self {
+            kernel_to_file: BTreeMap::new(),
+            kernel_to_line: BTreeMap::new(),
+        }
+    }
+
+    fn index_search_paths(
+        &mut self,
+        search_paths: &[PathBuf],
+        kernel_regex: &Regex,
+        func_regex: &Regex,
+        overwrite: bool,
+    ) -> Result<()> {
         for root in search_paths {
             if !root.exists() {
                 continue;
@@ -1323,36 +1344,92 @@ impl ShaderSourceIndex {
                 if entry.path().extension().and_then(|ext| ext.to_str()) != Some("metal") {
                     continue;
                 }
-                index.index_file(entry.path(), &kernel_regex, &func_regex)?;
+                self.index_file(entry.path(), kernel_regex, func_regex, overwrite)?;
             }
         }
-        Ok(index)
+        Ok(())
     }
 
-    fn index_file(&mut self, path: &Path, kernel_regex: &Regex, func_regex: &Regex) -> Result<()> {
+    fn index_embedded_trace_sources(
+        &mut self,
+        trace_path: &Path,
+        kernel_regex: &Regex,
+        func_regex: &Regex,
+    ) -> Result<()> {
+        if !trace_path.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(trace_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = entry.metadata()?;
+            if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.starts_with("MTLBuffer-")
+                || name.starts_with("startup-")
+                || name.starts_with("unused-device-resources-")
+                || name == "capture"
+                || name == "metadata"
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let contents = String::from_utf8_lossy(&bytes);
+            if !contents.contains("kernel void") {
+                continue;
+            }
+            self.index_contents(&path, &contents, kernel_regex, func_regex, true);
+        }
+        Ok(())
+    }
+
+    fn index_file(
+        &mut self,
+        path: &Path,
+        kernel_regex: &Regex,
+        func_regex: &Regex,
+        overwrite: bool,
+    ) -> Result<()> {
         let contents = fs::read_to_string(path)?;
+        self.index_contents(path, &contents, kernel_regex, func_regex, overwrite);
+        Ok(())
+    }
+
+    fn index_contents(
+        &mut self,
+        path: &Path,
+        contents: &str,
+        kernel_regex: &Regex,
+        func_regex: &Regex,
+        overwrite: bool,
+    ) {
         for (line_idx, line) in contents.lines().enumerate() {
             if let Some(captures) = kernel_regex.captures(line)
                 && let Some(name) = captures.get(1)
             {
-                self.kernel_to_file
-                    .insert(name.as_str().to_owned(), path.to_path_buf());
-                self.kernel_to_line
-                    .insert(name.as_str().to_owned(), line_idx + 1);
+                self.insert_symbol(name.as_str(), path, line_idx + 1, overwrite);
                 continue;
             }
             if let Some(captures) = func_regex.captures(line)
                 && let Some(name) = captures.get(1)
             {
-                self.kernel_to_file
-                    .entry(name.as_str().to_owned())
-                    .or_insert_with(|| path.to_path_buf());
-                self.kernel_to_line
-                    .entry(name.as_str().to_owned())
-                    .or_insert(line_idx + 1);
+                self.insert_symbol(name.as_str(), path, line_idx + 1, false);
             }
         }
-        Ok(())
+    }
+
+    fn insert_symbol(&mut self, name: &str, path: &Path, line: usize, overwrite: bool) {
+        if overwrite || !self.kernel_to_file.contains_key(name) {
+            self.kernel_to_file
+                .insert(name.to_owned(), path.to_path_buf());
+            self.kernel_to_line.insert(name.to_owned(), line);
+        }
     }
 
     fn lookup(&self, kernel_name: &str) -> Option<(PathBuf, usize)> {
@@ -1516,17 +1593,23 @@ fn truncate(value: &str, width: usize) -> String {
 
 fn function_bounds(lines: &[String], source_line: usize) -> (usize, usize) {
     let mut start_line = source_line.max(1).min(lines.len().max(1));
-    while start_line > 1 {
-        let prev = lines[start_line - 2].trim();
-        if prev.starts_with("kernel ") || prev.contains(" kernel ") {
+    let current = lines
+        .get(start_line.saturating_sub(1))
+        .map(|line| line.trim())
+        .unwrap_or_default();
+    if !(current.starts_with("kernel ") || current.contains(" kernel ")) {
+        while start_line > 1 {
+            let prev = lines[start_line - 2].trim();
+            if prev.starts_with("kernel ") || prev.contains(" kernel ") {
+                start_line -= 1;
+                break;
+            }
+            if prev.ends_with('{') {
+                start_line -= 1;
+                break;
+            }
             start_line -= 1;
-            break;
         }
-        if prev.ends_with('{') {
-            start_line -= 1;
-            break;
-        }
-        start_line -= 1;
     }
 
     let mut brace_depth = 0i32;
@@ -1691,6 +1774,127 @@ fn attribute_line_costs(lines: &mut [AttributedSourceLine], context: LineCostCon
         };
         line.attributed_gpu_percent =
             total_gpu_percent * ((line.estimated_cost * weight) / weighted_total);
+    }
+}
+
+fn compiler_line_instruction_counts(
+    trace: &TraceBundle,
+    shader: &ShaderEntry,
+    start_line: usize,
+    end_line: usize,
+) -> Option<BTreeMap<usize, u64>> {
+    let summary = profiler::stream_data_summary(&trace.path).ok()?;
+    let stats_counts = summary
+        .pipelines
+        .iter()
+        .find(|pipeline| {
+            shader.pipeline_addr != 0 && pipeline.pipeline_address == shader.pipeline_addr
+        })
+        .or_else(|| {
+            summary.pipelines.iter().find(|pipeline| {
+                pipeline
+                    .function_name
+                    .as_deref()
+                    .is_some_and(|name| name == shader.name)
+            })
+        })?
+        .stats
+        .as_ref()
+        .map(|stats| stats.line_instruction_counts.clone())
+        .unwrap_or_default();
+    let ranged_stats = filter_line_counts(stats_counts, start_line, end_line);
+    if !ranged_stats.is_empty() {
+        return Some(ranged_stats);
+    }
+    raw_stream_line_instruction_counts(&trace.path, &shader.name, start_line, end_line)
+}
+
+fn raw_stream_line_instruction_counts(
+    trace_path: &Path,
+    shader_name: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Option<BTreeMap<usize, u64>> {
+    let stream_data = find_profiler_raw_dir(trace_path)?.join("streamData");
+    let bytes = fs::read(stream_data).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut best = BTreeMap::new();
+    let mut best_total = 0u64;
+    for segment in text.split("Apple metal version") {
+        if !segment.contains(shader_name) {
+            continue;
+        }
+        let counts = filter_line_counts(
+            profiler::parse_instruction_mix_by_line(segment),
+            start_line,
+            end_line,
+        );
+        let total = counts.values().sum();
+        if total > best_total {
+            best_total = total;
+            best = counts;
+        }
+    }
+    (!best.is_empty()).then_some(best)
+}
+
+fn find_profiler_raw_dir(trace_path: &Path) -> Option<PathBuf> {
+    let sibling = PathBuf::from(format!("{}.gpuprofiler_raw", trace_path.display()));
+    if sibling.is_dir() {
+        return Some(sibling);
+    }
+    if !trace_path.is_dir() {
+        return None;
+    }
+    fs::read_dir(trace_path)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_dir()
+                && path.extension().and_then(|ext| ext.to_str()) == Some("gpuprofiler_raw")
+        })
+}
+
+fn filter_line_counts(
+    counts: BTreeMap<usize, u64>,
+    start_line: usize,
+    end_line: usize,
+) -> BTreeMap<usize, u64> {
+    counts
+        .into_iter()
+        .filter(|(line, _)| (start_line..=end_line).contains(line))
+        .collect()
+}
+
+fn attribute_compiler_line_costs(
+    lines: &mut [AttributedSourceLine],
+    line_instruction_counts: &BTreeMap<usize, u64>,
+    total_gpu_percent: f64,
+) {
+    if total_gpu_percent <= f64::EPSILON {
+        return;
+    }
+    let total_instructions = lines
+        .iter()
+        .filter_map(|line| line_instruction_counts.get(&line.line_number))
+        .sum::<u64>();
+    if total_instructions == 0 {
+        return;
+    }
+    for line in lines {
+        let instructions = line_instruction_counts
+            .get(&line.line_number)
+            .copied()
+            .unwrap_or(0);
+        if instructions == 0 {
+            line.estimated_cost = 0.0;
+            line.attributed_gpu_percent = 0.0;
+            continue;
+        }
+        line.estimated_cost = instructions as f64;
+        line.attributed_gpu_percent =
+            total_gpu_percent * (instructions as f64 / total_instructions as f64);
     }
 }
 
@@ -2206,6 +2410,68 @@ mod tests {
         );
 
         assert!(lines[0].attributed_gpu_percent > lines[1].attributed_gpu_percent);
+    }
+
+    #[test]
+    fn embedded_trace_sources_take_precedence_over_search_paths() {
+        let trace_dir = tempfile::tempdir().unwrap();
+        let search_dir = tempfile::tempdir().unwrap();
+        let embedded = trace_dir.path().join("F014BAB6CEF0307");
+        let source = search_dir.path().join("kernel.metal");
+        fs::write(
+            &embedded,
+            "using namespace metal;\n\nkernel void kernel_a() {\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &source,
+            "using namespace metal;\n\n\n\nkernel void kernel_a() {\n}\n",
+        )
+        .unwrap();
+
+        let index =
+            ShaderSourceIndex::build_for_trace(trace_dir.path(), &[search_dir.path().into()])
+                .unwrap();
+        let (path, line) = index.lookup("kernel_a").unwrap();
+
+        assert_eq!(path, embedded);
+        assert_eq!(line, 3);
+    }
+
+    #[test]
+    fn compiler_line_costs_override_source_heuristic_costs() {
+        let mut lines = vec![
+            AttributedSourceLine {
+                line_number: 10,
+                text: "if (lane < stride) {".into(),
+                instruction_type: "control".into(),
+                complexity: 2,
+                estimated_cost: 2.0,
+                attributed_gpu_percent: 1.0,
+                hotspot: false,
+                hints: vec![],
+            },
+            AttributedSourceLine {
+                line_number: 11,
+                text: "out[i] = value;".into(),
+                instruction_type: "memory".into(),
+                complexity: 3,
+                estimated_cost: 6.0,
+                attributed_gpu_percent: 3.0,
+                hotspot: false,
+                hints: vec![],
+            },
+        ];
+        let mut counts = BTreeMap::new();
+        counts.insert(10, 1);
+        counts.insert(11, 3);
+
+        attribute_compiler_line_costs(&mut lines, &counts, 40.0);
+
+        assert_eq!(lines[0].estimated_cost, 1.0);
+        assert_eq!(lines[1].estimated_cost, 3.0);
+        assert_eq!(lines[0].attributed_gpu_percent, 10.0);
+        assert_eq!(lines[1].attributed_gpu_percent, 30.0);
     }
 
     #[test]
