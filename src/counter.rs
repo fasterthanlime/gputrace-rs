@@ -1173,11 +1173,6 @@ fn raw_counter_js_variables(trace_path: &Path) -> BTreeMap<String, f64> {
         let normalized_mean = mean(&accum.normalized_values).unwrap_or(raw_mean);
         variables.insert(raw_name.clone(), raw_mean);
         variables.insert(format!("{raw_name}_norm"), normalized_mean);
-        for suffix in ["cmp", "frg", "vtx"] {
-            variables.insert(format!("{raw_name}_{suffix}"), raw_mean);
-            variables.insert(format!("{raw_name}_norm_{suffix}"), normalized_mean);
-            variables.insert(format!("{raw_name}_{suffix}_norm"), normalized_mean);
-        }
     }
     variables
 }
