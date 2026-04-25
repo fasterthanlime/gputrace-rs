@@ -206,10 +206,9 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             .or_else(|| raw_metric("Kernel Invocations"))
             .map(|value| value.round().max(0.0) as usize)
             .unwrap_or(encoder.dispatch_count);
-        let occupancy_percent = occupancy
-            .map(|(percent, _)| percent)
-            .or_else(|| xcode_metric("Kernel Occupancy"))
-            .or_else(|| raw_metric("Kernel Occupancy"));
+        let occupancy_percent = xcode_metric("Kernel Occupancy")
+            .or_else(|| raw_metric("Kernel Occupancy"))
+            .or_else(|| occupancy.map(|(percent, _)| percent));
         let alu_utilization_percent = xcode_metric("ALU Utilization")
             .or_else(|| raw_metric("ALU Utilization"))
             .or_else(|| limiter.and_then(|limiter| limiter.alu_utilization));
@@ -259,11 +258,7 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
                 .or_else(|| raw_metric("Integer and Conditional Utilization"));
         let f32_utilization_percent =
             xcode_metric("F32 Utilization").or_else(|| raw_metric("F32 Utilization"));
-        let metric_source = if execution_cost_percent.is_some() {
-            "execution-cost".to_owned()
-        } else if sample_count > 0 {
-            "streamData".to_owned()
-        } else if xcode_match.is_some()
+        let has_xcode_metrics = xcode_match.is_some()
             && (occupancy_percent.is_some()
                 || alu_utilization_percent.is_some()
                 || device_memory_bandwidth_gbps.is_some()
@@ -275,14 +270,18 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
                 || bytes_read_from_device_memory.is_some()
                 || bytes_written_to_device_memory.is_some()
                 || compute_shader_launch_utilization_percent.is_some()
-                || control_flow_utilization_percent.is_some())
-        {
+                || control_flow_utilization_percent.is_some());
+        let metric_source = if execution_cost_percent.is_some() {
+            "execution-cost".to_owned()
+        } else if has_xcode_metrics {
             "xcode-counters".to_owned()
         } else if raw_metrics_by_encoder
             .keys()
             .any(|(encoder_index, _)| *encoder_index == encoder.index)
         {
             "raw-counter-mapped".to_owned()
+        } else if sample_count > 0 {
+            "streamData".to_owned()
         } else if limiter.is_some() {
             "raw-counter".to_owned()
         } else {

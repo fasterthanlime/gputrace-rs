@@ -331,14 +331,8 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                     .filter(|duration| *duration > 0)
                     .map(|duration| bytes as f64 / (duration as f64 / 1e9) / 1e9)
             });
-            let weighted_cost = xcode_counter_match
-                .and_then(|entry| entry.kernel_alu_performance)
-                .filter(|value| *value > 0.0)
-                .map(|value| value.powf(0.30));
             let metric_source = if execution_cost_percent.is_some() {
                 "execution-cost".to_owned()
-            } else if weighted_cost.is_some() {
-                "xcode-weighted".to_owned()
             } else if total_duration_ns_for_shader.is_some() {
                 "profiler-duration".to_owned()
             } else if simd_percent_of_total.is_some() {
@@ -376,16 +370,16 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 estimated_bytes_accessed,
                 bottlenecks: Vec::new(),
                 optimization_hints: Vec::new(),
-                occupancy_percent: occupancy
-                    .map(|(value, _)| value)
-                    .or(xcode_counter_match.and_then(|entry| entry.occupancy_percent)),
+                occupancy_percent: xcode_counter_match
+                    .and_then(|entry| entry.occupancy_percent)
+                    .or_else(|| occupancy.map(|(value, _)| value)),
                 occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
                 alu_utilization_percent: limiter
                     .map(|(alu, _, _)| alu)
                     .or(xcode_counter_match.and_then(|entry| entry.alu_utilization_percent)),
                 kernel_alu_performance: xcode_counter_match
                     .and_then(|entry| entry.kernel_alu_performance),
-                weighted_cost,
+                weighted_cost: None,
                 weighted_percent_of_total: None,
                 last_level_cache_percent: limiter.map(|(_, llc, _)| llc),
                 device_memory_bandwidth_gbps: limiter
@@ -423,31 +417,11 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
             }
         })
         .collect();
-    let total_weighted_cost = shaders
-        .iter()
-        .filter(|shader| shader.execution_cost_percent.is_none())
-        .filter_map(|shader| shader.weighted_cost)
-        .sum::<f64>();
-    if total_weighted_cost > 0.0 {
-        for shader in &mut shaders {
-            if shader.execution_cost_percent.is_none() {
-                shader.weighted_percent_of_total = shader
-                    .weighted_cost
-                    .map(|value| (value / total_weighted_cost) * 100.0);
-            }
-        }
-    }
     for shader in &mut shaders {
         identify_shader_bottlenecks(shader);
     }
     shaders.sort_by(|left, right| {
         compare_option_f64_desc(right.execution_cost_percent, left.execution_cost_percent)
-            .then_with(|| {
-                compare_option_f64_desc(
-                    right.weighted_percent_of_total,
-                    left.weighted_percent_of_total,
-                )
-            })
             .then_with(|| compare_option_u64_desc(right.total_duration_ns, left.total_duration_ns))
             .then_with(|| compare_option_f64_desc(right.percent_of_total, left.percent_of_total))
             .then_with(|| right.simd_groups.cmp(&left.simd_groups))
@@ -708,7 +682,6 @@ pub fn hotspot_report(
     let metric_source = shader.metric_source.clone();
     let total_gpu_percent = shader
         .execution_cost_percent
-        .or(shader.weighted_percent_of_total)
         .or(shader.percent_of_total)
         .or(shader.simd_percent_of_total)
         .unwrap_or(0.0);
@@ -839,9 +812,10 @@ pub fn format_report(report: &ShaderReport) -> String {
             || shader.gpu_read_bandwidth_gbps.is_some()
             || shader.buffer_l1_miss_rate_percent.is_some()
     });
-    let has_weighted_metrics = report.shaders.iter().any(|shader| {
-        shader.weighted_percent_of_total.is_some() || shader.kernel_alu_performance.is_some()
-    });
+    let has_alu_perf = report
+        .shaders
+        .iter()
+        .any(|shader| shader.kernel_alu_performance.is_some());
     let has_simd_groups = report.shaders.iter().any(|shader| shader.simd_groups > 0);
     if has_profiler_timing {
         out.push_str(&format!(
@@ -855,8 +829,8 @@ pub fn format_report(report: &ShaderReport) -> String {
             " {:>14} {:>8} {:>8}",
             "Duration ns", "Time %", "Exec %",
         ));
-        if has_weighted_metrics {
-            out.push_str(&format!(" {:>8} {:>10}", "Weight %", "ALU Perf"));
+        if has_alu_perf {
+            out.push_str(&format!(" {:>10}", "ALU Perf"));
         }
         out.push_str(&format!(" {:>8} {:>10}", "Samples", "Samples/us"));
         if has_pipeline_stats {
@@ -883,8 +857,8 @@ pub fn format_report(report: &ShaderReport) -> String {
         if has_simd_groups {
             out.push_str(&format!(" {:>12} {:>8}", "SIMD Groups", "SIMD %"));
         }
-        if has_weighted_metrics {
-            out.push_str(&format!(" {:>8} {:>10}", "Weight %", "ALU Perf"));
+        if has_alu_perf {
+            out.push_str(&format!(" {:>10}", "ALU Perf"));
         }
         if has_pipeline_stats {
             out.push_str(&format!(
@@ -941,13 +915,9 @@ pub fn format_report(report: &ShaderReport) -> String {
                     .map(|value| format!("{value:.2}"))
                     .unwrap_or_else(|| "-".to_owned()),
             ));
-            if has_weighted_metrics {
+            if has_alu_perf {
                 out.push_str(&format!(
-                    " {:>8} {:>10}",
-                    shader
-                        .weighted_percent_of_total
-                        .map(|value| format!("{value:.2}"))
-                        .unwrap_or_else(|| "-".to_owned()),
+                    " {:>10}",
                     shader
                         .kernel_alu_performance
                         .map(|value| format!("{value:.2}"))
@@ -1040,13 +1010,9 @@ pub fn format_report(report: &ShaderReport) -> String {
                         .unwrap_or_else(|| "-".to_owned()),
                 ));
             }
-            if has_weighted_metrics {
+            if has_alu_perf {
                 out.push_str(&format!(
-                    " {:>8} {:>10}",
-                    shader
-                        .weighted_percent_of_total
-                        .map(|value| format!("{value:.2}"))
-                        .unwrap_or_else(|| "-".to_owned()),
+                    " {:>10}",
                     shader
                         .kernel_alu_performance
                         .map(|value| format!("{value:.2}"))
@@ -1570,7 +1536,6 @@ fn identify_shader_bottlenecks(shader: &mut ShaderEntry) {
 
     let gpu_percent = shader
         .execution_cost_percent
-        .or(shader.weighted_percent_of_total)
         .or(shader.percent_of_total)
         .or(shader.simd_percent_of_total);
     if let Some(percent) = gpu_percent
@@ -2157,7 +2122,6 @@ mod tests {
         assert!(output.contains("SIMD %"));
         assert!(output.contains("Time %"));
         assert!(output.contains("Exec %"));
-        assert!(output.contains("Weight %"));
         assert!(output.contains("ALU Perf"));
         assert!(output.contains("Samples"));
         assert!(output.contains("Samples/us"));
@@ -2172,7 +2136,6 @@ mod tests {
         assert!(output.contains("60.00"));
         assert!(output.contains("48.00"));
         assert!(output.contains("55.00"));
-        assert!(output.contains("52.00"));
         assert!(output.contains("2048.00"));
         assert!(output.contains("37.50"));
         assert!(output.contains("61.00"));
@@ -2198,14 +2161,14 @@ mod tests {
                 name: "kernel".into(),
                 pipeline_addr: 0x1234,
                 dispatch_count: 2,
-                metric_source: "xcode-weighted".into(),
+                metric_source: "profiler-duration".into(),
                 simd_groups: 96,
                 simd_percent_of_total: Some(48.0),
                 total_duration_ns: Some(120),
                 percent_of_total: Some(60.0),
                 execution_cost_percent: Some(55.0),
-                weighted_cost: Some(9.85),
-                weighted_percent_of_total: Some(52.0),
+                weighted_cost: None,
+                weighted_percent_of_total: None,
                 kernel_alu_performance: Some(2048.0),
                 execution_cost_samples: 11,
                 sample_count: 4,
@@ -2259,24 +2222,24 @@ mod tests {
         assert!(output.contains("classification"));
         assert!(output.contains("estimated_occupancy_percent"));
         assert!(output.contains("memory_bandwidth_limited"));
-        assert!(output.contains("\"kernel\",0x1234,2,\"xcode-weighted\",96,48"));
+        assert!(output.contains("\"kernel\",0x1234,2,\"profiler-duration\",96,48"));
         assert!(output.contains("\"/tmp/kernel.metal\",42"));
     }
 
     #[test]
-    fn hotspot_prefers_xcode_weighted_percent_when_execution_cost_is_missing() {
+    fn hotspot_prefers_duration_when_execution_cost_is_missing() {
         let shader = ShaderEntry {
             name: "kernel".into(),
             pipeline_addr: 0x1234,
             dispatch_count: 2,
-            metric_source: "xcode-weighted".into(),
+            metric_source: "profiler-duration".into(),
             simd_groups: 0,
             simd_percent_of_total: None,
             total_duration_ns: Some(120),
             percent_of_total: Some(60.0),
             execution_cost_percent: None,
-            weighted_cost: Some(9.85),
-            weighted_percent_of_total: Some(52.0),
+            weighted_cost: None,
+            weighted_percent_of_total: None,
             kernel_alu_performance: Some(2048.0),
             execution_cost_samples: 0,
             sample_count: 0,
@@ -2314,13 +2277,10 @@ mod tests {
             source_line: Some(42),
         };
 
-        assert_eq!(shader.metric_source, "xcode-weighted");
+        assert_eq!(shader.metric_source, "profiler-duration");
         assert_eq!(
-            shader
-                .execution_cost_percent
-                .or(shader.weighted_percent_of_total)
-                .or(shader.percent_of_total),
-            Some(52.0)
+            shader.execution_cost_percent.or(shader.percent_of_total),
+            Some(60.0)
         );
     }
 

@@ -86,82 +86,96 @@ pub fn validate(
     let mut matched_reference_indices = BTreeSet::new();
 
     for exported_row in &exported.rows {
-        let reference_row = match_reference_encoder(
+        let Some(reference_row) = match_reference_encoder(
             exported_row.encoder_index,
             &exported_row.encoder_label,
             &imported,
             &matched_reference_indices,
-        );
-        if let Some(reference_row) = reference_row {
-            matched_reference_indices.insert(reference_row.index);
-        }
+        ) else {
+            continue;
+        };
+        matched_reference_indices.insert(reference_row.index);
 
         let metrics = vec![
             compare_metric(
                 "Kernel Invocations",
                 Some(exported_row.kernel_invocations as f64),
-                reference_row.and_then(|row| row.counters.get("Kernel Invocations").copied()),
+                reference_row.counters.get("Kernel Invocations").copied(),
                 tolerance,
             ),
             compare_metric(
                 "ALU Utilization",
                 exported_row.alu_utilization_percent,
-                reference_row.and_then(|row| row.counters.get("ALU Utilization").copied()),
+                reference_row.counters.get("ALU Utilization").copied(),
                 tolerance,
             ),
             compare_metric(
                 "Kernel Occupancy",
                 exported_row.occupancy_percent,
-                reference_row.and_then(|row| row.counters.get("Kernel Occupancy").copied()),
+                reference_row.counters.get("Kernel Occupancy").copied(),
                 tolerance,
             ),
             compare_metric(
                 "Device Memory Bandwidth",
                 exported_row.device_memory_bandwidth_gbps,
-                reference_row.and_then(|row| row.counters.get("Device Memory Bandwidth").copied()),
+                reference_row
+                    .counters
+                    .get("Device Memory Bandwidth")
+                    .copied(),
                 tolerance,
             ),
             compare_metric(
                 "GPU Read Bandwidth",
                 exported_row.gpu_read_bandwidth_gbps,
-                reference_row.and_then(|row| row.counters.get("GPU Read Bandwidth").copied()),
+                reference_row.counters.get("GPU Read Bandwidth").copied(),
                 tolerance,
             ),
             compare_metric(
                 "GPU Write Bandwidth",
                 exported_row.gpu_write_bandwidth_gbps,
-                reference_row.and_then(|row| row.counters.get("GPU Write Bandwidth").copied()),
+                reference_row.counters.get("GPU Write Bandwidth").copied(),
                 tolerance,
             ),
             compare_metric(
                 "Buffer L1 Miss Rate",
                 exported_row.buffer_l1_miss_rate_percent,
-                reference_row.and_then(|row| row.counters.get("Buffer L1 Miss Rate").copied()),
+                reference_row.counters.get("Buffer L1 Miss Rate").copied(),
                 tolerance,
             ),
             compare_metric(
                 "Buffer L1 Read Accesses",
                 exported_row.buffer_l1_read_accesses,
-                reference_row.and_then(|row| row.counters.get("Buffer L1 Read Accesses").copied()),
+                reference_row
+                    .counters
+                    .get("Buffer L1 Read Accesses")
+                    .copied(),
                 tolerance,
             ),
             compare_metric(
                 "Buffer L1 Read Bandwidth",
                 exported_row.buffer_l1_read_bandwidth_gbps,
-                reference_row.and_then(|row| row.counters.get("Buffer L1 Read Bandwidth").copied()),
+                reference_row
+                    .counters
+                    .get("Buffer L1 Read Bandwidth")
+                    .copied(),
                 tolerance,
             ),
             compare_metric(
                 "Buffer L1 Write Accesses",
                 exported_row.buffer_l1_write_accesses,
-                reference_row.and_then(|row| row.counters.get("Buffer L1 Write Accesses").copied()),
+                reference_row
+                    .counters
+                    .get("Buffer L1 Write Accesses")
+                    .copied(),
                 tolerance,
             ),
             compare_metric(
                 "Buffer L1 Write Bandwidth",
                 exported_row.buffer_l1_write_bandwidth_gbps,
                 reference_row
-                    .and_then(|row| row.counters.get("Buffer L1 Write Bandwidth").copied()),
+                    .counters
+                    .get("Buffer L1 Write Bandwidth")
+                    .copied(),
                 tolerance,
             ),
         ];
@@ -171,7 +185,7 @@ pub fn validate(
             .count();
         row_results.push(CounterValidationRow {
             encoder_index: exported_row.encoder_index,
-            encoder_label: choose_encoder_label(&exported_row.encoder_label, reference_row),
+            encoder_label: choose_encoder_label(&exported_row.encoder_label, Some(reference_row)),
             metrics,
         });
     }

@@ -161,11 +161,6 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
                 });
         let metric_source = if execution_cost_percent.is_some() {
             "execution-cost"
-        } else if source
-            .and_then(|shader| shader.weighted_percent_of_total)
-            .is_some()
-        {
-            "xcode-weighted"
         } else if source.and_then(|shader| shader.total_duration_ns).is_some() {
             "profiler-duration"
         } else if source
@@ -234,20 +229,14 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<Correlati
     }
 
     shaders.sort_by(|left, right| {
-        compare_option_f64_desc(
-            right
-                .execution_cost_percent
-                .or(right.weighted_percent_of_total),
-            left.execution_cost_percent
-                .or(left.weighted_percent_of_total),
-        )
-        .then_with(|| {
-            right
-                .synthetic_total_duration_ns
-                .cmp(&left.synthetic_total_duration_ns)
-        })
-        .then_with(|| right.execution_count.cmp(&left.execution_count))
-        .then_with(|| left.shader_name.cmp(&right.shader_name))
+        compare_option_f64_desc(right.execution_cost_percent, left.execution_cost_percent)
+            .then_with(|| {
+                right
+                    .synthetic_total_duration_ns
+                    .cmp(&left.synthetic_total_duration_ns)
+            })
+            .then_with(|| right.execution_count.cmp(&left.execution_count))
+            .then_with(|| left.shader_name.cmp(&right.shader_name))
     });
 
     Ok(CorrelationReport {
@@ -314,7 +303,6 @@ pub fn format_report(report: &CorrelationReport, verbose: bool) -> String {
             shader.synthetic_percent_of_total,
             shader
                 .execution_cost_percent
-                .or(shader.weighted_percent_of_total)
                 .map(|value| format!("{value:.2}"))
                 .unwrap_or_else(|| "-".to_owned()),
             shader.sample_count,
