@@ -2230,9 +2230,7 @@ fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormaliz
 
     let mut accum = BTreeMap::<RawCounterMetricKey, RawCounterMetricAccum>::new();
     for (path, data) in sample_blobs {
-        if !path.contains("/Derived Counter Sample Data/")
-            || path.split('/').nth_back(1) != Some("1")
-        {
+        if !path.contains("/Derived Counter Sample Data/") {
             continue;
         }
         let Some((record_size, _)) = gprw_record_info(&data) else {
