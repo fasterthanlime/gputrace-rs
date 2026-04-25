@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::profiler;
 use crate::timeline;
 use crate::trace::TraceBundle;
+#[cfg(test)]
 use crate::xcode_counters;
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,29 +74,34 @@ pub struct CounterExportRow {
     pub alu_instruction_count: Option<i64>,
     pub branch_instruction_count: Option<i64>,
     pub compilation_time_ms: Option<f64>,
+    pub metrics: BTreeMap<String, f64>,
 }
 
 pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
     let timeline = timeline::report(trace)?;
     let limiters = counter::extract_limiters_for_trace(&trace.path);
-    let raw_counter_metrics = profiler::find_profiler_directory(&trace.path)
-        .map(|dir| counter::extract_counter_file_metrics(&dir))
-        .unwrap_or_default();
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
-    let xcode_counter_data = xcode_counters::parse(trace, None).ok();
+    let raw_counter_report = counter::raw_counters_report(trace).ok();
+
+    if let Some(raw_counter_report) = &raw_counter_report
+        && let Some(rows) = aps_counter_rows(
+            trace,
+            &timeline,
+            profiler_summary.as_ref(),
+            raw_counter_report,
+        )
+    {
+        return Ok(CounterExportReport {
+            trace_source: trace.path.clone(),
+            source: "aps-counter-samples".to_owned(),
+            total_rows: rows.len(),
+            rows,
+        });
+    }
 
     let limiters_by_encoder = limiters
         .into_iter()
         .map(|limiter| (limiter.encoder_index, limiter))
-        .collect::<BTreeMap<_, _>>();
-    let raw_metrics_by_encoder = raw_counter_metrics
-        .into_iter()
-        .map(|metric| {
-            (
-                (metric.encoder_index, metric.metric_name.clone()),
-                raw_counter_metric_value(&metric),
-            )
-        })
         .collect::<BTreeMap<_, _>>();
 
     let mut execution_cost_by_name = BTreeMap::<String, (f64, usize)>::new();
@@ -189,97 +195,45 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             .and_then(|name| pipeline_stats_by_name.get(name));
         let limiter = limiters_by_encoder.get(&encoder.index);
         let occupancy = occupancy_by_encoder.get(&encoder.index).copied();
-        let xcode_match = xcode_counter_data
-            .as_ref()
-            .and_then(|data| match_xcode_encoder(encoder.index, &encoder.label, data));
-        let xcode_metric = |name: &str| {
-            xcode_match
-                .and_then(|encoder| encoder.counters.get(name))
-                .copied()
-        };
-        let raw_metric = |name: &str| {
-            raw_metrics_by_encoder
-                .get(&(encoder.index, name.to_owned()))
-                .copied()
-        };
-        let kernel_invocations = xcode_metric("Kernel Invocations")
-            .or_else(|| raw_metric("Kernel Invocations"))
+        let row_metrics = BTreeMap::<String, f64>::new();
+        let row_metric = |name: &str| row_metrics.get(name).copied();
+        let kernel_invocations = row_metric("Kernel Invocations")
             .map(|value| value.round().max(0.0) as usize)
             .unwrap_or(encoder.dispatch_count);
-        let occupancy_percent = xcode_metric("Kernel Occupancy")
-            .or_else(|| raw_metric("Kernel Occupancy"))
-            .or_else(|| occupancy.map(|(percent, _)| percent));
-        let alu_utilization_percent = xcode_metric("ALU Utilization")
-            .or_else(|| raw_metric("ALU Utilization"))
+        let occupancy_percent =
+            row_metric("Kernel Occupancy").or_else(|| occupancy.map(|(percent, _)| percent));
+        let alu_utilization_percent = row_metric("ALU Utilization")
             .or_else(|| limiter.and_then(|limiter| limiter.alu_utilization));
-        let device_memory_bandwidth_gbps = xcode_metric("Device Memory Bandwidth")
-            .or_else(|| raw_metric("Device Memory Bandwidth"))
+        let device_memory_bandwidth_gbps = row_metric("Device Memory Bandwidth")
             .or_else(|| limiter.and_then(|limiter| limiter.device_memory_bandwidth_gbps));
-        let buffer_l1_read_bandwidth_gbps = xcode_metric("Buffer L1 Read Bandwidth")
-            .or_else(|| raw_metric("Buffer L1 Read Bandwidth"))
-            .or_else(|| xcode_metric("L1 Read Bandwidth"));
-        let buffer_l1_write_bandwidth_gbps = xcode_metric("Buffer L1 Write Bandwidth")
-            .or_else(|| raw_metric("Buffer L1 Write Bandwidth"))
-            .or_else(|| xcode_metric("L1 Write Bandwidth"));
+        let buffer_l1_read_bandwidth_gbps =
+            row_metric("Buffer L1 Read Bandwidth").or_else(|| row_metric("L1 Read Bandwidth"));
+        let buffer_l1_write_bandwidth_gbps =
+            row_metric("Buffer L1 Write Bandwidth").or_else(|| row_metric("L1 Write Bandwidth"));
         let buffer_l1_read_bandwidth_gbps = buffer_l1_read_bandwidth_gbps
             .or_else(|| limiter.and_then(|limiter| limiter.buffer_l1_read_bandwidth_gbps));
         let buffer_l1_write_bandwidth_gbps = buffer_l1_write_bandwidth_gbps
             .or_else(|| limiter.and_then(|limiter| limiter.buffer_l1_write_bandwidth_gbps));
-        let gpu_read_bandwidth_gbps =
-            xcode_metric("GPU Read Bandwidth").or_else(|| raw_metric("GPU Read Bandwidth"));
-        let gpu_write_bandwidth_gbps =
-            xcode_metric("GPU Write Bandwidth").or_else(|| raw_metric("GPU Write Bandwidth"));
-        let buffer_device_memory_bytes_read = xcode_metric("Buffer Device Memory Bytes Read")
-            .or_else(|| raw_metric("Buffer Device Memory Bytes Read"));
-        let buffer_device_memory_bytes_written = xcode_metric("Buffer Device Memory Bytes Written")
-            .or_else(|| raw_metric("Buffer Device Memory Bytes Written"));
-        let bytes_read_from_device_memory = xcode_metric("Bytes Read From Device Memory")
-            .or_else(|| raw_metric("Bytes Read From Device Memory"));
-        let bytes_written_to_device_memory = xcode_metric("Bytes Written To Device Memory")
-            .or_else(|| raw_metric("Bytes Written To Device Memory"));
-        let buffer_l1_miss_rate_percent =
-            xcode_metric("Buffer L1 Miss Rate").or_else(|| raw_metric("Buffer L1 Miss Rate"));
-        let buffer_l1_read_accesses = xcode_metric("Buffer L1 Read Accesses")
-            .or_else(|| raw_metric("Buffer L1 Read Accesses"));
-        let buffer_l1_write_accesses = xcode_metric("Buffer L1 Write Accesses")
-            .or_else(|| raw_metric("Buffer L1 Write Accesses"));
+        let gpu_read_bandwidth_gbps = row_metric("GPU Read Bandwidth");
+        let gpu_write_bandwidth_gbps = row_metric("GPU Write Bandwidth");
+        let buffer_device_memory_bytes_read = row_metric("Buffer Device Memory Bytes Read");
+        let buffer_device_memory_bytes_written = row_metric("Buffer Device Memory Bytes Written");
+        let bytes_read_from_device_memory = row_metric("Bytes Read From Device Memory");
+        let bytes_written_to_device_memory = row_metric("Bytes Written To Device Memory");
+        let buffer_l1_miss_rate_percent = row_metric("Buffer L1 Miss Rate");
+        let buffer_l1_read_accesses = row_metric("Buffer L1 Read Accesses");
+        let buffer_l1_write_accesses = row_metric("Buffer L1 Write Accesses");
         let compute_shader_launch_utilization_percent =
-            xcode_metric("Compute Shader Launch Utilization")
-                .or_else(|| raw_metric("Compute Shader Launch Utilization"));
-        let control_flow_utilization_percent = xcode_metric("Control Flow Utilization")
-            .or_else(|| raw_metric("Control Flow Utilization"));
+            row_metric("Compute Shader Launch Utilization");
+        let control_flow_utilization_percent = row_metric("Control Flow Utilization");
         let instruction_throughput_utilization_percent =
-            xcode_metric("Instruction Throughput Utilization")
-                .or_else(|| raw_metric("Instruction Throughput Utilization"));
-        let integer_complex_utilization_percent = xcode_metric("Integer and Complex Utilization")
-            .or_else(|| raw_metric("Integer and Complex Utilization"));
+            row_metric("Instruction Throughput Utilization");
+        let integer_complex_utilization_percent = row_metric("Integer and Complex Utilization");
         let integer_conditional_utilization_percent =
-            xcode_metric("Integer and Conditional Utilization")
-                .or_else(|| raw_metric("Integer and Conditional Utilization"));
-        let f32_utilization_percent =
-            xcode_metric("F32 Utilization").or_else(|| raw_metric("F32 Utilization"));
-        let has_xcode_metrics = xcode_match.is_some()
-            && (occupancy_percent.is_some()
-                || alu_utilization_percent.is_some()
-                || device_memory_bandwidth_gbps.is_some()
-                || buffer_l1_miss_rate_percent.is_some()
-                || gpu_read_bandwidth_gbps.is_some()
-                || gpu_write_bandwidth_gbps.is_some()
-                || buffer_device_memory_bytes_read.is_some()
-                || buffer_device_memory_bytes_written.is_some()
-                || bytes_read_from_device_memory.is_some()
-                || bytes_written_to_device_memory.is_some()
-                || compute_shader_launch_utilization_percent.is_some()
-                || control_flow_utilization_percent.is_some());
+            row_metric("Integer and Conditional Utilization");
+        let f32_utilization_percent = row_metric("F32 Utilization");
         let metric_source = if execution_cost_percent.is_some() {
             "execution-cost".to_owned()
-        } else if has_xcode_metrics {
-            "xcode-counters".to_owned()
-        } else if raw_metrics_by_encoder
-            .keys()
-            .any(|(encoder_index, _)| *encoder_index == encoder.index)
-        {
-            "raw-counter-mapped".to_owned()
         } else if sample_count > 0 {
             "streamData".to_owned()
         } else if limiter.is_some() {
@@ -309,24 +263,24 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             occupancy_confidence: occupancy.map(|(_, confidence)| confidence),
             occupancy_manager_percent: limiter.and_then(|limiter| limiter.occupancy_manager),
             alu_utilization_percent,
-            shader_launch_limiter_percent: raw_metric("Compute Shader Launch Limiter")
+            shader_launch_limiter_percent: row_metric("Compute Shader Launch Limiter")
                 .or_else(|| limiter.and_then(|limiter| limiter.compute_shader_launch))
                 .map(normalize_percent_like),
-            instruction_throughput_percent: raw_metric("Instruction Throughput Limiter")
+            instruction_throughput_percent: row_metric("Instruction Throughput Limiter")
                 .or_else(|| limiter.and_then(|limiter| limiter.instruction_throughput)),
-            integer_complex_percent: raw_metric("Integer and Complex Limiter")
+            integer_complex_percent: row_metric("Integer and Complex Limiter")
                 .or_else(|| limiter.and_then(|limiter| limiter.integer_complex))
                 .map(normalize_percent_like),
-            f32_limiter_percent: raw_metric("F32 Limiter")
+            f32_limiter_percent: row_metric("F32 Limiter")
                 .or_else(|| limiter.and_then(|limiter| limiter.f32_limiter))
                 .map(normalize_percent_like),
-            l1_cache_percent: raw_metric("L1 Cache Limiter")
+            l1_cache_percent: row_metric("L1 Cache Limiter")
                 .or_else(|| limiter.and_then(|limiter| limiter.l1_cache))
                 .map(normalize_percent_like),
-            last_level_cache_percent: raw_metric("Last Level Cache Limiter")
+            last_level_cache_percent: row_metric("Last Level Cache Limiter")
                 .or_else(|| limiter.and_then(|limiter| limiter.last_level_cache))
                 .map(normalize_percent_like),
-            control_flow_percent: raw_metric("Control Flow Limiter")
+            control_flow_percent: row_metric("Control Flow Limiter")
                 .or_else(|| limiter.and_then(|limiter| limiter.control_flow))
                 .map(normalize_percent_like),
             device_memory_bandwidth_gbps,
@@ -355,6 +309,7 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             alu_instruction_count: pipeline_stats.map(|stats| stats.alu_instruction_count),
             branch_instruction_count: pipeline_stats.map(|stats| stats.branch_instruction_count),
             compilation_time_ms: pipeline_stats.map(|stats| stats.compilation_time_ms),
+            metrics: row_metrics,
         });
     }
 
@@ -366,14 +321,258 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
     })
 }
 
-fn raw_counter_metric_value(metric: &counter::CounterFileMetric) -> f64 {
-    if metric.aggregation == "sum" {
-        metric.total_value
-    } else {
-        metric.mean_value
+fn aps_counter_rows(
+    _trace: &TraceBundle,
+    timeline: &timeline::TimelineReport,
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+    raw_counter_report: &counter::RawCountersReport,
+) -> Option<Vec<CounterExportRow>> {
+    let mut groups_by_row = raw_counter_report
+        .grouped_derived_metrics
+        .iter()
+        .filter(|group| group.group_kind == "encoder_sample")
+        .filter_map(|group| group.encoder_sample_row_index.map(|row| (row, group)))
+        .collect::<Vec<_>>();
+    if groups_by_row.is_empty() {
+        return None;
+    }
+    groups_by_row.sort_by_key(|(row, _)| *row);
+
+    let sample_index_by_row = raw_counter_report
+        .aggregate_metadata
+        .iter()
+        .flat_map(|metadata| metadata.encoder_sample_indices.iter())
+        .map(|index| (index.row_index, index.sample_index))
+        .collect::<BTreeMap<_, _>>();
+    let timing_by_sample_index = profiler_summary
+        .map(|summary| {
+            summary
+                .encoder_timings
+                .iter()
+                .map(|timing| (timing.end_offset_micros as u32, timing))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let mut rows = Vec::new();
+    for (row_index, group) in groups_by_row {
+        let mut metrics = BTreeMap::new();
+        for metric in &group.derived_metrics {
+            insert_metric(&mut metrics, &metric.name, metric.value);
+        }
+
+        let sample_index = group
+            .encoder_sample_index
+            .or_else(|| sample_index_by_row.get(&row_index).copied())
+            .unwrap_or(row_index as u32);
+        let timing = timing_by_sample_index.get(&sample_index).copied();
+        let command_buffer_index = row_index;
+        let timeline_encoder = preferred_timeline_encoder(timeline, command_buffer_index);
+        let encoder_label = timeline_encoder
+            .map(|encoder| encoder.label.clone())
+            .unwrap_or_else(|| format!("encoder_sample_{row_index}"));
+        let pipeline_addr = timeline_encoder.map(|encoder| encoder.address);
+        let kernel_name = kernel_name_from_label(&encoder_label);
+        let start_time_ns = timing
+            .map(|timing| {
+                timing
+                    .end_offset_micros
+                    .saturating_sub(timing.duration_micros)
+                    .saturating_mul(1000)
+            })
+            .or_else(|| timeline_encoder.map(|encoder| encoder.start_time_ns))
+            .unwrap_or_default();
+        let end_time_ns = timing
+            .map(|timing| timing.end_offset_micros.saturating_mul(1000))
+            .or_else(|| timeline_encoder.map(|encoder| encoder.end_time_ns))
+            .unwrap_or(start_time_ns);
+        let duration_ns = timing
+            .map(|timing| timing.duration_micros.saturating_mul(1000))
+            .or_else(|| timeline_encoder.and_then(|encoder| encoder.duration_ns));
+        let kernel_invocations = first_metric(&metrics, &["Kernel Invocations"])
+            .map(|value| value.round().max(0.0) as usize)
+            .unwrap_or_default();
+
+        rows.push(CounterExportRow {
+            row_index: rows.len(),
+            command_buffer_index,
+            encoder_index: sample_index as usize,
+            encoder_label,
+            kernel_name,
+            pipeline_addr,
+            start_time_ns,
+            end_time_ns,
+            duration_ns,
+            dispatch_count: kernel_invocations,
+            kernel_invocations,
+            metric_source: "aps-counter-samples".to_owned(),
+            execution_cost_percent: None,
+            execution_cost_samples: 0,
+            sample_count: group.record_count,
+            avg_sampling_density: None,
+            occupancy_percent: first_metric(&metrics, &["Kernel Occupancy", "CS Occupancy"]),
+            occupancy_confidence: None,
+            occupancy_manager_percent: first_metric(&metrics, &["Occupancy Manager Target"]),
+            alu_utilization_percent: first_metric(
+                &metrics,
+                &[
+                    "ALU Utilization",
+                    "CS ALU Performance",
+                    "Kernel ALU Performance",
+                ],
+            ),
+            shader_launch_limiter_percent: first_metric(
+                &metrics,
+                &[
+                    "Compute Shader Launch Limiter",
+                    "Shader Launch Limiter",
+                    "Vertex Shader Launch Limiter",
+                ],
+            ),
+            instruction_throughput_percent: first_metric(
+                &metrics,
+                &["Instruction Throughput Limiter"],
+            ),
+            integer_complex_percent: first_metric(&metrics, &["Integer and Complex Limiter"]),
+            f32_limiter_percent: first_metric(&metrics, &["F32 Limiter"]),
+            l1_cache_percent: first_metric(
+                &metrics,
+                &[
+                    "Texture Cache Limiter",
+                    "Texture Read Cache Limiter",
+                    "L1 Cache Limiter",
+                ],
+            ),
+            last_level_cache_percent: first_metric(&metrics, &["Last Level Cache Limiter"]),
+            control_flow_percent: first_metric(&metrics, &["Control Flow Limiter"]),
+            device_memory_bandwidth_gbps: first_metric(
+                &metrics,
+                &["Device Memory Bandwidth", "Main Memory Throughput"],
+            ),
+            gpu_read_bandwidth_gbps: first_metric(&metrics, &["GPU Read Bandwidth"]),
+            gpu_write_bandwidth_gbps: first_metric(&metrics, &["GPU Write Bandwidth"]),
+            buffer_device_memory_bytes_read: first_metric(
+                &metrics,
+                &["Buffer Device Memory Bytes Read"],
+            ),
+            buffer_device_memory_bytes_written: first_metric(
+                &metrics,
+                &["Buffer Device Memory Bytes Written"],
+            ),
+            bytes_read_from_device_memory: first_metric(
+                &metrics,
+                &["Bytes Read From Device Memory"],
+            ),
+            bytes_written_to_device_memory: first_metric(
+                &metrics,
+                &["Bytes Written To Device Memory"],
+            ),
+            buffer_l1_miss_rate_percent: first_metric(
+                &metrics,
+                &[
+                    "Buffer L1 Miss Rate",
+                    "Texture Cache Read Miss Rate",
+                    "Texture Cache Miss Rate",
+                ],
+            ),
+            buffer_l1_read_accesses: first_metric(&metrics, &["Buffer L1 Read Accesses"]),
+            buffer_l1_read_bandwidth_gbps: first_metric(
+                &metrics,
+                &["Buffer L1 Read Bandwidth", "L1 Read Bandwidth"],
+            ),
+            buffer_l1_write_accesses: first_metric(&metrics, &["Buffer L1 Write Accesses"]),
+            buffer_l1_write_bandwidth_gbps: first_metric(
+                &metrics,
+                &["Buffer L1 Write Bandwidth", "L1 Write Bandwidth"],
+            ),
+            compute_shader_launch_utilization_percent: first_metric(
+                &metrics,
+                &["Compute Shader Launch Utilization"],
+            ),
+            control_flow_utilization_percent: first_metric(&metrics, &["Control Flow Utilization"]),
+            instruction_throughput_utilization_percent: first_metric(
+                &metrics,
+                &["Instruction Throughput Utilization"],
+            ),
+            integer_complex_utilization_percent: first_metric(
+                &metrics,
+                &["Integer and Complex Utilization"],
+            ),
+            integer_conditional_utilization_percent: first_metric(
+                &metrics,
+                &["Integer and Conditional Utilization"],
+            ),
+            f32_utilization_percent: first_metric(&metrics, &["F32 Utilization"]),
+            temporary_register_count: None,
+            uniform_register_count: None,
+            spilled_bytes: None,
+            threadgroup_memory: None,
+            instruction_count: None,
+            alu_instruction_count: None,
+            branch_instruction_count: None,
+            compilation_time_ms: None,
+            metrics,
+        });
+    }
+    Some(rows)
+}
+
+fn insert_metric(metrics: &mut BTreeMap<String, f64>, name: &str, value: f64) {
+    if !value.is_finite() {
+        return;
+    }
+    match metrics.get(name).copied() {
+        Some(existing) if existing.abs() >= value.abs() => {}
+        _ => {
+            metrics.insert(name.to_owned(), value);
+        }
     }
 }
 
+fn first_metric(metrics: &BTreeMap<String, f64>, names: &[&str]) -> Option<f64> {
+    names.iter().find_map(|name| metrics.get(*name).copied())
+}
+
+fn preferred_timeline_encoder(
+    timeline: &timeline::TimelineReport,
+    command_buffer_index: usize,
+) -> Option<&timeline::TimelineEncoder> {
+    timeline
+        .encoders
+        .iter()
+        .filter(|encoder| encoder.command_buffer_index == command_buffer_index)
+        .find(|encoder| !encoder.label.ends_with(".command_buffer"))
+        .or_else(|| {
+            timeline
+                .encoders
+                .iter()
+                .find(|encoder| encoder.command_buffer_index == command_buffer_index)
+        })
+}
+
+fn kernel_name_from_label(label: &str) -> Option<String> {
+    (!label.contains('.') && !label.is_empty()).then(|| label.to_owned())
+}
+
+fn top_metrics_summary(metrics: &BTreeMap<String, f64>, limit: usize) -> String {
+    let mut values = metrics.iter().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .1
+            .abs()
+            .partial_cmp(&left.1.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(right.0))
+    });
+    values
+        .into_iter()
+        .take(limit)
+        .map(|(name, value)| format!("{name}={value:.2}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
 fn match_xcode_encoder<'a>(
     encoder_index: usize,
     encoder_label: &str,
@@ -465,6 +664,20 @@ pub fn format_report(report: &CounterExportReport) -> String {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_owned()),
         ));
+    }
+    if report.rows.iter().any(|row| !row.metrics.is_empty()) {
+        out.push_str("\ntrace-derived metrics\n");
+        for row in &report.rows {
+            if row.metrics.is_empty() {
+                continue;
+            }
+            out.push_str(&format!(
+                "row {} {}: {}\n",
+                row.row_index,
+                truncate(&row.encoder_label, 32),
+                top_metrics_summary(&row.metrics, 8)
+            ));
+        }
     }
     out
 }
@@ -881,6 +1094,7 @@ fn normalize_percent_like(value: f64) -> f64 {
     if value <= 1.0 { value * 100.0 } else { value }
 }
 
+#[cfg(test)]
 fn normalize_for_matching(name: &str) -> String {
     name.chars()
         .filter_map(|ch| {
@@ -958,6 +1172,7 @@ mod tests {
                 alu_instruction_count: Some(700),
                 branch_instruction_count: Some(20),
                 compilation_time_ms: Some(1.2),
+                metrics: BTreeMap::new(),
             }],
         };
 
@@ -1025,39 +1240,51 @@ mod tests {
     }
 
     #[test]
-    fn raw_counter_metric_value_uses_go_aggregation_semantics() {
-        let averaged = counter::CounterFileMetric {
-            file_index: 12,
-            metric_name: "ALU Utilization".into(),
-            unit: Some("%".into()),
-            encoder_index: 0,
-            record_count: 2,
-            sample_count: 2,
-            aggregation: "average".into(),
-            total_value: 60.0,
-            representative_value: 30.0,
-            min_value: 20.0,
-            max_value: 40.0,
-            mean_value: 30.0,
-            confidence: 1.0,
-        };
-        let summed = counter::CounterFileMetric {
-            file_index: 28,
-            metric_name: "Bytes Read From Device Memory".into(),
-            unit: Some("bytes".into()),
-            encoder_index: 0,
-            record_count: 2,
-            sample_count: 2,
-            aggregation: "sum".into(),
-            total_value: 12_288.0,
-            representative_value: 12_288.0,
-            min_value: 4096.0,
-            max_value: 8192.0,
-            mean_value: 6144.0,
-            confidence: 1.0,
+    fn chooses_first_non_command_buffer_encoder_for_sample_rows() {
+        let timeline = timeline::TimelineReport {
+            synthetic: false,
+            source: "fixture".to_owned(),
+            command_buffers_profiler_backed: true,
+            start_time_ns: 0,
+            end_time_ns: 0,
+            duration_ns: 0,
+            command_buffer_count: 1,
+            encoder_count: 2,
+            dispatch_count: 0,
+            counter_track_count: 0,
+            command_buffers: Vec::new(),
+            encoders: vec![
+                timeline::TimelineEncoder {
+                    index: 1,
+                    command_buffer_index: 0,
+                    label: "cb.command_buffer".to_owned(),
+                    address: 0,
+                    dispatch_count: 0,
+                    start_time_ns: 0,
+                    end_time_ns: 1,
+                    duration_ns: Some(1),
+                    synthetic: false,
+                },
+                timeline::TimelineEncoder {
+                    index: 2,
+                    command_buffer_index: 0,
+                    label: "kernel_a".to_owned(),
+                    address: 0,
+                    dispatch_count: 0,
+                    start_time_ns: 1,
+                    end_time_ns: 2,
+                    duration_ns: Some(1),
+                    synthetic: false,
+                },
+            ],
+            dispatches: Vec::new(),
+            counter_tracks: Vec::new(),
+            events: Vec::new(),
         };
 
-        assert_eq!(raw_counter_metric_value(&averaged), 30.0);
-        assert_eq!(raw_counter_metric_value(&summed), 12_288.0);
+        assert_eq!(
+            preferred_timeline_encoder(&timeline, 0).map(|encoder| encoder.label.as_str()),
+            Some("kernel_a")
+        );
     }
 }
