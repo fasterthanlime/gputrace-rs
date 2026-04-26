@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::analysis::{AnalysisReport, analyze};
 use crate::counter_export;
@@ -25,6 +25,7 @@ pub struct DiffReport {
 #[derive(Debug, Clone, Default)]
 pub struct DiffOptions {
     pub profile: ProfileDiffOptions,
+    pub profile_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -294,9 +295,137 @@ pub fn diff_paths_with_options(
     right: impl AsRef<Path>,
     options: &DiffOptions,
 ) -> Result<DiffReport> {
-    let left = TraceBundle::open(left)?;
-    let right = TraceBundle::open(right)?;
-    Ok(diff_with_options(&left, &right, options))
+    if options.profile_only {
+        return Ok(diff_profile_paths_report(
+            left.as_ref(),
+            right.as_ref(),
+            &options.profile,
+        ));
+    }
+    let (left, left_warnings) = open_trace_bundle_for_diff(left.as_ref())?;
+    let (right, right_warnings) = open_trace_bundle_for_diff(right.as_ref())?;
+    let mut report = diff_with_options(&left, &right, options);
+    for warning in left_warnings.into_iter().chain(right_warnings) {
+        report.summary.push(warning.clone());
+        if let Some(profile) = &mut report.profile_diff {
+            profile.warnings.push(warning);
+        }
+    }
+    Ok(report)
+}
+
+fn diff_profile_paths_report(
+    left: &Path,
+    right: &Path,
+    options: &ProfileDiffOptions,
+) -> DiffReport {
+    let profile_diff = diff_profile_paths(left, right, options);
+    let mut summary = Vec::new();
+    if let Some(profile) = &profile_diff {
+        summary.push(format!(
+            "Profile dispatch delta: {} -> {} ({:+}), GPU time {} -> {} us ({:+} us), matched delta {:+} us, unmatched delta {:+} us",
+            profile.summary.left_dispatch_count,
+            profile.summary.right_dispatch_count,
+            profile.summary.dispatch_count_delta,
+            profile.summary.left_total_gpu_time_us,
+            profile.summary.right_total_gpu_time_us,
+            profile.summary.total_delta_us,
+            profile.summary.matched_delta_us,
+            profile.summary.unmatched_delta_us
+        ));
+        summary.push(format!(
+            "Likely profile cause: {}",
+            profile.summary.likely_cause
+        ));
+        summary.extend(profile.warnings.clone());
+    } else {
+        summary.push("No profile dispatch data found for either input.".to_owned());
+    }
+
+    DiffReport {
+        left: empty_analysis_report(left),
+        right: empty_analysis_report(right),
+        buffer_changes: Vec::new(),
+        buffer_lifecycle_changes: Vec::new(),
+        kernel_changes: Vec::new(),
+        kernel_timing_changes: Vec::new(),
+        counter_metric_changes: Vec::new(),
+        profile_diff,
+        summary,
+    }
+}
+
+fn empty_analysis_report(path: &Path) -> AnalysisReport {
+    AnalysisReport {
+        trace: crate::trace::TraceSummary {
+            trace_name: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+                .to_owned(),
+            uuid: None,
+            capture_version: None,
+            graphics_api: None,
+            device_id: None,
+            capture_len: 0,
+            device_resource_count: 0,
+            device_resource_bytes: 0,
+        },
+        timing_synthetic: false,
+        total_duration_ns: 0,
+        command_buffer_count: 0,
+        command_buffer_region_count: 0,
+        compute_encoder_count: 0,
+        dispatch_count: 0,
+        pipeline_function_count: 0,
+        kernel_count: 0,
+        buffer_count: 0,
+        shared_buffer_count: 0,
+        single_use_buffer_count: 0,
+        short_lived_buffer_count: 0,
+        long_lived_buffer_count: 0,
+        buffer_inventory_count: 0,
+        buffer_inventory_bytes: 0,
+        buffer_inventory_aliases: 0,
+        unused_resource_count: 0,
+        unused_resource_bytes: 0,
+        kernel_stats: Vec::new(),
+        timed_kernel_stats: Vec::new(),
+        buffer_stats: Vec::new(),
+        buffer_lifecycles: Vec::new(),
+        largest_buffers: Vec::new(),
+        unused_resource_groups: Vec::new(),
+        findings: Vec::new(),
+    }
+}
+
+fn open_trace_bundle_for_diff(path: &Path) -> Result<(TraceBundle, Vec<String>)> {
+    match TraceBundle::open(path) {
+        Ok(trace) => Ok((trace, Vec::new())),
+        Err(error @ Error::MissingFile(_)) => {
+            let Some(raw_sibling) = raw_capture_sibling(path) else {
+                return Err(error);
+            };
+            match TraceBundle::open(&raw_sibling) {
+                Ok(trace) => Ok((
+                    trace,
+                    vec![format!(
+                        "Diff input {} is missing raw capture data; using sibling raw capture {} for structural analysis.",
+                        path.display(),
+                        raw_sibling.display()
+                    )],
+                )),
+                Err(_) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn raw_capture_sibling(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix("-perfdata.gputrace")?;
+    Some(path.with_file_name(format!("{stem}.gputrace")))
 }
 
 pub fn diff(left: &TraceBundle, right: &TraceBundle) -> DiffReport {
@@ -1212,8 +1341,17 @@ fn diff_profile(
     right: &TraceBundle,
     options: &ProfileDiffOptions,
 ) -> Option<ProfileDiffReport> {
-    let left_trace = load_profile_trace(left, options);
-    let right_trace = load_profile_trace(right, options);
+    diff_profile_paths(&left.path, &right.path, options)
+}
+
+fn diff_profile_paths(
+    left: &Path,
+    right: &Path,
+    options: &ProfileDiffOptions,
+) -> Option<ProfileDiffReport> {
+    let prefer_sidecar = !has_stream_data(left) || !has_stream_data(right);
+    let left_trace = load_profile_trace_from_path(left, options, prefer_sidecar);
+    let right_trace = load_profile_trace_from_path(right, options, prefer_sidecar);
     if left_trace.dispatches.is_empty() && right_trace.dispatches.is_empty() {
         return None;
     }
@@ -1306,23 +1444,42 @@ fn diff_profile(
     Some(report)
 }
 
-fn load_profile_trace(trace: &TraceBundle, options: &ProfileDiffOptions) -> ProfileTraceData {
-    let path = trace.path.display().to_string();
-    let label = trace
-        .path
+fn load_profile_trace_from_path(
+    path: &Path,
+    options: &ProfileDiffOptions,
+    prefer_sidecar: bool,
+) -> ProfileTraceData {
+    let path_display = path.display().to_string();
+    let label = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(path.as_str())
+        .unwrap_or(path_display.as_str())
         .to_owned();
     let mut warnings = Vec::new();
-    let summary = match profiler::stream_data_summary(&trace.path) {
+    if prefer_sidecar
+        && let Some(mut trace) = load_profile_trace_from_counter_sidecar(path, options, &label)
+    {
+        trace.warnings.push(
+            "using adjacent export-counters JSON because at least one diff input lacks streamData"
+                .to_owned(),
+        );
+        return trace;
+    }
+    let summary = match profiler::stream_data_summary(path) {
         Ok(summary) => summary,
         Err(error) => {
+            if let Some(mut trace) = load_profile_trace_from_counter_sidecar(path, options, &label)
+            {
+                trace.warnings.push(format!(
+                    "profile streamData unavailable for {label}: {error}; using adjacent export-counters JSON"
+                ));
+                return trace;
+            }
             warnings.push(format!(
                 "profile streamData unavailable for {label}: {error}"
             ));
             return ProfileTraceData {
-                path,
+                path: path_display,
                 label,
                 dispatches: Vec::new(),
                 warnings,
@@ -1373,11 +1530,109 @@ fn load_profile_trace(trace: &TraceBundle, options: &ProfileDiffOptions) -> Prof
     }
 
     ProfileTraceData {
-        path,
+        path: path_display,
         label,
         dispatches,
         warnings,
     }
+}
+
+fn has_stream_data(path: &Path) -> bool {
+    profiler::find_profiler_directory(path).is_some_and(|dir| dir.join("streamData").is_file())
+}
+
+#[derive(Debug, Deserialize)]
+struct CounterSidecarReport {
+    rows: Vec<CounterSidecarRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CounterSidecarRow {
+    row_index: usize,
+    encoder_index: usize,
+    encoder_label: String,
+    kernel_name: Option<String>,
+    pipeline_addr: Option<u64>,
+    duration_ns: u64,
+    dispatch_count: usize,
+    metric_source: String,
+}
+
+fn load_profile_trace_from_counter_sidecar(
+    path: &Path,
+    options: &ProfileDiffOptions,
+    label: &str,
+) -> Option<ProfileTraceData> {
+    let sidecar = counter_sidecar_path(path)?;
+    let data = std::fs::read(&sidecar).ok()?;
+    let report: CounterSidecarReport = serde_json::from_slice(&data).ok()?;
+    let only_function = options
+        .only_function
+        .as_ref()
+        .map(|value| value.to_ascii_lowercase());
+    let mut dispatches = Vec::new();
+    for row in report.rows {
+        if row.metric_source != "profile-dispatch-time" {
+            continue;
+        }
+        if options
+            .only_encoder
+            .is_some_and(|encoder| row.encoder_index != encoder)
+        {
+            continue;
+        }
+        let function_name = row
+            .kernel_name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(row.encoder_label.clone());
+        if only_function
+            .as_ref()
+            .is_some_and(|needle| !function_name.to_ascii_lowercase().contains(needle.as_str()))
+        {
+            continue;
+        }
+
+        let dispatch_count = row.dispatch_count.max(1);
+        let total_us = row.duration_ns / 1_000;
+        let per_dispatch_us = (total_us / dispatch_count as u64).max(1);
+        for occurrence in 0..dispatch_count {
+            let function_key = normalize_profile_name(&function_name);
+            dispatches.push(ProfileDispatch {
+                source_index: row
+                    .row_index
+                    .saturating_mul(1_000_000)
+                    .saturating_add(occurrence),
+                function_name: function_name.clone(),
+                kernel_id: function_key.clone(),
+                function_key,
+                pipeline_id: row.pipeline_addr.map(|value| value as i64),
+                encoder_index: row.encoder_index,
+                duration_us: per_dispatch_us,
+            });
+        }
+    }
+    if dispatches.is_empty() {
+        return None;
+    }
+    Some(ProfileTraceData {
+        path: path.display().to_string(),
+        label: label.to_owned(),
+        dispatches,
+        warnings: vec![format!(
+            "loaded profile rows from sidecar {}",
+            sidecar.display()
+        )],
+    })
+}
+
+fn counter_sidecar_path(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix("-perfdata.gputrace")
+        .or_else(|| name.strip_suffix(".gputrace"))?;
+    let candidate = path.with_file_name(format!("{stem}-counters.json"));
+    candidate.is_file().then_some(candidate)
 }
 
 fn profile_function_key(function_name: &str, dispatch: &profiler::ProfilerDispatch) -> String {
@@ -3043,6 +3298,15 @@ mod tests {
         assert_eq!(timing_changes.len(), 3);
         assert_eq!(timing_changes[0].name, "c");
         assert_eq!(timing_changes[0].duration_delta_ns, 90);
+    }
+
+    #[test]
+    fn maps_perfdata_path_to_raw_capture_sibling() {
+        assert_eq!(
+            raw_capture_sibling(Path::new("/tmp/sample-perfdata.gputrace")),
+            Some(PathBuf::from("/tmp/sample.gputrace"))
+        );
+        assert_eq!(raw_capture_sibling(Path::new("/tmp/sample.gputrace")), None);
     }
 
     #[test]

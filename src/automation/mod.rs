@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
+use crate::profiler;
 
 #[cfg(target_os = "macos")]
 mod ax;
@@ -560,8 +561,14 @@ fn finish_export_sheet(
     })?;
     let action = ax::finish_export_sheet(parent, file_name, trace_path)?;
     let actual_output = wait_for_export_path(output_path, trace_path, Duration::from_secs(30))?;
+    if export_kind == "profile-trace" {
+        wait_for_complete_profile_export(&actual_output, Duration::from_secs(300))?;
+    }
     if actual_output != output_path {
         copy_path(&actual_output, output_path)?;
+    }
+    if export_kind == "profile-trace" {
+        validate_complete_profile_export(output_path)?;
     }
     if action.target != file_name.to_string_lossy() {
         return Err(Error::InvalidInput(format!(
@@ -570,6 +577,39 @@ fn finish_export_sheet(
         )));
     }
     Ok(action.window_title)
+}
+
+fn wait_for_complete_profile_export(output_path: &Path, timeout: Duration) -> Result<()> {
+    let complete = wait_for_condition(timeout, Duration::from_millis(500), || {
+        Ok(is_complete_profile_export(output_path))
+    })?;
+    if complete {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "profile export stayed incomplete: {} (expected capture/unsorted-capture and .gpuprofiler_raw/streamData)",
+            output_path.display()
+        )))
+    }
+}
+
+fn validate_complete_profile_export(output_path: &Path) -> Result<()> {
+    if is_complete_profile_export(output_path) {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "profile export is incomplete after copy: {} (expected capture/unsorted-capture and .gpuprofiler_raw/streamData)",
+            output_path.display()
+        )))
+    }
+}
+
+fn is_complete_profile_export(output_path: &Path) -> bool {
+    let has_capture =
+        output_path.join("capture").is_file() || output_path.join("unsorted-capture").is_file();
+    let has_stream_data = profiler::find_profiler_directory(output_path)
+        .is_some_and(|path| path.join("streamData").is_file());
+    has_capture && has_stream_data
 }
 
 fn export_profile_trace(
@@ -839,5 +879,26 @@ mod tests {
             std::fs::read(destination.join("nested").join("leaf.txt")).unwrap(),
             b"leaf"
         );
+    }
+
+    #[test]
+    fn profile_export_completion_requires_capture_and_stream_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let export = dir.path().join("trace-perfdata.gputrace");
+        std::fs::create_dir_all(&export).unwrap();
+        std::fs::write(export.join("index"), b"index").unwrap();
+        std::fs::write(export.join("metadata"), b"metadata").unwrap();
+        std::fs::write(export.join("store0"), b"packed").unwrap();
+
+        assert!(!is_complete_profile_export(&export));
+
+        std::fs::write(export.join("capture"), b"capture").unwrap();
+        assert!(!is_complete_profile_export(&export));
+
+        let profiler_dir = export.join("trace.gputrace.gpuprofiler_raw");
+        std::fs::create_dir_all(&profiler_dir).unwrap();
+        std::fs::write(profiler_dir.join("streamData"), b"stream").unwrap();
+
+        assert!(is_complete_profile_export(&export));
     }
 }

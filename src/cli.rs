@@ -1218,6 +1218,7 @@ pub fn run() -> Result<()> {
             let json_flag = args.json;
             let csv_flag = args.csv;
             let by = args.by.clone();
+            let profile_only = csv_flag || format_arg.as_deref() == Some("csv");
             let show_matches = args.show_matches;
             let show_unmatched = args.show_unmatched;
             let show_occurrences = args.show_occurrences;
@@ -1235,6 +1236,7 @@ pub fn run() -> Result<()> {
                         only_encoder,
                         only_function,
                     },
+                    profile_only,
                 },
             )?;
             if let Some(path) = md_out.as_ref() {
