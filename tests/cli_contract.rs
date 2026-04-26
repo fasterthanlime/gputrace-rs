@@ -82,6 +82,9 @@ fn export_counters_help_mentions_trace_and_formats() {
     assert!(help.contains("<TRACE>"));
     assert!(help.contains("--format <FORMAT>"));
     assert!(help.contains("[default: csv]"));
+    assert!(help.contains("APS counter sample rows"));
+    assert!(help.contains("metric_metadata"));
+    assert!(help.contains("xcode-counters"));
 }
 
 #[test]
@@ -92,6 +95,9 @@ fn raw_counters_help_mentions_trace_and_formats() {
     assert!(help.contains("<TRACE>"));
     assert!(help.contains("--format <FORMAT>"));
     assert!(help.contains("[default: text]"));
+    assert!(help.contains("APSCounterData"));
+    assert!(help.contains("derived.js"));
+    assert!(help.contains("independent of Xcode Counters.csv"));
 }
 
 #[test]

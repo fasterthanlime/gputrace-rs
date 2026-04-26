@@ -227,6 +227,21 @@ The summary view highlights top invocations, memory bandwidth, low occupancy,
 buffer L1 misses, and limiter signals. Use `--metric <name> --top <n>` for a
 focused ranked table.
 
+For offline analysis without an exported Xcode counter CSV, use
+`export-counters` as the structured feed:
+
+```bash
+gputrace export-counters /abs/path/input-perfdata.gputrace --format json
+gputrace export-counters /abs/path/input-perfdata.gputrace --format csv
+```
+
+The JSON output combines profiler/timeline rows and decoded APS counter sample
+rows when present. Use `metric_source` to distinguish `profile-dispatch-time`,
+`profile-execution-cost`, `aps-counter-samples`, and fallback `raw-counter`
+rows. APS rows include `metrics` and `metric_metadata`; metadata is populated
+from local Apple/Xcode counter catalogs with counter keys, units, groups,
+timeline groups, visibility flags, and descriptions where available.
+
 For end-user raw counter inspection without a counter CSV, use `raw-counters`.
 It reports the decoded `.gpuprofiler_raw/streamData` metadata, schemas,
 `GPRWCNTR` streams, raw counter ids, and any matching derived counter names from
@@ -234,8 +249,8 @@ installed AGX Metal statistics/perf counter catalogs. In JSON, `derived_metrics`
 contains finite values from running Apple's local AGX `*-derived.js` formulas
 against decoded raw variables, without needing a separate Xcode counter CSV.
 `grouped_derived_metrics` splits those derived values by raw sample group/source
-and includes profiler-dispatch join fields only when the bundle exposes
-overlapping raw counter and `streamData` tick windows:
+and includes counter graph metadata plus profiler-dispatch join fields only when
+the bundle exposes overlapping raw counter and `streamData` tick windows:
 
 ```bash
 gputrace raw-counters /abs/path/input-perfdata.gputrace --format text

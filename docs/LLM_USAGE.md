@@ -127,6 +127,7 @@ gputrace diff --bench-dir /abs/path/bench-traces --json
 ```bash
 gputrace xcode-counters trace-perfdata.gputrace --format summary
 gputrace xcode-counters trace-perfdata.gputrace --format json
+gputrace export-counters trace-perfdata.gputrace --format json
 gputrace shaders trace-perfdata.gputrace --format json
 gputrace shader-hotspots trace-perfdata.gputrace kernel_name --search-path /abs/path/src --format json
 gputrace shader-source trace-perfdata.gputrace kernel_name --search-path /abs/path/src --format text
@@ -155,6 +156,24 @@ exports. For ranking without a counter CSV, use profiler duration fields. For
 Xcode counter parity, use an exported Xcode counter CSV with `xcode-counters`
 or `validate-counters`.
 
+For a single machine-readable offline feed, prefer `export-counters --format
+json`. It combines profiler/timeline rows with decoded APS counter sample rows
+when present. Inspect each row's `metric_source`:
+
+- `profile-dispatch-time`: per-kernel rows synthesized from real `streamData`
+  dispatch durations when Xcode Cost rows are not separately decoded.
+- `profile-execution-cost`: per-kernel rows from decoded execution-cost data
+  when present.
+- `aps-counter-samples`: rows from decoded `APSCounterData` sample windows.
+- `raw-counter` or timeline-derived sources: fallback timeline/counter rows.
+
+For `aps-counter-samples`, JSON rows include `metrics` and `metric_metadata`.
+`metric_metadata` contains the Apple counter key, type, description, unit,
+counter graph groups, timeline groups, and visibility flags from local
+Xcode/AGX catalogs when available. Do not require or look for a
+`Counters.csv` file for this path; CSV exports are only for `xcode-counters`
+parity/validation.
+
 For end-user raw counter inspection without a counter CSV, use `raw-counters`.
 It reads `.gpuprofiler_raw/streamData` and reports aggregate metadata,
 per-sample-group schemas, decoded `GPRWCNTR` streams, and raw counter ids. When
@@ -164,7 +183,8 @@ counter plists under `/System/Library/Extensions`. The JSON report includes
 decoded raw variables. Treat these as offline Apple-formula counter values; they
 do not depend on, or require, an exported Xcode counter CSV.
 `grouped_derived_metrics` contains the same formula output split by raw counter
-sample group/source. It also carries profiler dispatch metadata when a trace's
+sample group/source and includes counter graph metadata where local Xcode/AGX
+catalogs expose it. It also carries profiler dispatch metadata when a trace's
 raw counter timestamps overlap `streamData` dispatch tick windows; if they do
 not, the report warns rather than fabricating a dispatch join:
 

@@ -37,6 +37,10 @@ gputrace xcode-counters trace-perfdata.gputrace --csv Counters.csv --format json
 gputrace raw-counters trace-perfdata.gputrace --format text
 gputrace raw-counters trace-perfdata.gputrace --format json
 
+# Combined offline profile/counter export for tools and LLMs.
+gputrace export-counters trace-perfdata.gputrace --format json
+gputrace export-counters trace-perfdata.gputrace --format csv
+
 # Shader and source attribution.
 gputrace shaders trace-perfdata.gputrace --format json
 gputrace shader-source trace-perfdata.gputrace kernel_name --search-path src
@@ -61,14 +65,23 @@ when a directory contains unrelated `*Counters.csv` files.
 `pipeline_id_scan_costs` field is a debug-only scan of `Profiling_f_*` bytes,
 not Xcode's Performance/Cost percentage.
 
+`export-counters` is the preferred structured offline feed for downstream tools.
+It does not need an Xcode counter CSV. Its rows include `metric_source` so
+consumers can distinguish `profile-dispatch-time`, `profile-execution-cost`
+when available, timeline/raw-counter fallback rows, and `aps-counter-samples`.
+JSON output also includes `metrics` plus `metric_metadata` for APS-derived
+metrics, including Apple/Xcode counter graph keys, units, groups, timeline
+groups, visibility, and descriptions where the local Xcode/AGX catalogs provide
+them.
+
 `raw-counters` reads the profiler bundle directly and enriches raw counter hashes
 with installed AGX Metal catalog names where the local system provides them.
 Its JSON output also includes `derived_metrics` computed by running Apple's
 local AGX `*-derived.js` formulas against decoded raw counter variables; it does
 not require an Xcode counter CSV. `grouped_derived_metrics` repeats those
-formula evaluations per raw counter sample group/source, and includes
-profiler-dispatch fields only when the raw counter timestamps overlap
-`streamData` dispatch tick windows.
+formula evaluations per raw counter sample group/source, includes Xcode counter
+graph metadata where available, and carries profiler-dispatch fields only when
+the raw counter timestamps overlap `streamData` dispatch tick windows.
 
 ## Main Commands
 

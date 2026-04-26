@@ -49,7 +49,15 @@ enum CommandSet {
     ClearBuffers(ClearBuffersArgs),
     Dump(DumpArgs),
     DumpRecords(DumpRecordsArgs),
+    #[command(
+        about = "Export offline counter/profile rows from a trace bundle",
+        long_about = "Export offline counter/profile rows from a trace bundle.\n\nRows combine streamData/profile dispatch timing, profiler-backed fallback rows, and decoded APS counter sample rows when present. JSON includes APS-derived metric_metadata with Xcode counter graph units/groups/visibility. No Xcode Counters.csv is required; use xcode-counters for explicit CSV exports."
+    )]
     ExportCounters(ExportCountersArgs),
+    #[command(
+        about = "Decode raw APS counter data from a profiler bundle",
+        long_about = "Decode raw APS counter data from a profiler bundle.\n\nReads .gpuprofiler_raw/streamData directly, decodes APSCounterData/GPRWCNTR schemas, maps raw hashes through installed AGX Metal catalogs, and runs local Apple *-derived.js formulas where the trace exposes matching raw variables. This is independent of Xcode Counters.csv."
+    )]
     RawCounters(RawCountersArgs),
     #[command(hide = true)]
     RawCounterProbe(RawCounterProbeArgs),
@@ -238,15 +246,27 @@ struct DumpRecordsArgs {
 
 #[derive(Debug, Args)]
 struct ExportCountersArgs {
+    #[arg(help = "Trace bundle or exported perfdata .gputrace path")]
     trace: PathBuf,
-    #[arg(short, long, default_value = "csv")]
+    #[arg(
+        short,
+        long,
+        default_value = "csv",
+        help = "Output format: csv/xcode-csv, internal-csv, json, or text"
+    )]
     format: String,
 }
 
 #[derive(Debug, Args)]
 struct RawCountersArgs {
+    #[arg(help = "Trace bundle or exported perfdata .gputrace path")]
     trace: PathBuf,
-    #[arg(short, long, default_value = "text")]
+    #[arg(
+        short,
+        long,
+        default_value = "text",
+        help = "Output format: text, json, or csv"
+    )]
     format: String,
 }
 
