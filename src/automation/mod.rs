@@ -630,6 +630,7 @@ fn export_output_candidates(output_path: &Path, trace_path: Option<&Path>) -> Re
         output_path,
         trace_path,
         std::env::var_os("HOME").map(PathBuf::from),
+        Some(std::env::temp_dir()),
     )
 }
 
@@ -637,6 +638,7 @@ fn export_output_candidates_with_home(
     output_path: &Path,
     trace_path: Option<&Path>,
     home: Option<PathBuf>,
+    temp_dir: Option<PathBuf>,
 ) -> Result<Vec<PathBuf>> {
     let file_name = output_path
         .file_name()
@@ -675,6 +677,12 @@ fn export_output_candidates_with_home(
             if !candidates.contains(&candidate) {
                 candidates.push(candidate);
             }
+        }
+    }
+    if let Some(temp_dir) = temp_dir {
+        let candidate = temp_dir.join(&file_name);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
         }
     }
     Ok(candidates)
@@ -801,12 +809,14 @@ mod tests {
             output,
             Some(trace),
             Some(temp_home.path().to_path_buf()),
+            Some(PathBuf::from("/private/tmp")),
         )
         .unwrap();
         assert!(candidates.contains(&PathBuf::from("/tmp/out/trace.gputrace")));
         assert!(candidates.contains(&PathBuf::from("/captures/input/trace.gputrace")));
         assert!(candidates.contains(&temp_home.path().join("Downloads").join("trace.gputrace")));
         assert!(candidates.contains(&temp_home.path().join("Desktop").join("trace.gputrace")));
+        assert!(candidates.contains(&PathBuf::from("/private/tmp/trace.gputrace")));
     }
 
     #[test]

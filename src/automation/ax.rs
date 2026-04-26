@@ -42,6 +42,7 @@ const K_CG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
 const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
 const K_VK_G: u16 = 0x05;
 const K_VK_RETURN: u16 = 0x24;
+const K_VK_KEYPAD_ENTER: u16 = 0x4c;
 const EXPORT_SHEET_SEARCH_LIMIT: usize = 60_000;
 
 #[repr(C)]
@@ -712,11 +713,21 @@ pub fn finish_export_sheet(
     }
 
     let _ = navigate_to_parent_best_effort(&window, &sheet, parent);
+    let sheet = wait_for_export_sheet_with_save_button(&window, trace_path, Duration::from_secs(5))
+        .unwrap_or(sheet);
 
     let output_name = file_name.to_string_lossy();
     if let Some(field) = find_save_as_field(&sheet) {
         field.set_string_value(&output_name)?;
         let _ = field.perform("AXConfirm");
+    }
+
+    if press_replace_if_present(&window) {
+        return Ok(XcodeActionResult {
+            window_title: window.title(),
+            action: "save-export".to_owned(),
+            target: output_name.into_owned(),
+        });
     }
 
     let Some(button) = find_save_button(&sheet, EXPORT_SHEET_SEARCH_LIMIT) else {
@@ -731,11 +742,7 @@ pub fn finish_export_sheet(
     }
     press(&button, Some(&window))?;
     thread::sleep(Duration::from_millis(500));
-    if let Some(replace) = find_button(&window, "Replace", EXPORT_SHEET_SEARCH_LIMIT)
-        && replace.enabled()
-    {
-        press(&replace, Some(&window))?;
-    }
+    let _ = press_replace_if_present(&window);
     Ok(XcodeActionResult {
         window_title: window.title(),
         action: "save-export".to_owned(),
@@ -751,8 +758,12 @@ fn find_export_sheet(app: &AxElement) -> Option<(AxElement, AxElement)> {
 
 fn find_export_sheet_in_window(window: &AxElement) -> Option<AxElement> {
     find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, |el| {
-        el.role() == "AXSheet"
+        el.role() == "AXSheet" && !is_go_to_folder_sheet(el)
     })
+}
+
+fn is_go_to_folder_sheet(sheet: &AxElement) -> bool {
+    sheet.role() == "AXSheet" && normalize(&sheet.string_attr("AXIdentifier")) == "gotowindow"
 }
 
 fn app() -> Result<AxElement> {
@@ -994,9 +1005,13 @@ fn navigate_to_parent_best_effort(
                 || normalize(&el.string_attr("AXDescription")).contains("path")
                 || normalize(&el.string_attr("AXDescription")).contains("folder"))
     }) {
+        let _ = click_element(&path_field);
+        thread::sleep(Duration::from_millis(150));
         let _ = path_field.set_string_value(&parent);
+        thread::sleep(Duration::from_millis(150));
         let _ = path_field.perform("AXConfirm");
-        thread::sleep(Duration::from_millis(250));
+        confirm_text_entry(window, &path_field)?;
+        close_go_to_folder_sheet_if_present(window);
         return Ok(());
     }
 
@@ -1025,17 +1040,72 @@ fn navigate_to_parent_best_effort(
         return Ok(());
     };
 
+    let _ = click_element(&go_field);
+    thread::sleep(Duration::from_millis(150));
     go_field.set_string_value(&parent)?;
-    let _ = go_field.perform("AXConfirm");
-    post_key(K_VK_RETURN, 0)?;
-    thread::sleep(Duration::from_millis(500));
-    if let Some(choose) = find_button(window, "Go", EXPORT_SHEET_SEARCH_LIMIT)
-        .or_else(|| find_button(window, "Choose", EXPORT_SHEET_SEARCH_LIMIT))
-        .filter(AxElement::enabled)
-    {
-        let _ = press(&choose, Some(window));
-    }
+    thread::sleep(Duration::from_millis(200));
+    confirm_text_entry(window, &go_field)?;
+    thread::sleep(Duration::from_millis(700));
+    close_go_to_folder_sheet_if_present(window);
     Ok(())
+}
+
+fn confirm_text_entry(window: &AxElement, field: &AxElement) -> Result<()> {
+    let _ = activate_xcode();
+    let _ = window.perform("AXRaise");
+    thread::sleep(Duration::from_millis(250));
+    let _ = click_element(field);
+    thread::sleep(Duration::from_millis(500));
+    post_key(K_VK_RETURN, 0)?;
+    thread::sleep(Duration::from_millis(350));
+    post_key(K_VK_KEYPAD_ENTER, 0)?;
+    thread::sleep(Duration::from_millis(500));
+    Ok(())
+}
+
+fn close_go_to_folder_sheet_if_present(window: &AxElement) {
+    let Some(sheet) = find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, is_go_to_folder_sheet)
+    else {
+        return;
+    };
+    if let Some(close) = find_button(&sheet, "Close", EXPORT_SHEET_SEARCH_LIMIT) {
+        let _ = press(&close, Some(window));
+    } else {
+        let _ = sheet.perform("AXCancel");
+    }
+    thread::sleep(Duration::from_millis(300));
+}
+
+fn press_replace_if_present(window: &AxElement) -> bool {
+    let Some(replace) =
+        find_button(window, "Replace", EXPORT_SHEET_SEARCH_LIMIT).filter(AxElement::enabled)
+    else {
+        return false;
+    };
+    press(&replace, Some(window)).is_ok()
+}
+
+fn wait_for_export_sheet_with_save_button(
+    window: &AxElement,
+    trace_path: Option<&Path>,
+    timeout: Duration,
+) -> Option<AxElement> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(sheet) = find_export_sheet_in_window(window)
+            && find_save_button(&sheet, EXPORT_SHEET_SEARCH_LIMIT).is_some()
+        {
+            return Some(sheet);
+        }
+        if let Ok(Some(selected)) = selected_window(trace_path)
+            && let Some(sheet) = find_export_sheet_in_window(&selected)
+            && find_save_button(&sheet, EXPORT_SHEET_SEARCH_LIMIT).is_some()
+        {
+            return Some(sheet);
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    None
 }
 
 fn checkbox_action(
