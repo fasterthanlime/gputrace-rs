@@ -168,7 +168,8 @@ impl TraceBundle {
         let metadata = parse_metadata(&path)?;
         let capture_path = load_capture_path(&path)?;
         let capture_len = fs::metadata(&capture_path)?.len();
-        let device_resources = load_device_resources(&path)?;
+        let resource_path = capture_path.parent().unwrap_or(&path);
+        let device_resources = load_device_resources(resource_path)?;
 
         Ok(Self {
             path,
@@ -502,6 +503,18 @@ fn parse_metadata(bundle_path: &Path) -> Result<Metadata> {
 }
 
 fn load_capture_path(bundle_path: &Path) -> Result<PathBuf> {
+    if let Some(path) = local_capture_path(bundle_path)? {
+        return Ok(path);
+    }
+
+    if let Some(path) = sibling_capture_path_for_perfdata(bundle_path)? {
+        return Ok(path);
+    }
+
+    Err(Error::MissingFile(bundle_path.join("capture")))
+}
+
+fn local_capture_path(bundle_path: &Path) -> Result<Option<PathBuf>> {
     for candidate in ["capture", "unsorted-capture"] {
         let path = bundle_path.join(candidate);
         if path.exists() {
@@ -509,11 +522,42 @@ fn load_capture_path(bundle_path: &Path) -> Result<PathBuf> {
             if bytes.get(..4) != Some(MAGIC_MTSP.as_slice()) {
                 return Err(Error::InvalidTrace("capture file did not start with MTSP"));
             }
-            return Ok(path);
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn sibling_capture_path_for_perfdata(bundle_path: &Path) -> Result<Option<PathBuf>> {
+    let Some(parent) = bundle_path.parent() else {
+        return Ok(None);
+    };
+    let Ok(entries) = fs::read_dir(bundle_path) else {
+        return Ok(None);
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(trace_name) = name.strip_suffix(".gpuprofiler_raw") else {
+            continue;
+        };
+        let sibling = parent.join(trace_name);
+        if sibling == bundle_path {
+            continue;
+        }
+        if let Some(path) = local_capture_path(&sibling)? {
+            return Ok(Some(path));
         }
     }
 
-    Err(Error::MissingFile(bundle_path.join("capture")))
+    Ok(None)
 }
 
 fn load_device_resources(bundle_path: &Path) -> Result<Vec<DeviceResource>> {
@@ -861,6 +905,43 @@ fn read_c_string_bytes(data: &[u8], offset: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_metadata(path: &Path) {
+        fs::write(
+            path.join("metadata"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>(uuid)</key><string>test</string></dict></plist>
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn opens_perfdata_export_using_sibling_raw_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("raw.gputrace");
+        let export = dir.path().join("raw-perfdata.gputrace");
+        fs::create_dir_all(&raw).unwrap();
+        fs::create_dir_all(&export).unwrap();
+        write_metadata(&raw);
+        write_metadata(&export);
+        fs::write(raw.join("capture"), [b"MTSP".as_slice(), &[0; 12]].concat()).unwrap();
+        fs::write(raw.join("device-resources-0"), b"resource").unwrap();
+        fs::create_dir_all(export.join("raw.gputrace.gpuprofiler_raw")).unwrap();
+        fs::write(export.join("store0"), b"packed").unwrap();
+        fs::write(export.join("index"), b"index").unwrap();
+
+        let bundle = TraceBundle::open(&export).unwrap();
+
+        assert_eq!(bundle.path, export);
+        assert_eq!(bundle.capture_path, raw.join("capture"));
+        assert_eq!(bundle.device_resources.len(), 1);
+        assert_eq!(
+            bundle.device_resources[0].path,
+            raw.join("device-resources-0")
+        );
+    }
 
     #[test]
     fn parses_command_buffer_markers() {

@@ -792,7 +792,7 @@ pub fn finish_export_sheet(
     };
 
     info!("AX finish export sheet: ensure embed performance data");
-    ensure_embed_performance_data(&window, &sheet)?;
+    ensure_export_checkbox(&window, &sheet, "Embed performance data")?;
 
     let output_name = file_name.to_string_lossy();
     if let Some(field) = find_save_as_field(&sheet) {
@@ -1141,33 +1141,35 @@ fn find_save_button(root: &AxElement, max_visit: usize) -> Option<AxElement> {
     None
 }
 
-fn ensure_embed_performance_data(window: &AxElement, sheet: &AxElement) -> Result<()> {
-    info!("AX ensure embed performance data: begin");
-    let Some(embed) = find_checkbox(sheet, "Embed performance data", EXPORT_SHEET_SEARCH_LIMIT)
-    else {
-        warn!("AX ensure embed performance data: checkbox not found");
+fn ensure_export_checkbox(window: &AxElement, sheet: &AxElement, name: &str) -> Result<()> {
+    info!(name, "AX ensure export checkbox: begin");
+    let Some(embed) = find_checkbox(sheet, name, EXPORT_SHEET_SEARCH_LIMIT) else {
+        warn!(name, "AX ensure export checkbox: checkbox not found");
         return Ok(());
     };
     info!(
         checkbox = %ax_summary(&embed),
         checked = checkbox_checked(&embed),
-        "AX ensure embed performance data: checkbox found"
+        name,
+        "AX ensure export checkbox: checkbox found"
     );
     if !embed.enabled() {
-        warn!(checkbox = %ax_summary(&embed), "AX ensure embed performance data: checkbox disabled");
+        warn!(checkbox = %ax_summary(&embed), name, "AX ensure export checkbox: checkbox disabled");
         return Ok(());
     }
     if !checkbox_checked(&embed) {
-        info!("AX ensure embed performance data: pressing checkbox");
+        info!(name, "AX ensure export checkbox: pressing checkbox");
         press(&embed, Some(window))?;
         thread::sleep(Duration::from_millis(300));
-        info!(
-            checked = checkbox_checked(&embed),
-            checkbox = %ax_summary(&embed),
-            "AX ensure embed performance data: after press"
-        );
+        let checked = checkbox_checked(&embed);
+        info!(checked, checkbox = %ax_summary(&embed), name, "AX ensure export checkbox: after press");
+        if !checked {
+            return Err(Error::InvalidInput(format!(
+                "export checkbox did not become checked: {name}"
+            )));
+        }
     } else {
-        info!("AX ensure embed performance data: already checked");
+        info!(name, "AX ensure export checkbox: already checked");
     }
     Ok(())
 }

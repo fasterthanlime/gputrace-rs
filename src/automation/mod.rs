@@ -652,7 +652,7 @@ fn wait_for_complete_profile_export(output_path: &Path, timeout: Duration) -> Re
     } else {
         warn!(output_path = %output_path.display(), "profile export stayed incomplete");
         Err(Error::InvalidInput(format!(
-            "profile export stayed incomplete: {} (expected capture/unsorted-capture and .gpuprofiler_raw/streamData)",
+            "profile export stayed incomplete: {} (expected capture/unsorted-capture or store0/index/metadata, plus .gpuprofiler_raw/streamData)",
             output_path.display()
         )))
     }
@@ -663,7 +663,7 @@ fn validate_complete_profile_export(output_path: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidInput(format!(
-            "profile export is incomplete after copy: {} (expected capture/unsorted-capture and .gpuprofiler_raw/streamData)",
+            "profile export is incomplete after copy: {} (expected capture/unsorted-capture or store0/index/metadata, plus .gpuprofiler_raw/streamData)",
             output_path.display()
         )))
     }
@@ -672,15 +672,19 @@ fn validate_complete_profile_export(output_path: &Path) -> Result<()> {
 fn is_complete_profile_export(output_path: &Path) -> bool {
     let has_capture =
         output_path.join("capture").is_file() || output_path.join("unsorted-capture").is_file();
+    let has_store_layout = output_path.join("store0").is_file()
+        && output_path.join("index").is_file()
+        && output_path.join("metadata").is_file();
     let has_stream_data = profiler::find_profiler_directory(output_path)
         .is_some_and(|path| path.join("streamData").is_file());
     info!(
         output_path = %output_path.display(),
         has_capture,
+        has_store_layout,
         has_stream_data,
         "checked complete profile export"
     );
-    has_capture && has_stream_data
+    (has_capture || has_store_layout) && has_stream_data
 }
 
 fn export_profile_trace(
@@ -969,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_export_completion_requires_capture_and_stream_data() {
+    fn profile_export_completion_accepts_capture_or_store_layout_with_stream_data() {
         let dir = tempfile::tempdir().unwrap();
         let export = dir.path().join("trace-perfdata.gputrace");
         std::fs::create_dir_all(&export).unwrap();
@@ -987,5 +991,11 @@ mod tests {
         std::fs::write(profiler_dir.join("streamData"), b"stream").unwrap();
 
         assert!(is_complete_profile_export(&export));
+
+        std::fs::remove_file(export.join("capture")).unwrap();
+        assert!(is_complete_profile_export(&export));
+
+        std::fs::remove_file(export.join("store0")).unwrap();
+        assert!(!is_complete_profile_export(&export));
     }
 }
