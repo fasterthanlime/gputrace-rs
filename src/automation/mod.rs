@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use tracing::{info, warn};
 
 use crate::error::{Error, Result};
 use crate::profiler;
@@ -264,11 +265,19 @@ pub fn show_memory(trace_path: Option<&Path>) -> Result<XcodeActionResult> {
 }
 
 pub fn export_counters(trace_path: Option<&Path>, output_path: &Path) -> Result<XcodeExportResult> {
+    info!(
+        trace_path = ?trace_path,
+        output_path = %output_path.display(),
+        "xcode export counters requested"
+    );
     let output_path = prepare_export_output_path(output_path)?;
     let trace_path = trace_path.map(validate_trace_path).transpose()?;
 
+    info!("xcode export counters: show performance tab");
     let _ = show_performance(trace_path.as_deref());
+    info!("xcode export counters: show counters tab");
     let _ = show_counters(trace_path.as_deref());
+    info!("xcode export counters: open export counters menu item");
     let _ = click_menu_item(&["Editor", "Export GPU Counters…"])
         .or_else(|_| click_menu_item(&["Editor", "Export GPU Counters..."]))
         .or_else(|_| click_menu_item(&["Editor", "Export GPU Counters"]))?;
@@ -283,11 +292,19 @@ pub fn export_counters(trace_path: Option<&Path>, output_path: &Path) -> Result<
 }
 
 pub fn export_memory(trace_path: Option<&Path>, output_path: &Path) -> Result<XcodeExportResult> {
+    info!(
+        trace_path = ?trace_path,
+        output_path = %output_path.display(),
+        "xcode export memory requested"
+    );
     let output_path = prepare_export_output_path(output_path)?;
     let trace_path = trace_path.map(validate_trace_path).transpose()?;
 
+    info!("xcode export memory: show performance tab");
     let _ = show_performance(trace_path.as_deref());
+    info!("xcode export memory: show memory tab");
     let _ = show_memory(trace_path.as_deref());
+    info!("xcode export memory: open export memory menu item");
     let _ = click_menu_item(&["Editor", "Export Memory Report…"])
         .or_else(|_| click_menu_item(&["Editor", "Export Memory Report..."]))
         .or_else(|_| click_menu_item(&["Editor", "Export Memory Report"]))?;
@@ -309,23 +326,29 @@ pub fn export_profile(trace_path: Option<&Path>, output_path: &Path) -> Result<X
 }
 
 pub fn run_profile(request: &XcodeProfileRun) -> Result<XcodeExportResult> {
+    info!(request = ?request, "xcode profile run requested");
     let permissions = check_accessibility_permissions(request.prompt_for_permissions)?;
+    info!(permissions = ?permissions, "xcode profile permissions checked");
     if !permissions.accessibility_granted {
         return Err(Error::InvalidInput(
             "Accessibility permission is required for Xcode automation. Grant access in System Settings > Privacy & Security > Accessibility and retry.".to_owned(),
         ));
     }
+    info!("xcode profile: wait for any existing profile to finish");
     wait_for_running_profile(
         Duration::from_secs(request.wait_for_running_profile_seconds),
         request.force,
     )?;
 
+    info!(trace_path = %request.trace_path.display(), "xcode profile: validate trace");
     validate_trace_path(&request.trace_path)?;
     let output_path = request
         .output_path
         .clone()
         .unwrap_or_else(|| default_profile_output_path(&request.trace_path));
+    info!(output_path = %output_path.display(), "xcode profile: resolved output path");
 
+    info!(trace_path = %request.trace_path.display(), "xcode profile: open trace in Xcode");
     open_trace_in_xcode_with_options(
         &request.trace_path,
         OpenTraceOptions {
@@ -335,15 +358,18 @@ pub fn run_profile(request: &XcodeProfileRun) -> Result<XcodeExportResult> {
         },
     )?;
 
+    info!("xcode profile: dismiss startup dialogs");
     let _ = dismiss_startup_dialogs();
     let trace_path = Some(request.trace_path.as_path());
     let status = get_window_status(trace_path)?;
+    info!(status = ?status, "xcode profile: initial window status");
     if !matches!(
         status.status,
         XcodeAutomationStatus::ReplayReady
             | XcodeAutomationStatus::Complete
             | XcodeAutomationStatus::Running
     ) {
+        info!("xcode profile: wait for ready/running/complete status");
         let _ = wait_for_status(
             Duration::from_secs(request.timeout_seconds.max(1)),
             trace_path,
@@ -356,9 +382,12 @@ pub fn run_profile(request: &XcodeProfileRun) -> Result<XcodeExportResult> {
     }
 
     let status = get_window_status(trace_path)?;
+    info!(status = ?status, "xcode profile: status before replay/profile decision");
     match status.status {
         XcodeAutomationStatus::ReplayReady => {
+            info!("xcode profile: clicking Profile/Replay");
             let _ = click_button(trace_path, &["Profile", "Replay"])?;
+            info!("xcode profile: waiting for completion after replay");
             let _ = wait_for_status(
                 Duration::from_secs(request.timeout_seconds.max(1)),
                 trace_path,
@@ -366,13 +395,16 @@ pub fn run_profile(request: &XcodeProfileRun) -> Result<XcodeExportResult> {
             )?;
         }
         XcodeAutomationStatus::Running => {
+            info!("xcode profile: already running, waiting for completion");
             let _ = wait_for_status(
                 Duration::from_secs(request.timeout_seconds.max(1)),
                 trace_path,
                 &[XcodeAutomationStatus::Complete],
             )?;
         }
-        XcodeAutomationStatus::Complete => {}
+        XcodeAutomationStatus::Complete => {
+            info!("xcode profile: already complete");
+        }
         _ => {
             return Err(Error::InvalidInput(format!(
                 "Xcode trace window is not ready to profile: {}",
@@ -381,9 +413,12 @@ pub fn run_profile(request: &XcodeProfileRun) -> Result<XcodeExportResult> {
         }
     }
 
+    info!("xcode profile: show performance");
     let _ = show_performance(trace_path);
 
+    info!("xcode profile: export profiled trace");
     let export = export_profile_trace(trace_path, &output_path)?;
+    info!("xcode profile: close trace window");
     let _ = close_window(trace_path);
     Ok(export)
 }
@@ -524,6 +559,7 @@ fn default_profile_output_path(trace_path: &Path) -> PathBuf {
 
 fn prepare_export_output_path(output_path: &Path) -> Result<PathBuf> {
     let output_path = output_path.to_path_buf();
+    info!(output_path = %output_path.display(), "prepare export output path");
     let parent = output_path.parent().ok_or_else(|| {
         Error::InvalidInput(format!(
             "export path has no parent directory: {}",
@@ -534,8 +570,10 @@ fn prepare_export_output_path(output_path: &Path) -> Result<PathBuf> {
     if output_path.exists() {
         let metadata = output_path.metadata()?;
         if metadata.is_dir() {
+            info!(path = %output_path.display(), "remove existing export directory");
             std::fs::remove_dir_all(&output_path)?;
         } else {
+            info!(path = %output_path.display(), "remove existing export file");
             std::fs::remove_file(&output_path)?;
         }
     }
@@ -547,6 +585,12 @@ fn finish_export_sheet(
     trace_path: Option<&Path>,
     export_kind: &str,
 ) -> Result<String> {
+    info!(
+        output_path = %output_path.display(),
+        trace_path = ?trace_path,
+        export_kind,
+        "finish export sheet wrapper: begin"
+    );
     let parent = output_path.parent().ok_or_else(|| {
         Error::InvalidInput(format!(
             "export path has no parent directory: {}",
@@ -559,15 +603,29 @@ fn finish_export_sheet(
             output_path.display()
         ))
     })?;
+    info!(
+        parent = %parent.display(),
+        file_name = ?file_name,
+        "finish export sheet wrapper: resolved parent and file name"
+    );
     let action = ax::finish_export_sheet(parent, file_name, trace_path)?;
+    info!(action = ?action, "finish export sheet wrapper: AX action returned");
     let actual_output = wait_for_export_path(output_path, trace_path, Duration::from_secs(30))?;
+    info!(actual_output = %actual_output.display(), "finish export sheet wrapper: export path found");
     if export_kind == "profile-trace" {
+        info!("finish export sheet wrapper: wait for complete profile export");
         wait_for_complete_profile_export(&actual_output, Duration::from_secs(300))?;
     }
     if actual_output != output_path {
+        info!(
+            from = %actual_output.display(),
+            to = %output_path.display(),
+            "finish export sheet wrapper: copy exported path to requested path"
+        );
         copy_path(&actual_output, output_path)?;
     }
     if export_kind == "profile-trace" {
+        info!("finish export sheet wrapper: validate complete profile export");
         validate_complete_profile_export(output_path)?;
     }
     if action.target != file_name.to_string_lossy() {
@@ -580,12 +638,19 @@ fn finish_export_sheet(
 }
 
 fn wait_for_complete_profile_export(output_path: &Path, timeout: Duration) -> Result<()> {
+    info!(
+        output_path = %output_path.display(),
+        timeout_ms = timeout.as_millis(),
+        "wait for complete profile export"
+    );
     let complete = wait_for_condition(timeout, Duration::from_millis(500), || {
         Ok(is_complete_profile_export(output_path))
     })?;
     if complete {
+        info!(output_path = %output_path.display(), "profile export is complete");
         Ok(())
     } else {
+        warn!(output_path = %output_path.display(), "profile export stayed incomplete");
         Err(Error::InvalidInput(format!(
             "profile export stayed incomplete: {} (expected capture/unsorted-capture and .gpuprofiler_raw/streamData)",
             output_path.display()
@@ -609,6 +674,12 @@ fn is_complete_profile_export(output_path: &Path) -> bool {
         output_path.join("capture").is_file() || output_path.join("unsorted-capture").is_file();
     let has_stream_data = profiler::find_profiler_directory(output_path)
         .is_some_and(|path| path.join("streamData").is_file());
+    info!(
+        output_path = %output_path.display(),
+        has_capture,
+        has_stream_data,
+        "checked complete profile export"
+    );
     has_capture && has_stream_data
 }
 
@@ -616,12 +687,20 @@ fn export_profile_trace(
     trace_path: Option<&Path>,
     output_path: &Path,
 ) -> Result<XcodeExportResult> {
+    info!(
+        trace_path = ?trace_path,
+        output_path = %output_path.display(),
+        "xcode profile export requested"
+    );
     let output_path = prepare_export_output_path(output_path)?;
+    info!("xcode profile export: show summary");
     let _ = show_summary(trace_path);
+    info!("xcode profile export: click Export or File > Export");
     let _ = click_button(trace_path, &["Export"])
         .or_else(|_| click_menu_item(&["File", "Export…"]))
         .or_else(|_| click_menu_item(&["File", "Export..."]))
         .or_else(|_| click_menu_item(&["File", "Export"]))?;
+    info!("xcode profile export: finish save sheet");
     let window_title = finish_export_sheet(output_path.as_path(), trace_path, "profile-trace")?;
     Ok(XcodeExportResult {
         window_title,
@@ -636,6 +715,12 @@ fn wait_for_export_path(
     timeout: Duration,
 ) -> Result<PathBuf> {
     let candidates = export_output_candidates(output_path, trace_path)?;
+    info!(
+        output_path = %output_path.display(),
+        candidates = ?candidates,
+        timeout_ms = timeout.as_millis(),
+        "wait for export path"
+    );
     let mut found_path = None;
     let found = wait_for_condition(timeout, Duration::from_millis(500), || {
         found_path = candidates
@@ -646,6 +731,7 @@ fn wait_for_export_path(
     })?;
 
     if found {
+        info!(found_path = ?found_path, "export path appeared");
         found_path.ok_or_else(|| {
             Error::InvalidInput(format!(
                 "export output was reported present but no path was captured: {}",
@@ -653,6 +739,7 @@ fn wait_for_export_path(
             ))
         })
     } else {
+        warn!(output_path = %output_path.display(), candidates = ?candidates, "timed out waiting for export path");
         Err(Error::InvalidInput(format!(
             "timed out waiting for export output: {} (also checked {})",
             output_path.display(),

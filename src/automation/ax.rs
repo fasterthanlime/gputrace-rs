@@ -6,6 +6,8 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tracing::{info, warn};
+
 use crate::error::{Error, Result};
 
 use super::{
@@ -42,7 +44,6 @@ const K_CG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
 const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
 const K_VK_G: u16 = 0x05;
 const K_VK_RETURN: u16 = 0x24;
-const K_VK_KEYPAD_ENTER: u16 = 0x4c;
 const EXPORT_SHEET_SEARCH_LIMIT: usize = 60_000;
 
 #[repr(C)]
@@ -290,7 +291,23 @@ impl Drop for AxElement {
     }
 }
 
+fn ax_summary(el: &AxElement) -> String {
+    format!(
+        "ptr=0x{:x} role={:?} subrole={:?} title={:?} desc={:?} id={:?} value={:?} enabled={:?} focused={:?}",
+        el.ptr as usize,
+        el.role(),
+        el.subrole(),
+        el.title(),
+        el.string_attr("AXDescription"),
+        el.string_attr("AXIdentifier"),
+        el.string_attr("AXValue"),
+        el.bool_attr("AXEnabled"),
+        el.bool_attr("AXFocused"),
+    )
+}
+
 pub fn check_accessibility_permissions(prompt: bool) -> Result<XcodePermissionReport> {
+    info!(prompt, "check accessibility permissions");
     let xcode_running = is_xcode_running()?;
     let accessibility_granted = unsafe { AXIsProcessTrusted() } != 0;
     let xcode_probe_ok = if accessibility_granted && xcode_running {
@@ -312,6 +329,7 @@ pub fn check_accessibility_permissions(prompt: bool) -> Result<XcodePermissionRe
 }
 
 pub fn activate_xcode() -> Result<()> {
+    info!("activate Xcode");
     let output = Command::new("open")
         .arg("-a")
         .arg(XCODE_APP_NAME)
@@ -450,10 +468,13 @@ pub fn list_ui_elements(trace_path: Option<&Path>) -> Result<Vec<XcodeUiElementI
 }
 
 pub fn click_button(trace_path: Option<&Path>, button_names: &[&str]) -> Result<XcodeActionResult> {
+    info!(trace_path = ?trace_path, button_names = ?button_names, "AX click button: begin");
     let Some(window) = selected_window(trace_path)? else {
+        warn!("AX click button: missing selected window");
         return Err(Error::InvalidInput("missing-window".to_owned()));
     };
     let window_title = window.title();
+    info!(window = %ax_summary(&window), "AX click button: selected window");
     let names = button_names
         .iter()
         .map(|s| normalize(s))
@@ -469,6 +490,14 @@ pub fn click_button(trace_path: Option<&Path>, button_names: &[&str]) -> Result<
                 || normalize(&el.string_attr("AXDescription")) == *name
         })
     }) else {
+        warn!(
+            requested = ?button_names,
+            buttons = ?buttons
+                .iter()
+                .map(|el| (el.label(), el.title(), el.string_attr("AXDescription"), el.enabled()))
+                .collect::<Vec<_>>(),
+            "AX click button: requested button not found"
+        );
         return Err(Error::InvalidInput(format!(
             "missing-action; requested={:?}; buttons={:?}",
             button_names,
@@ -485,13 +514,16 @@ pub fn click_button(trace_path: Option<&Path>, button_names: &[&str]) -> Result<
                 .collect::<Vec<_>>()
         )));
     };
+    info!(button = %ax_summary(button), "AX click button: matched button");
     if !button.enabled() {
+        warn!(button = %ax_summary(button), "AX click button: button disabled");
         return Err(Error::InvalidInput(format!(
             "button '{}' is disabled",
             button.label()
         )));
     }
     let target = button.label();
+    info!(target, "AX click button: pressing");
     press(button, Some(&window))?;
     Ok(XcodeActionResult {
         window_title,
@@ -501,15 +533,19 @@ pub fn click_button(trace_path: Option<&Path>, button_names: &[&str]) -> Result<
 }
 
 pub fn select_tab(trace_path: Option<&Path>, tab_name: &str) -> Result<XcodeActionResult> {
+    info!(trace_path = ?trace_path, tab_name, "AX select tab: begin");
     let Some(window) = selected_window(trace_path)? else {
+        warn!("AX select tab: missing selected window");
         return Err(Error::InvalidInput("missing-window".to_owned()));
     };
     let window_title = window.title();
+    info!(window = %ax_summary(&window), "AX select tab: selected window");
     let name = normalize(tab_name);
     let elements = descendants(&window, 5_000);
     if let Some(tab) = elements.iter().find(|el| {
         is_tab_role(&el.role(), el.subrole().as_deref()) && normalize(&el.label()) == name
     }) {
+        info!(tab = %ax_summary(tab), "AX select tab: pressing tab element");
         press(tab, Some(&window))?;
         return Ok(XcodeActionResult {
             window_title,
@@ -524,9 +560,15 @@ pub fn select_tab(trace_path: Option<&Path>, tab_name: &str) -> Result<XcodeActi
             "AXStaticText" | "AXCell" | "AXRow" | "AXButton"
         ) && normalize(&el.label()) == name
     }) else {
+        warn!(tab_name, "AX select tab: tab/action element not found");
         return Err(Error::InvalidInput("missing-action".to_owned()));
     };
     let target = clickable_navigation_ancestor(item).unwrap_or_else(|| item.clone());
+    info!(
+        item = %ax_summary(item),
+        target = %ax_summary(&target),
+        "AX select tab: pressing navigation ancestor"
+    );
     press(&target, Some(&window))?;
     Ok(XcodeActionResult {
         window_title,
@@ -536,20 +578,25 @@ pub fn select_tab(trace_path: Option<&Path>, tab_name: &str) -> Result<XcodeActi
 }
 
 pub fn click_menu_item(menu_path: &[&str]) -> Result<XcodeActionResult> {
+    info!(menu_path = ?menu_path, "AX click menu item: begin");
     let app = app()?;
     if menu_path.is_empty() {
+        warn!("AX click menu item: empty menu path");
         return Err(Error::InvalidInput("missing menu path".to_owned()));
     }
     let mut current = menu_bar(&app)?;
     let mut target = String::new();
     for (idx, segment) in menu_path.iter().enumerate() {
+        info!(idx, segment, current = %ax_summary(&current), "AX click menu item: resolve segment");
         let Some(item) = find_menu_child(&current, segment) else {
+            warn!(idx, segment, "AX click menu item: segment not found");
             return Err(Error::InvalidInput(format!(
                 "menu item '{}' not found",
                 segment
             )));
         };
         target = item.title();
+        info!(idx, segment, item = %ax_summary(&item), "AX click menu item: pressing segment");
         press(&item, None)?;
         thread::sleep(Duration::from_millis(if idx + 1 == menu_path.len() {
             150
@@ -675,12 +722,24 @@ pub fn finish_export_sheet(
     file_name: &OsStr,
     trace_path: Option<&Path>,
 ) -> Result<XcodeActionResult> {
+    info!(
+        parent = %parent.display(),
+        file_name = ?file_name,
+        trace_path = ?trace_path,
+        "AX finish export sheet: begin"
+    );
     let initial_app = app()?;
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut sheet_target = None;
+    let mut poll_count = 0usize;
     while Instant::now() < deadline {
+        poll_count += 1;
         let fresh_app = app().unwrap_or_else(|_| initial_app.clone());
         if let Some(target) = find_export_sheet(&fresh_app) {
+            info!(
+                poll_count,
+                "AX finish export sheet: found export sheet from app windows"
+            );
             sheet_target = Some(target);
             break;
         }
@@ -689,40 +748,79 @@ pub fn finish_export_sheet(
     let (window, sheet) = if let Some(target) = sheet_target {
         target
     } else {
+        warn!(
+            poll_count,
+            "AX finish export sheet: polling did not find sheet, falling back to selected window"
+        );
         let Some(window) = selected_window(trace_path)? else {
+            warn!("AX finish export sheet: selected window missing");
             return Err(Error::InvalidInput(
                 "export sheet did not appear".to_owned(),
             ));
         };
+        info!(window = %ax_summary(&window), "AX finish export sheet: selected window fallback");
         let Some(sheet) = find_export_sheet_in_window(&window).or_else(|| {
             find_save_button(&window, EXPORT_SHEET_SEARCH_LIMIT).map(|_| window.clone())
         }) else {
+            warn!("AX finish export sheet: export sheet missing in selected window");
             return Err(Error::InvalidInput(
                 "export sheet did not appear".to_owned(),
             ));
         };
         (window, sheet)
     };
+    info!(
+        window = %ax_summary(&window),
+        sheet = %ax_summary(&sheet),
+        "AX finish export sheet: target sheet resolved"
+    );
 
-    if let Some(embed) = find_checkbox(&sheet, "Embed performance data", EXPORT_SHEET_SEARCH_LIMIT)
-        && embed.enabled()
-        && !checkbox_checked(&embed)
-    {
-        press(&embed, Some(&window))?;
-        thread::sleep(Duration::from_millis(200));
-    }
+    info!("AX finish export sheet: navigate to requested parent");
+    navigate_to_parent(&window, &sheet, parent)?;
+    info!("AX finish export sheet: wait for export sheet after path navigation");
+    let sheet = match wait_for_export_sheet(&window, trace_path, Duration::from_secs(8)) {
+        Some(sheet) => {
+            info!(sheet = %ax_summary(&sheet), "AX finish export sheet: reacquired export sheet");
+            sheet
+        }
+        None => {
+            warn!(
+                "AX finish export sheet: failed to reacquire export sheet, using previous sheet handle"
+            );
+            sheet
+        }
+    };
 
-    let _ = navigate_to_parent_best_effort(&window, &sheet, parent);
-    let sheet = wait_for_export_sheet_with_save_button(&window, trace_path, Duration::from_secs(5))
-        .unwrap_or(sheet);
+    info!("AX finish export sheet: ensure embed performance data");
+    ensure_embed_performance_data(&window, &sheet)?;
 
     let output_name = file_name.to_string_lossy();
     if let Some(field) = find_save_as_field(&sheet) {
+        info!(
+            field = %ax_summary(&field),
+            output_name = %output_name,
+            "AX finish export sheet: set Save As field"
+        );
         field.set_string_value(&output_name)?;
-        let _ = field.perform("AXConfirm");
+        let actual = field.string_attr("AXValue");
+        info!(
+            expected = %output_name,
+            actual = %actual,
+            matches = actual == output_name,
+            "AX finish export sheet: Save As AXValue after set"
+        );
+        if actual != output_name {
+            return Err(Error::InvalidInput(format!(
+                "Save As field value mismatch: expected {output_name:?}, got {actual:?}"
+            )));
+        }
+    } else {
+        warn!("AX finish export sheet: Save As field not found");
     }
 
+    info!("AX finish export sheet: check replace dialog before save");
     if press_replace_if_present(&window) {
+        info!("AX finish export sheet: replace dialog handled before save");
         return Ok(XcodeActionResult {
             window_title: window.title(),
             action: "save-export".to_owned(),
@@ -731,18 +829,29 @@ pub fn finish_export_sheet(
     }
 
     let Some(button) = find_save_button(&sheet, EXPORT_SHEET_SEARCH_LIMIT) else {
+        warn!(
+            sheet = %ax_summary(&sheet),
+            "AX finish export sheet: Save/Export button not found"
+        );
         return Err(Error::InvalidInput(
             "Save/Export button not found".to_owned(),
         ));
     };
+    info!(button = %ax_summary(&button), "AX finish export sheet: Save/Export button found");
     if !button.enabled() {
+        warn!(button = %ax_summary(&button), "AX finish export sheet: Save/Export button disabled");
         return Err(Error::InvalidInput(
             "Save/Export button is disabled in export sheet".to_owned(),
         ));
     }
+    info!("AX finish export sheet: press Save/Export button");
     press(&button, Some(&window))?;
     thread::sleep(Duration::from_millis(500));
-    let _ = press_replace_if_present(&window);
+    let replaced = press_replace_if_present(&window);
+    info!(
+        replaced,
+        "AX finish export sheet: replace dialog check after save"
+    );
     Ok(XcodeActionResult {
         window_title: window.title(),
         action: "save-export".to_owned(),
@@ -751,15 +860,36 @@ pub fn finish_export_sheet(
 }
 
 fn find_export_sheet(app: &AxElement) -> Option<(AxElement, AxElement)> {
-    windows(app)
-        .into_iter()
-        .find_map(|window| find_export_sheet_in_window(&window).map(|sheet| (window, sheet)))
+    let windows = windows(app);
+    info!(
+        window_count = windows.len(),
+        "AX find export sheet: scanning windows"
+    );
+    windows.into_iter().find_map(|window| {
+        let found = find_export_sheet_in_window(&window);
+        if let Some(sheet) = &found {
+            info!(
+                window = %ax_summary(&window),
+                sheet = %ax_summary(sheet),
+                "AX find export sheet: found"
+            );
+        }
+        found.map(|sheet| (window, sheet))
+    })
 }
 
 fn find_export_sheet_in_window(window: &AxElement) -> Option<AxElement> {
-    find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, |el| {
+    let found = find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, |el| {
         el.role() == "AXSheet" && !is_go_to_folder_sheet(el)
-    })
+    });
+    if let Some(sheet) = &found {
+        info!(
+            window = %ax_summary(window),
+            sheet = %ax_summary(sheet),
+            "AX find export sheet in window: found"
+        );
+    }
+    found
 }
 
 fn is_go_to_folder_sheet(sheet: &AxElement) -> bool {
@@ -790,14 +920,27 @@ fn xcode_pid() -> Result<c_int> {
 }
 
 fn selected_window(trace_path: Option<&Path>) -> Result<Option<AxElement>> {
+    info!(trace_path = ?trace_path, "AX selected window: begin");
     let Ok(app) = app() else {
+        warn!("AX selected window: app unavailable");
         return Ok(None);
     };
-    target_window(&app, trace_path)
+    let selected = target_window(&app, trace_path)?;
+    if let Some(window) = &selected {
+        info!(window = %ax_summary(window), "AX selected window: found");
+    } else {
+        warn!("AX selected window: none");
+    }
+    Ok(selected)
 }
 
 fn target_window(app: &AxElement, trace_path: Option<&Path>) -> Result<Option<AxElement>> {
     let all = windows(app);
+    info!(
+        window_count = all.len(),
+        patterns = ?trace_patterns(trace_path),
+        "AX target window: begin"
+    );
     if all.is_empty() {
         return Ok(None);
     }
@@ -815,6 +958,7 @@ fn target_window(app: &AxElement, trace_path: Option<&Path>) -> Result<Option<Ax
             .cloned()
             .collect::<Vec<_>>();
         if let Some(preferred) = preferred_trace_window(matches) {
+            info!(window = %ax_summary(&preferred), "AX target window: selected by trace path pattern");
             return Ok(Some(preferred));
         }
     }
@@ -828,9 +972,14 @@ fn target_window(app: &AxElement, trace_path: Option<&Path>) -> Result<Option<Ax
             .cloned()
             .collect(),
     ) {
+        info!(window = %ax_summary(&trace_window), "AX target window: selected by trace landmark");
         return Ok(Some(trace_window));
     }
-    Ok(all.into_iter().next())
+    let fallback = all.into_iter().next();
+    if let Some(window) = &fallback {
+        info!(window = %ax_summary(window), "AX target window: selected fallback first window");
+    }
+    Ok(fallback)
 }
 
 fn windows(app: &AxElement) -> Vec<AxElement> {
@@ -974,9 +1123,53 @@ fn find_checkbox(root: &AxElement, name: &str, max_visit: usize) -> Option<AxEle
 }
 
 fn find_save_button(root: &AxElement, max_visit: usize) -> Option<AxElement> {
-    ["Save", "Export"]
-        .iter()
-        .find_map(|name| find_button(root, name, max_visit).filter(AxElement::enabled))
+    for name in ["Save", "Export"] {
+        let button = find_button(root, name, max_visit);
+        match &button {
+            Some(button) => info!(
+                name,
+                button = %ax_summary(button),
+                "AX find save button: candidate"
+            ),
+            None => info!(name, "AX find save button: candidate missing"),
+        }
+        if let Some(button) = button.filter(AxElement::enabled) {
+            info!(name, "AX find save button: using enabled candidate");
+            return Some(button);
+        }
+    }
+    None
+}
+
+fn ensure_embed_performance_data(window: &AxElement, sheet: &AxElement) -> Result<()> {
+    info!("AX ensure embed performance data: begin");
+    let Some(embed) = find_checkbox(sheet, "Embed performance data", EXPORT_SHEET_SEARCH_LIMIT)
+    else {
+        warn!("AX ensure embed performance data: checkbox not found");
+        return Ok(());
+    };
+    info!(
+        checkbox = %ax_summary(&embed),
+        checked = checkbox_checked(&embed),
+        "AX ensure embed performance data: checkbox found"
+    );
+    if !embed.enabled() {
+        warn!(checkbox = %ax_summary(&embed), "AX ensure embed performance data: checkbox disabled");
+        return Ok(());
+    }
+    if !checkbox_checked(&embed) {
+        info!("AX ensure embed performance data: pressing checkbox");
+        press(&embed, Some(window))?;
+        thread::sleep(Duration::from_millis(300));
+        info!(
+            checked = checkbox_checked(&embed),
+            checkbox = %ax_summary(&embed),
+            "AX ensure embed performance data: after press"
+        );
+    } else {
+        info!("AX ensure embed performance data: already checked");
+    }
+    Ok(())
 }
 
 fn find_save_as_field(root: &AxElement) -> Option<AxElement> {
@@ -992,11 +1185,13 @@ fn find_save_as_field(root: &AxElement) -> Option<AxElement> {
     })
 }
 
-fn navigate_to_parent_best_effort(
-    window: &AxElement,
-    sheet: &AxElement,
-    parent: &Path,
-) -> Result<()> {
+fn navigate_to_parent(window: &AxElement, sheet: &AxElement, parent: &Path) -> Result<()> {
+    info!(
+        parent = %parent.display(),
+        window = %ax_summary(window),
+        sheet = %ax_summary(sheet),
+        "AX navigate to parent: begin"
+    );
     std::fs::create_dir_all(parent)?;
     let parent = parent.to_string_lossy();
     if let Some(path_field) = find_descendant(sheet, EXPORT_SHEET_SEARCH_LIMIT, |el| {
@@ -1005,84 +1200,203 @@ fn navigate_to_parent_best_effort(
                 || normalize(&el.string_attr("AXDescription")).contains("path")
                 || normalize(&el.string_attr("AXDescription")).contains("folder"))
     }) {
-        let _ = click_element(&path_field);
-        thread::sleep(Duration::from_millis(150));
-        let _ = path_field.set_string_value(&parent);
-        thread::sleep(Duration::from_millis(150));
-        let _ = path_field.perform("AXConfirm");
+        info!(
+            field = %ax_summary(&path_field),
+            parent = %parent,
+            "AX navigate to parent: using direct path field"
+        );
+        path_field.set_string_value(&parent)?;
+        info!(
+            value = %path_field.string_attr("AXValue"),
+            "AX navigate to parent: direct path field AXValue after set"
+        );
         confirm_text_entry(window, &path_field)?;
-        close_go_to_folder_sheet_if_present(window);
         return Ok(());
     }
+    info!("AX navigate to parent: direct path field not found");
 
-    let _ = activate_xcode();
-    let _ = window.perform("AXRaise");
-    post_key(
-        K_VK_G,
-        K_CG_EVENT_FLAG_MASK_COMMAND | K_CG_EVENT_FLAG_MASK_SHIFT,
-    )?;
-    thread::sleep(Duration::from_millis(300));
+    match activate_xcode() {
+        Ok(()) => info!("AX navigate to parent: activated Xcode"),
+        Err(error) => warn!(%error, "AX navigate to parent: activate Xcode failed"),
+    }
+    let raise_err = window.perform("AXRaise");
+    info!(raise_err, "AX navigate to parent: raised window");
 
-    let Some(go_field) = find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, |el| {
-        matches!(el.role().as_str(), "AXTextField" | "AXComboBox")
-            && (normalize(&el.string_attr("AXDescription")).contains("go to")
-                || normalize(&el.string_attr("AXDescription")).contains("folder")
-                || normalize(&el.title()).contains("go to"))
-    })
-    .or_else(|| {
-        find_descendant(sheet, EXPORT_SHEET_SEARCH_LIMIT, |el| {
-            matches!(el.role().as_str(), "AXTextField" | "AXComboBox")
-                && (normalize(&el.string_attr("AXDescription")).contains("go to")
-                    || normalize(&el.string_attr("AXDescription")).contains("folder")
-                    || normalize(&el.title()).contains("go to"))
-        })
-    }) else {
-        return Ok(());
+    let go_field = if let Some(field) = find_go_to_folder_field(window, sheet) {
+        info!(field = %ax_summary(&field), "AX navigate to parent: existing Go To field found");
+        field
+    } else {
+        info!("AX navigate to parent: posting Cmd+Shift+G");
+        post_key(
+            K_VK_G,
+            K_CG_EVENT_FLAG_MASK_COMMAND | K_CG_EVENT_FLAG_MASK_SHIFT,
+        )?;
+        thread::sleep(Duration::from_millis(700));
+        find_go_to_folder_field(window, sheet)
+            .ok_or_else(|| Error::InvalidInput("Go To Folder field not found".to_owned()))?
     };
 
-    let _ = click_element(&go_field);
-    thread::sleep(Duration::from_millis(150));
+    if !is_go_to_folder_text_field(&go_field) {
+        warn!(field = %ax_summary(&go_field), "AX navigate to parent: Go To field predicate failed");
+        return Err(Error::InvalidInput(
+            "Go To Folder field not found".to_owned(),
+        ));
+    };
+
+    info!(
+        field = %ax_summary(&go_field),
+        parent = %parent,
+        "AX navigate to parent: set Go To Folder field"
+    );
     go_field.set_string_value(&parent)?;
-    thread::sleep(Duration::from_millis(200));
-    confirm_text_entry(window, &go_field)?;
-    thread::sleep(Duration::from_millis(700));
-    close_go_to_folder_sheet_if_present(window);
+    let actual = go_field.string_attr("AXValue");
+    info!(
+        expected = %parent,
+        actual = %actual,
+        matches = actual == parent,
+        "AX navigate to parent: Go To Folder AXValue after set"
+    );
+    if actual != parent {
+        return Err(Error::InvalidInput(format!(
+            "Go To Folder field value mismatch: expected {parent:?}, got {actual:?}"
+        )));
+    }
+    confirm_go_to_folder_entry(window, &go_field)?;
     Ok(())
+}
+
+fn find_go_to_folder_field(window: &AxElement, sheet: &AxElement) -> Option<AxElement> {
+    info!("AX find Go To Folder field: begin");
+    let go_sheet = find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, is_go_to_folder_sheet)
+        .or_else(|| find_descendant(sheet, EXPORT_SHEET_SEARCH_LIMIT, is_go_to_folder_sheet));
+    let Some(go_sheet) = go_sheet else {
+        info!("AX find Go To Folder field: sheet not found");
+        return None;
+    };
+    info!(sheet = %ax_summary(&go_sheet), "AX find Go To Folder field: sheet found");
+    find_descendant(
+        &go_sheet,
+        EXPORT_SHEET_SEARCH_LIMIT,
+        is_go_to_folder_text_field,
+    )
+    .inspect(|field| {
+        info!(field = %ax_summary(field), "AX find Go To Folder field: field found");
+    })
+}
+
+fn is_go_to_folder_text_field(el: &AxElement) -> bool {
+    matches!(
+        el.role().as_str(),
+        "AXTextField" | "AXComboBox" | "AXTextArea"
+    )
 }
 
 fn confirm_text_entry(window: &AxElement, field: &AxElement) -> Result<()> {
-    let _ = activate_xcode();
-    let _ = window.perform("AXRaise");
-    thread::sleep(Duration::from_millis(250));
-    let _ = click_element(field);
-    thread::sleep(Duration::from_millis(500));
+    info!(
+        field = %ax_summary(field),
+        "AX confirm text entry: begin"
+    );
+    match activate_xcode() {
+        Ok(()) => info!("AX confirm text entry: activated Xcode"),
+        Err(error) => warn!(%error, "AX confirm text entry: activate Xcode failed"),
+    }
+    let raise_err = window.perform("AXRaise");
+    info!(raise_err, "AX confirm text entry: raised window");
+    thread::sleep(Duration::from_millis(150));
+    info!("AX confirm text entry: posting Return");
     post_key(K_VK_RETURN, 0)?;
-    thread::sleep(Duration::from_millis(350));
-    post_key(K_VK_KEYPAD_ENTER, 0)?;
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(250));
     Ok(())
 }
 
+fn confirm_go_to_folder_entry(window: &AxElement, field: &AxElement) -> Result<()> {
+    info!(
+        field = %ax_summary(field),
+        value = %field.string_attr("AXValue"),
+        "AX confirm Go To Folder: begin"
+    );
+    match activate_xcode() {
+        Ok(()) => info!("AX confirm Go To Folder: activated Xcode"),
+        Err(error) => warn!(%error, "AX confirm Go To Folder: activate Xcode failed"),
+    }
+    let raise_err = window.perform("AXRaise");
+    info!(raise_err, "AX confirm Go To Folder: raised window");
+    thread::sleep(Duration::from_millis(150));
+
+    info!("AX confirm Go To Folder: posting Return");
+    post_key(K_VK_RETURN, 0)?;
+    if wait_for_go_to_folder_sheet_closed(window, Duration::from_secs(2)) {
+        info!("AX confirm Go To Folder: closed after Return");
+        return Ok(());
+    }
+
+    warn!(
+        field = %ax_summary(field),
+        value = %field.string_attr("AXValue"),
+        "AX confirm Go To Folder: sheet stayed open after Return"
+    );
+    Err(Error::InvalidInput(
+        "Go To Folder sheet stayed open after pressing Return".to_owned(),
+    ))
+}
+
+fn wait_for_go_to_folder_sheet_closed(window: &AxElement, timeout: Duration) -> bool {
+    info!(
+        timeout_ms = timeout.as_millis(),
+        "AX wait Go To Folder sheet closed: begin"
+    );
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, is_go_to_folder_sheet).is_none() {
+            info!("AX wait Go To Folder sheet closed: closed");
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    warn!("AX wait Go To Folder sheet closed: timeout");
+    false
+}
+
 fn close_go_to_folder_sheet_if_present(window: &AxElement) {
+    info!("AX close Go To Folder sheet if present: begin");
     let Some(sheet) = find_descendant(window, EXPORT_SHEET_SEARCH_LIMIT, is_go_to_folder_sheet)
     else {
+        info!("AX close Go To Folder sheet if present: no sheet");
         return;
     };
+    info!(sheet = %ax_summary(&sheet), "AX close Go To Folder sheet if present: sheet found");
     if let Some(close) = find_button(&sheet, "Close", EXPORT_SHEET_SEARCH_LIMIT) {
-        let _ = press(&close, Some(window));
+        info!(button = %ax_summary(&close), "AX close Go To Folder sheet if present: pressing Close");
+        match press(&close, Some(window)) {
+            Ok(()) => info!("AX close Go To Folder sheet if present: Close pressed"),
+            Err(error) => warn!(%error, "AX close Go To Folder sheet if present: Close failed"),
+        }
     } else {
-        let _ = sheet.perform("AXCancel");
+        let err = sheet.perform("AXCancel");
+        info!(err, "AX close Go To Folder sheet if present: AXCancel");
     }
     thread::sleep(Duration::from_millis(300));
 }
 
 fn press_replace_if_present(window: &AxElement) -> bool {
+    info!("AX press Replace if present: begin");
     let Some(replace) =
         find_button(window, "Replace", EXPORT_SHEET_SEARCH_LIMIT).filter(AxElement::enabled)
     else {
+        info!("AX press Replace if present: no enabled Replace button");
         return false;
     };
-    press(&replace, Some(window)).is_ok()
+    info!(button = %ax_summary(&replace), "AX press Replace if present: pressing Replace");
+    match press(&replace, Some(window)) {
+        Ok(()) => {
+            info!("AX press Replace if present: success");
+            true
+        }
+        Err(error) => {
+            warn!(%error, "AX press Replace if present: failed");
+            false
+        }
+    }
 }
 
 fn wait_for_export_sheet_with_save_button(
@@ -1090,21 +1404,55 @@ fn wait_for_export_sheet_with_save_button(
     trace_path: Option<&Path>,
     timeout: Duration,
 ) -> Option<AxElement> {
+    info!(
+        timeout_ms = timeout.as_millis(),
+        "AX wait export sheet with save button: begin"
+    );
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(sheet) = find_export_sheet_in_window(window)
             && find_save_button(&sheet, EXPORT_SHEET_SEARCH_LIMIT).is_some()
         {
+            info!(sheet = %ax_summary(&sheet), "AX wait export sheet with save button: found in provided window");
             return Some(sheet);
         }
         if let Ok(Some(selected)) = selected_window(trace_path)
             && let Some(sheet) = find_export_sheet_in_window(&selected)
             && find_save_button(&sheet, EXPORT_SHEET_SEARCH_LIMIT).is_some()
         {
+            info!(sheet = %ax_summary(&sheet), "AX wait export sheet with save button: found in selected window");
             return Some(sheet);
         }
         thread::sleep(Duration::from_millis(150));
     }
+    warn!("AX wait export sheet with save button: timeout");
+    None
+}
+
+fn wait_for_export_sheet(
+    window: &AxElement,
+    trace_path: Option<&Path>,
+    timeout: Duration,
+) -> Option<AxElement> {
+    info!(
+        timeout_ms = timeout.as_millis(),
+        "AX wait export sheet: begin"
+    );
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(sheet) = find_export_sheet_in_window(window) {
+            info!(sheet = %ax_summary(&sheet), "AX wait export sheet: found in provided window");
+            return Some(sheet);
+        }
+        if let Ok(Some(selected)) = selected_window(trace_path)
+            && let Some(sheet) = find_export_sheet_in_window(&selected)
+        {
+            info!(sheet = %ax_summary(&sheet), "AX wait export sheet: found in selected window");
+            return Some(sheet);
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    warn!("AX wait export sheet: timeout");
     None
 }
 
@@ -1113,15 +1461,22 @@ fn checkbox_action(
     checkbox_name: &str,
     toggle: bool,
 ) -> Result<XcodeActionResult> {
+    info!(trace_path = ?trace_path, checkbox_name, toggle, "AX checkbox action: begin");
     let Some(window) = selected_window(trace_path)? else {
+        warn!("AX checkbox action: missing selected window");
         return Err(Error::InvalidInput("missing-window".to_owned()));
     };
     let Some(checkbox) = find_checkbox(&window, checkbox_name, 5_000) else {
+        warn!(checkbox_name, "AX checkbox action: checkbox not found");
         return Err(Error::InvalidInput("missing-action".to_owned()));
     };
     let checked = checkbox_checked(&checkbox);
+    info!(checkbox = %ax_summary(&checkbox), checked, "AX checkbox action: checkbox found");
     if toggle || !checked {
+        info!("AX checkbox action: pressing checkbox");
         press(&checkbox, Some(&window))?;
+    } else {
+        info!("AX checkbox action: checkbox already checked");
     }
     Ok(XcodeActionResult {
         window_title: window.title(),
@@ -1305,41 +1660,66 @@ fn is_tab_role(role: &str, subrole: Option<&str>) -> bool {
 }
 
 fn press(el: &AxElement, window: Option<&AxElement>) -> Result<()> {
+    info!(element = %ax_summary(el), "AX press: begin");
     let err = el.perform("AXPress");
     if err == K_AX_ERROR_SUCCESS {
+        info!("AX press: AXPress succeeded");
         return Ok(());
     }
+    info!(err, "AX press: AXPress failed");
     if matches!(
         err,
         K_AX_ERROR_ACTION_UNSUPPORTED | K_AX_ERROR_API_DISABLED | K_AX_ERROR_ACTION_UNSUPPORTED_ALT
     ) {
         if let Some(window) = window {
-            let _ = activate_xcode();
+            info!("AX press: fallback activate and raise window");
+            match activate_xcode() {
+                Ok(()) => info!("AX press: activated Xcode"),
+                Err(error) => warn!(%error, "AX press: activate Xcode failed"),
+            }
             thread::sleep(Duration::from_millis(150));
-            let _ = window.perform("AXRaise");
+            let raise_err = window.perform("AXRaise");
+            info!(raise_err, "AX press: raised window");
             thread::sleep(Duration::from_millis(150));
         }
         if click_element(el) {
+            info!("AX press: click fallback succeeded");
             return Ok(());
         }
+        warn!("AX press: click fallback failed");
     }
     ax_ok(err, "AXPress")
 }
 
 fn click_element(el: &AxElement) -> bool {
+    info!(element = %ax_summary(el), "AX click element: begin");
     let Some(pos) = el.point_attr("AXPosition") else {
+        warn!("AX click element: missing AXPosition");
         return false;
     };
     let Some(size) = el.size_attr("AXSize") else {
+        warn!("AX click element: missing AXSize");
         return false;
     };
     if size.width <= 0.0 || size.height <= 0.0 {
+        warn!(
+            width = size.width,
+            height = size.height,
+            "AX click element: invalid size"
+        );
         return false;
     }
     let point = CGPoint {
         x: pos.x + size.width / 2.0,
         y: pos.y + size.height / 2.0,
     };
+    info!(
+        x = point.x,
+        y = point.y,
+        width = size.width,
+        height = size.height,
+        "AX click element: posting mouse events"
+    );
     unsafe {
         let down = CGEventCreateMouseEvent(
             std::ptr::null(),
@@ -1354,6 +1734,11 @@ fn click_element(el: &AxElement) -> bool {
             0 as c_uint,
         );
         if down.is_null() || up.is_null() {
+            warn!(
+                down_null = down.is_null(),
+                up_null = up.is_null(),
+                "AX click element: failed to create mouse events"
+            );
             if !down.is_null() {
                 CFRelease(down);
             }
@@ -1368,14 +1753,23 @@ fn click_element(el: &AxElement) -> bool {
         CFRelease(down);
         CFRelease(up);
     }
+    info!("AX click element: success");
     true
 }
 
 fn post_key(key_code: u16, flags: u64) -> Result<()> {
+    info!(key_code, flags, "AX post key: begin");
     unsafe {
         let down = CGEventCreateKeyboardEvent(std::ptr::null(), key_code, 1);
         let up = CGEventCreateKeyboardEvent(std::ptr::null(), key_code, 0);
         if down.is_null() || up.is_null() {
+            warn!(
+                key_code,
+                flags,
+                down_null = down.is_null(),
+                up_null = up.is_null(),
+                "AX post key: failed to create keyboard events"
+            );
             if !down.is_null() {
                 CFRelease(down);
             }
@@ -1394,6 +1788,7 @@ fn post_key(key_code: u16, flags: u64) -> Result<()> {
         CFRelease(down);
         CFRelease(up);
     }
+    info!(key_code, flags, "AX post key: success");
     Ok(())
 }
 
