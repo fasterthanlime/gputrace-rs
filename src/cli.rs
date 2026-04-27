@@ -56,11 +56,13 @@ enum CommandSet {
     ExportCounters(ExportCountersArgs),
     #[command(
         about = "Decode raw APS counter data from a profiler bundle",
-        long_about = "Decode raw APS counter data from a profiler bundle.\n\nReads .gpuprofiler_raw/streamData directly, decodes APSCounterData/GPRWCNTR schemas, exposes APS trace-id and program-address mappings, maps raw hashes through installed AGX Metal catalogs, and runs local Apple *-derived.js formulas where the trace exposes matching raw variables. This is independent of Xcode Counters.csv."
+        long_about = "Decode raw APS counter data from a profiler bundle.\n\nReads .gpuprofiler_raw/streamData directly, decodes APSCounterData/GPRWCNTR schemas, exposes APS trace-id and program-address mappings, scans Profiling_f_* payloads for address-derived shader hits, maps raw hashes through installed AGX Metal catalogs, and runs local Apple *-derived.js formulas where the trace exposes matching raw variables. This is independent of Xcode Counters.csv."
     )]
     RawCounters(RawCountersArgs),
     #[command(hide = true)]
     RawCounterProbe(RawCounterProbeArgs),
+    #[command(hide = true)]
+    ProfilingAddressProbe(ProfilingAddressProbeArgs),
     #[command(alias = "perfcounters-validate")]
     ValidateCounters(ValidateCountersArgs),
     Fences(FencesArgs),
@@ -297,6 +299,13 @@ struct RawCounterProbeArgs {
     metric: Option<String>,
     #[arg(long)]
     scan_files: bool,
+    #[arg(short, long, default_value = "text")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ProfilingAddressProbeArgs {
+    trace: PathBuf,
     #[arg(short, long, default_value = "text")]
     format: String,
 }
@@ -898,6 +907,19 @@ pub fn run() -> Result<()> {
                 _ => {
                     return Err(crate::Error::Unsupported(
                         "unknown raw-counter-probe format",
+                    ));
+                }
+            }
+        }
+        CommandSet::ProfilingAddressProbe(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = counter::probe_profiling_addresses(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", counter::format_profiling_address_probe(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown profiling-address-probe format",
                     ));
                 }
             }

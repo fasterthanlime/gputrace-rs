@@ -73,6 +73,7 @@ pub struct RawCountersReport {
     pub sample_trace_indices: Vec<RawCounterSampleTraceIndex>,
     pub trace_maps: Vec<RawCounterTraceMapEntry>,
     pub program_address_mappings: Vec<RawCounterProgramAddressMapping>,
+    pub profiling_address_summary: Option<ProfilingAddressProbeReport>,
     pub counter_info: Vec<RawCounterInfoEntry>,
     pub schemas: Vec<RawCounterSchema>,
     pub streams: Vec<RawCounterDecodedStream>,
@@ -273,6 +274,63 @@ pub struct RawCounterProgramAddressMapping {
     pub shader_index: Option<u64>,
     pub mapped_address: Option<u64>,
     pub mapped_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilingAddressProbeReport {
+    pub trace_source: PathBuf,
+    pub profiler_directory: PathBuf,
+    pub mapping_count: usize,
+    pub file_summaries: Vec<ProfilingAddressFileSummary>,
+    pub top_full_address_hits: Vec<ProfilingAddressHit>,
+    pub top_low32_address_hits: Vec<ProfilingAddressHit>,
+    pub top_shader_low32_hits: Vec<ProfilingShaderAddressHit>,
+    pub top_function_low32_hits: Vec<ProfilingFunctionAddressHit>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilingAddressFileSummary {
+    pub file_index: usize,
+    pub file_name: String,
+    pub byte_len: usize,
+    pub full_address_hits: usize,
+    pub low32_address_hits: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilingAddressHit {
+    pub hit_count: usize,
+    pub scan_kind: String,
+    pub first_offset: usize,
+    pub archive_index: usize,
+    pub mapping_index: usize,
+    pub mapping_type: String,
+    pub binary_unique_id: Option<String>,
+    pub draw_call_index: Option<u64>,
+    pub draw_function_index: Option<u64>,
+    pub encoder_trace_id: Option<u64>,
+    pub encoder_index: Option<u64>,
+    pub shader_index: Option<u64>,
+    pub mapped_address: Option<u64>,
+    pub mapped_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilingShaderAddressHit {
+    pub hit_count: usize,
+    pub dispatch_index: usize,
+    pub function_name: Option<String>,
+    pub encoder_index: Option<u64>,
+    pub encoder_trace_id: Option<u64>,
+    pub mapping_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilingFunctionAddressHit {
+    pub hit_count: usize,
+    pub function_name: String,
+    pub dispatch_count: usize,
+    pub mapping_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -505,6 +563,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
     let sample_trace_indices = probe_sample_trace_indices(&trace.path);
     let trace_maps = probe_trace_maps(&trace.path);
     let program_address_mappings = probe_program_address_mappings(&trace.path);
+    let profiling_address_summary = probe_profiling_addresses(trace).ok();
     let counter_info = probe_counter_info_entries(&trace.path);
     let structured_layouts = probe_structured_counter_layouts(&trace.path);
     let normalized_counters = probe_normalized_counter_metrics(&trace.path);
@@ -627,6 +686,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         sample_trace_indices,
         trace_maps,
         program_address_mappings,
+        profiling_address_summary,
         counter_info,
         schemas,
         streams,
@@ -636,6 +696,146 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         encoder_sample_metrics,
         warnings,
     })
+}
+
+pub fn probe_profiling_addresses(
+    trace: &TraceBundle,
+) -> crate::Result<ProfilingAddressProbeReport> {
+    let profiler_directory = profiler::find_profiler_directory(&trace.path)
+        .ok_or_else(|| crate::Error::NotFound(trace.path.clone()))?;
+    let mappings = probe_program_address_mappings(&trace.path);
+    let ranges = profiling_address_ranges(&mappings);
+    let low32_ranges = profiling_low32_address_ranges(&mappings);
+    let mut full_hits = vec![0usize; mappings.len()];
+    let mut low32_hits = vec![0usize; mappings.len()];
+    let mut first_full_offsets = vec![None; mappings.len()];
+    let mut first_low32_offsets = vec![None; mappings.len()];
+    let mut file_summaries = Vec::new();
+
+    let mut files = fs::read_dir(&profiler_directory)?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let file_index = name
+                .strip_prefix("Profiling_f_")
+                .and_then(|rest| rest.strip_suffix(".raw"))
+                .and_then(|rest| rest.parse::<usize>().ok())?;
+            path.is_file().then_some((file_index, name, path))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|(file_index, _, _)| *file_index);
+
+    for (file_index, file_name, path) in files {
+        let data = fs::read(path)?;
+        let mut file_full_hits = 0usize;
+        let mut file_low32_hits = 0usize;
+
+        for offset in (0..data.len().saturating_sub(7)).step_by(4) {
+            let value = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            if let Some(mapping_index) = find_address_range(&ranges, value) {
+                full_hits[mapping_index] += 1;
+                file_full_hits += 1;
+                first_full_offsets[mapping_index].get_or_insert(offset);
+            }
+        }
+
+        for offset in (0..data.len().saturating_sub(3)).step_by(4) {
+            let value = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            if let Some(mapping_index) = find_low32_address_range(&low32_ranges, value) {
+                low32_hits[mapping_index] += 1;
+                file_low32_hits += 1;
+                first_low32_offsets[mapping_index].get_or_insert(offset);
+            }
+        }
+
+        file_summaries.push(ProfilingAddressFileSummary {
+            file_index,
+            file_name,
+            byte_len: data.len(),
+            full_address_hits: file_full_hits,
+            low32_address_hits: file_low32_hits,
+        });
+    }
+
+    Ok(ProfilingAddressProbeReport {
+        trace_source: trace.path.clone(),
+        profiler_directory,
+        mapping_count: mappings.len(),
+        file_summaries,
+        top_full_address_hits: top_profiling_address_hits(
+            &mappings,
+            &full_hits,
+            &first_full_offsets,
+            "u64",
+        ),
+        top_low32_address_hits: top_profiling_address_hits(
+            &mappings,
+            &low32_hits,
+            &first_low32_offsets,
+            "low32",
+        ),
+        top_shader_low32_hits: top_shader_low32_hits(trace, &mappings, &low32_hits),
+        top_function_low32_hits: top_function_low32_hits(trace, &mappings, &low32_hits),
+    })
+}
+
+pub fn format_profiling_address_probe(report: &ProfilingAddressProbeReport) -> String {
+    let mut out = String::new();
+    out.push_str("Profiling address probe\n");
+    out.push_str(&format!(
+        "trace={} profiler_directory={} mappings={}\n\n",
+        report.trace_source.display(),
+        report.profiler_directory.display(),
+        report.mapping_count
+    ));
+    out.push_str("files:\n");
+    for file in &report.file_summaries {
+        out.push_str(&format!(
+            "  {:>2} {:<18} bytes={} u64_hits={} low32_hits={}\n",
+            file.file_index,
+            file.file_name,
+            file.byte_len,
+            file.full_address_hits,
+            file.low32_address_hits
+        ));
+    }
+    format_profiling_address_hits(
+        &mut out,
+        "top u64 address hits",
+        &report.top_full_address_hits,
+    );
+    format_profiling_address_hits(
+        &mut out,
+        "top low32 address hits",
+        &report.top_low32_address_hits,
+    );
+    out.push_str("\ntop shader low32 hits:\n");
+    if report.top_shader_low32_hits.is_empty() {
+        out.push_str("  none\n");
+    }
+    for hit in report.top_shader_low32_hits.iter().take(32) {
+        out.push_str(&format!(
+            "  hits={} dispatch={} encoder={} enc_trace_id={} mappings={} function={}\n",
+            hit.hit_count,
+            hit.dispatch_index,
+            format_optional_u64(hit.encoder_index),
+            format_optional_u64(hit.encoder_trace_id),
+            hit.mapping_count,
+            hit.function_name.as_deref().unwrap_or("-")
+        ));
+    }
+    out.push_str("\ntop function low32 hits:\n");
+    if report.top_function_low32_hits.is_empty() {
+        out.push_str("  none\n");
+    }
+    for hit in report.top_function_low32_hits.iter().take(32) {
+        out.push_str(&format!(
+            "  hits={} dispatches={} mappings={} function={}\n",
+            hit.hit_count, hit.dispatch_count, hit.mapping_count, hit.function_name
+        ));
+    }
+    out
 }
 
 pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
@@ -730,6 +930,17 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
                 mapping.binary_unique_id.as_deref().unwrap_or("-"),
                 format_optional_u64_hex(mapping.mapped_address),
                 format_optional_u64(mapping.mapped_size)
+            ));
+        }
+    }
+    if let Some(summary) = &report.profiling_address_summary
+        && !summary.top_function_low32_hits.is_empty()
+    {
+        out.push_str("\nProfiling_f address-derived shader hits (low32 range match):\n");
+        for hit in summary.top_function_low32_hits.iter().take(16) {
+            out.push_str(&format!(
+                "  hits={} dispatches={} mappings={} function={}\n",
+                hit.hit_count, hit.dispatch_count, hit.mapping_count, hit.function_name
             ));
         }
     }
@@ -3219,6 +3430,273 @@ fn probe_trace_maps(trace_path: &Path) -> Vec<RawCounterTraceMapEntry> {
     entries
 }
 
+#[derive(Debug, Clone)]
+struct ProfilingAddressRange {
+    start: u64,
+    end: u64,
+    mapping_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProfilingLow32AddressRange {
+    start: u32,
+    end: u32,
+    mapping_index: usize,
+}
+
+fn profiling_address_ranges(
+    mappings: &[RawCounterProgramAddressMapping],
+) -> Vec<ProfilingAddressRange> {
+    let mut ranges = mappings
+        .iter()
+        .enumerate()
+        .filter_map(|(mapping_index, mapping)| {
+            let start = mapping.mapped_address?;
+            let size = mapping.mapped_size?;
+            (size > 0).then_some(ProfilingAddressRange {
+                start,
+                end: start.saturating_add(size),
+                mapping_index,
+            })
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start, range.end, range.mapping_index));
+    ranges
+}
+
+fn profiling_low32_address_ranges(
+    mappings: &[RawCounterProgramAddressMapping],
+) -> Vec<ProfilingLow32AddressRange> {
+    let mut ranges = mappings
+        .iter()
+        .enumerate()
+        .filter_map(|(mapping_index, mapping)| {
+            let start = mapping.mapped_address?;
+            let size = mapping.mapped_size?;
+            let end = start.saturating_add(size);
+            let low_start = start as u32;
+            let low_end = end as u32;
+            (size > 0 && low_start < low_end).then_some(ProfilingLow32AddressRange {
+                start: low_start,
+                end: low_end,
+                mapping_index,
+            })
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start, range.end, range.mapping_index));
+    ranges
+}
+
+fn find_address_range(ranges: &[ProfilingAddressRange], value: u64) -> Option<usize> {
+    let mut index = ranges.partition_point(|range| range.start <= value);
+    while index > 0 {
+        index -= 1;
+        let range = &ranges[index];
+        if value >= range.end {
+            break;
+        }
+        if value >= range.start {
+            return Some(range.mapping_index);
+        }
+    }
+    None
+}
+
+fn find_low32_address_range(ranges: &[ProfilingLow32AddressRange], value: u32) -> Option<usize> {
+    let mut index = ranges.partition_point(|range| range.start <= value);
+    while index > 0 {
+        index -= 1;
+        let range = &ranges[index];
+        if value >= range.end {
+            break;
+        }
+        if value >= range.start {
+            return Some(range.mapping_index);
+        }
+    }
+    None
+}
+
+fn top_profiling_address_hits(
+    mappings: &[RawCounterProgramAddressMapping],
+    hits: &[usize],
+    first_offsets: &[Option<usize>],
+    scan_kind: &str,
+) -> Vec<ProfilingAddressHit> {
+    let mut rows = hits
+        .iter()
+        .enumerate()
+        .filter_map(|(mapping_index, hit_count)| {
+            let hit_count = *hit_count;
+            (hit_count > 0).then(|| {
+                let mapping = &mappings[mapping_index];
+                ProfilingAddressHit {
+                    hit_count,
+                    scan_kind: scan_kind.to_owned(),
+                    first_offset: first_offsets[mapping_index].unwrap_or_default(),
+                    archive_index: mapping.archive_index,
+                    mapping_index: mapping.mapping_index,
+                    mapping_type: mapping.mapping_type.clone(),
+                    binary_unique_id: mapping.binary_unique_id.clone(),
+                    draw_call_index: mapping.draw_call_index,
+                    draw_function_index: mapping.draw_function_index,
+                    encoder_trace_id: mapping.encoder_trace_id,
+                    encoder_index: mapping.encoder_index,
+                    shader_index: mapping.shader_index,
+                    mapped_address: mapping.mapped_address,
+                    mapped_size: mapping.mapped_size,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .hit_count
+            .cmp(&left.hit_count)
+            .then_with(|| left.mapping_index.cmp(&right.mapping_index))
+    });
+    rows.truncate(64);
+    rows
+}
+
+fn format_profiling_address_hits(out: &mut String, title: &str, hits: &[ProfilingAddressHit]) {
+    out.push_str(&format!("\n{title}:\n"));
+    if hits.is_empty() {
+        out.push_str("  none\n");
+        return;
+    }
+    for hit in hits.iter().take(32) {
+        out.push_str(&format!(
+            "  hits={} first_offset={} map={} enc_trace_id={} enc_index={} draw_function={} draw={} shader_index={} type={} binary={} addr={} size={}\n",
+            hit.hit_count,
+            hit.first_offset,
+            hit.mapping_index,
+            format_optional_u64(hit.encoder_trace_id),
+            format_optional_u64(hit.encoder_index),
+            format_optional_u64(hit.draw_function_index),
+            format_optional_u64(hit.draw_call_index),
+            format_optional_u64(hit.shader_index),
+            hit.mapping_type,
+            hit.binary_unique_id.as_deref().unwrap_or("-"),
+            format_optional_u64_hex(hit.mapped_address),
+            format_optional_u64(hit.mapped_size)
+        ));
+    }
+}
+
+fn top_shader_low32_hits(
+    trace: &TraceBundle,
+    mappings: &[RawCounterProgramAddressMapping],
+    low32_hits: &[usize],
+) -> Vec<ProfilingShaderAddressHit> {
+    #[derive(Default)]
+    struct Accum {
+        hit_count: usize,
+        encoder_index: Option<u64>,
+        encoder_trace_id: Option<u64>,
+        mapping_count: usize,
+    }
+
+    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    let mut by_dispatch = BTreeMap::<usize, Accum>::new();
+    for (mapping, hit_count) in mappings.iter().zip(low32_hits.iter().copied()) {
+        if hit_count == 0 || !mapping.mapping_type.starts_with("compute") {
+            continue;
+        }
+        let Some(dispatch_index) = mapping
+            .draw_call_index
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            continue;
+        };
+        let entry = by_dispatch.entry(dispatch_index).or_default();
+        entry.hit_count += hit_count;
+        entry.encoder_index = entry.encoder_index.or(mapping.encoder_index);
+        entry.encoder_trace_id = entry.encoder_trace_id.or(mapping.encoder_trace_id);
+        entry.mapping_count += 1;
+    }
+
+    let mut rows = by_dispatch
+        .into_iter()
+        .map(|(dispatch_index, accum)| {
+            let function_name = profiler_summary
+                .as_ref()
+                .and_then(|summary| summary.dispatches.get(dispatch_index))
+                .and_then(|dispatch| dispatch.function_name.clone());
+            ProfilingShaderAddressHit {
+                hit_count: accum.hit_count,
+                dispatch_index,
+                function_name,
+                encoder_index: accum.encoder_index,
+                encoder_trace_id: accum.encoder_trace_id,
+                mapping_count: accum.mapping_count,
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .hit_count
+            .cmp(&left.hit_count)
+            .then_with(|| left.dispatch_index.cmp(&right.dispatch_index))
+    });
+    rows.truncate(64);
+    rows
+}
+
+fn top_function_low32_hits(
+    trace: &TraceBundle,
+    mappings: &[RawCounterProgramAddressMapping],
+    low32_hits: &[usize],
+) -> Vec<ProfilingFunctionAddressHit> {
+    #[derive(Default)]
+    struct Accum {
+        hit_count: usize,
+        dispatches: BTreeSet<usize>,
+        mapping_count: usize,
+    }
+
+    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    let mut by_function = BTreeMap::<String, Accum>::new();
+    for (mapping, hit_count) in mappings.iter().zip(low32_hits.iter().copied()) {
+        if hit_count == 0 || !mapping.mapping_type.starts_with("compute") {
+            continue;
+        }
+        let Some(dispatch_index) = mapping
+            .draw_call_index
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            continue;
+        };
+        let function_name = profiler_summary
+            .as_ref()
+            .and_then(|summary| summary.dispatches.get(dispatch_index))
+            .and_then(|dispatch| dispatch.function_name.clone())
+            .unwrap_or_else(|| format!("dispatch_{dispatch_index}"));
+        let entry = by_function.entry(function_name).or_default();
+        entry.hit_count += hit_count;
+        entry.dispatches.insert(dispatch_index);
+        entry.mapping_count += 1;
+    }
+
+    let mut rows = by_function
+        .into_iter()
+        .map(|(function_name, accum)| ProfilingFunctionAddressHit {
+            hit_count: accum.hit_count,
+            function_name,
+            dispatch_count: accum.dispatches.len(),
+            mapping_count: accum.mapping_count,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .hit_count
+            .cmp(&left.hit_count)
+            .then_with(|| left.function_name.cmp(&right.function_name))
+    });
+    rows.truncate(64);
+    rows
+}
+
 fn probe_program_address_mappings(trace_path: &Path) -> Vec<RawCounterProgramAddressMapping> {
     let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
         return Vec::new();
@@ -5154,6 +5632,7 @@ mod tests {
             sample_trace_indices: Vec::new(),
             trace_maps: Vec::new(),
             program_address_mappings: Vec::new(),
+            profiling_address_summary: None,
             counter_info: Vec::new(),
             schemas: vec![RawCounterSchema {
                 sample_group: 0,
@@ -5263,6 +5742,7 @@ mod tests {
             sample_trace_indices: Vec::new(),
             trace_maps: Vec::new(),
             program_address_mappings: Vec::new(),
+            profiling_address_summary: None,
             counter_info: Vec::new(),
             schemas: Vec::new(),
             streams: Vec::new(),
@@ -5302,6 +5782,21 @@ mod tests {
                 mapped_address: Some(0x10000005840),
                 mapped_size: Some(1590),
             }],
+            profiling_address_summary: Some(ProfilingAddressProbeReport {
+                trace_source: PathBuf::from("trace.gputrace"),
+                profiler_directory: PathBuf::from("trace.gputrace/raw"),
+                mapping_count: 1,
+                file_summaries: Vec::new(),
+                top_full_address_hits: Vec::new(),
+                top_low32_address_hits: Vec::new(),
+                top_shader_low32_hits: Vec::new(),
+                top_function_low32_hits: vec![ProfilingFunctionAddressHit {
+                    hit_count: 42,
+                    function_name: "kernel".to_owned(),
+                    dispatch_count: 2,
+                    mapping_count: 3,
+                }],
+            }),
             counter_info: Vec::new(),
             schemas: Vec::new(),
             streams: Vec::new(),
@@ -5318,6 +5813,8 @@ mod tests {
         assert!(text.contains("enc_trace_id=2680109419"));
         assert!(text.contains("draw_function=1564"));
         assert!(text.contains("addr=0x10000005840"));
+        assert!(text.contains("Profiling_f address-derived shader hits"));
+        assert!(text.contains("function=kernel"));
     }
 
     #[test]
