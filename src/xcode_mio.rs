@@ -18,6 +18,7 @@ pub struct XcodeMioReport {
     pub draw_count: usize,
     pub cost_record_count: usize,
     pub gpu_time_ns: u64,
+    pub cost_timeline: Option<XcodeMioCostTimeline>,
     pub pipelines: Vec<XcodeMioPipeline>,
     pub gpu_commands: Vec<XcodeMioGpuCommand>,
     pub warnings: Vec<String>,
@@ -44,6 +45,17 @@ pub struct XcodeMioGpuCommand {
     pub pipeline_object_id: u64,
     pub command_buffer_index: usize,
     pub function_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioCostTimeline {
+    pub draw_count: usize,
+    pub pipeline_state_count: usize,
+    pub cost_record_count: usize,
+    pub gpu_time_ns: u64,
+    pub global_gpu_time_ns: u64,
+    pub timeline_duration_ns: u64,
+    pub total_clique_cost: u64,
 }
 
 pub fn report(trace: &TraceBundle) -> Result<XcodeMioReport> {
@@ -80,7 +92,19 @@ pub fn format_report(report: &XcodeMioReport) -> String {
         report.cost_record_count,
         report.gpu_time_ns as f64 / 1_000_000.0
     ));
-
+    if let Some(timeline) = &report.cost_timeline {
+        out.push_str(&format!(
+            "cost_timeline: draws={} pipelines={} cost_records={} global_gpu_time={:.3} ms total_clique_cost={}\n",
+            timeline.draw_count,
+            timeline.pipeline_state_count,
+            timeline.cost_record_count,
+            timeline.global_gpu_time_ns as f64 / 1_000_000.0,
+            timeline.total_clique_cost
+        ));
+        out.push_str("cost_timeline_note: structured timeline object is decoded, but per-scope Xcode Cost values are not mapped yet\n\n");
+    } else {
+        out.push('\n');
+    }
     out.push_str("Pipelines by command count:\n");
     let mut pipelines = report.pipelines.clone();
     pipelines.sort_by(|left, right| {
@@ -119,10 +143,13 @@ mod platform {
     use std::ffi::{CString, c_char, c_int, c_void};
     use std::mem;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
-    use super::{XcodeMioGpuCommand, XcodeMioPipeline, XcodeMioReport};
+    use super::{XcodeMioCostTimeline, XcodeMioGpuCommand, XcodeMioPipeline, XcodeMioReport};
     use crate::error::{Error, Result};
     use crate::profiler;
+    use block2::RcBlock;
 
     type Id = *mut c_void;
     type Class = *mut c_void;
@@ -225,6 +252,13 @@ mod platform {
         }
 
         let mut warnings = Vec::new();
+        let cost_timeline = match unsafe { runtime.request_cost_timeline(mio) } {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                warnings.push(format!("private cost timeline callback failed: {error}"));
+                None
+            }
+        };
         if profiler_summary.is_some_and(|summary| summary.num_gpu_commands != command_count) {
             warnings.push("private MIO command count differs from streamData summary".to_owned());
         }
@@ -246,6 +280,7 @@ mod platform {
             draw_count: unsafe { runtime.send_u64(mio, "drawCount")? as usize },
             cost_record_count: unsafe { runtime.send_u64(mio, "costCount")? as usize },
             gpu_time_ns: unsafe { runtime.send_u64(mio, "gpuTime")? },
+            cost_timeline,
             pipelines: decoded_pipelines,
             gpu_commands: decoded_commands,
             warnings,
@@ -323,6 +358,51 @@ mod platform {
 
         unsafe fn array_object(&mut self, array: Id, index: usize) -> Result<Id> {
             unsafe { send_id_usize(array, "objectAtIndex:", index) }
+        }
+
+        unsafe fn request_cost_timeline(
+            &mut self,
+            mio: Id,
+        ) -> Result<Option<XcodeMioCostTimeline>> {
+            let slot = Arc::new(Mutex::new(None::<usize>));
+            let callback_slot = Arc::clone(&slot);
+            let block = RcBlock::new(move |timeline: Id| {
+                if !timeline.is_null()
+                    && let Ok(mut slot) = callback_slot.lock()
+                {
+                    *slot = Some(timeline as usize);
+                }
+            });
+            let block_ptr = RcBlock::as_ptr(&block).cast::<c_void>();
+            unsafe {
+                send_id_id_allow_nil(mio, "requestCostTimeline:", block_ptr.cast())?;
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut timeline = None;
+            while Instant::now() < deadline {
+                timeline = *slot
+                    .lock()
+                    .map_err(|_| Error::InvalidInput("cost timeline lock poisoned".to_owned()))?;
+                if timeline.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            let Some(timeline) = timeline.map(|value| value as Id) else {
+                return Ok(None);
+            };
+
+            Ok(Some(XcodeMioCostTimeline {
+                draw_count: unsafe { send_u64(timeline, "drawCount")? as usize },
+                pipeline_state_count: unsafe { send_u64(timeline, "pipelineStateCount")? as usize },
+                cost_record_count: unsafe { send_u64(timeline, "costCount")? as usize },
+                gpu_time_ns: unsafe { send_u64(timeline, "gpuTime")? },
+                global_gpu_time_ns: unsafe { send_u64(timeline, "globalGPUTime")? },
+                timeline_duration_ns: unsafe { send_u64(timeline, "timelineDuration")? },
+                total_clique_cost: unsafe { send_u64(timeline, "totalCliqueCost")? },
+            }))
         }
     }
 
@@ -483,6 +563,18 @@ mod platform {
         } else {
             Ok(value)
         }
+    }
+
+    unsafe fn send_id_id_allow_nil(receiver: Id, sel: &str, arg: Id) -> Result<Id> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, Id) -> Id =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, arg))
     }
 
     unsafe fn send_id_id_id(receiver: Id, sel: &str, left: Id, right: Id) -> Result<Id> {
