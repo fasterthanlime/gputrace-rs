@@ -179,12 +179,15 @@ For end-user raw counter inspection without a counter CSV, use `raw-counters`.
 It reads `.gpuprofiler_raw/streamData` and reports aggregate metadata,
 per-sample-group schemas, decoded `GPRWCNTR` streams, raw counter ids, and
 trace-id maps from embedded APS metadata such as `TraceId to BatchId` and
-`TraceId to SampleIndex`. When available, it enriches raw hashes from installed
-AGX Metal statistics/perf counter plists under `/System/Library/Extensions`.
-The JSON report includes
-`derived_metrics` when local AGX `*-derived.js` files can be evaluated from
-decoded raw variables. Treat these as offline Apple-formula counter values; they
-do not depend on, or require, an exported Xcode counter CSV.
+`TraceId to SampleIndex`. It also exposes APS `program_address_mappings`: the
+encoder trace id, draw/function index, shader index, binary id, mapped address,
+and mapped size records that bridge USC/MIO samples back to shader address
+ranges. When available, it enriches raw hashes from installed AGX Metal
+statistics/perf counter plists under `/System/Library/Extensions`. The JSON
+report includes `derived_metrics` when local AGX `*-derived.js` files can be
+evaluated from decoded raw variables. Treat these as offline Apple-formula
+counter values; they do not depend on, or require, an exported Xcode counter
+CSV.
 `grouped_derived_metrics` contains the same formula output split by raw counter
 sample group/source and includes counter graph metadata where local Xcode/AGX
 catalogs expose it. It also carries profiler dispatch metadata when a trace's

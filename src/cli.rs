@@ -56,7 +56,7 @@ enum CommandSet {
     ExportCounters(ExportCountersArgs),
     #[command(
         about = "Decode raw APS counter data from a profiler bundle",
-        long_about = "Decode raw APS counter data from a profiler bundle.\n\nReads .gpuprofiler_raw/streamData directly, decodes APSCounterData/GPRWCNTR schemas, maps raw hashes through installed AGX Metal catalogs, and runs local Apple *-derived.js formulas where the trace exposes matching raw variables. This is independent of Xcode Counters.csv."
+        long_about = "Decode raw APS counter data from a profiler bundle.\n\nReads .gpuprofiler_raw/streamData directly, decodes APSCounterData/GPRWCNTR schemas, exposes APS trace-id and program-address mappings, maps raw hashes through installed AGX Metal catalogs, and runs local Apple *-derived.js formulas where the trace exposes matching raw variables. This is independent of Xcode Counters.csv."
     )]
     RawCounters(RawCountersArgs),
     #[command(hide = true)]

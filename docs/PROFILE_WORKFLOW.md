@@ -249,9 +249,11 @@ It reports the decoded `.gpuprofiler_raw/streamData` metadata, schemas,
 `GPRWCNTR` streams, raw counter ids, and any matching derived counter names from
 installed AGX Metal statistics/perf counter catalogs. It also exposes embedded
 APS trace-id maps such as `TraceId to BatchId` and `TraceId to SampleIndex` for
-later dispatch/shader joins. In JSON, `derived_metrics` contains finite values
-from running Apple's local AGX `*-derived.js` formulas against decoded raw
-variables, without needing a separate Xcode counter CSV.
+later dispatch/shader joins, plus `program_address_mappings` with the
+encoder/draw/function/binary/address ranges used to connect USC/MIO samples to
+shader code. In JSON, `derived_metrics` contains finite values from running
+Apple's local AGX `*-derived.js` formulas against decoded raw variables, without
+needing a separate Xcode counter CSV.
 `grouped_derived_metrics` splits those derived values by raw sample group/source
 and includes counter graph metadata plus profiler-dispatch join fields only when
 the bundle exposes overlapping raw counter and `streamData` tick windows:

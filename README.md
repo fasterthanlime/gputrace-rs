@@ -84,12 +84,15 @@ them.
 
 `raw-counters` reads the profiler bundle directly and enriches raw counter hashes
 with installed AGX Metal catalog names where the local system provides them.
-Its JSON output also includes `derived_metrics` computed by running Apple's
-local AGX `*-derived.js` formulas against decoded raw counter variables; it does
-not require an Xcode counter CSV. `grouped_derived_metrics` repeats those
-formula evaluations per raw counter sample group/source, includes Xcode counter
-graph metadata where available, and carries profiler-dispatch fields only when
-the raw counter timestamps overlap `streamData` dispatch tick windows.
+It also exposes APS trace-id maps and `program_address_mappings`, the
+encoder/draw/function/binary/address table Xcode uses to bridge USC/MIO samples
+back to shader code ranges. Its JSON output includes `derived_metrics` computed
+by running Apple's local AGX `*-derived.js` formulas against decoded raw counter
+variables; it does not require an Xcode counter CSV. `grouped_derived_metrics`
+repeats those formula evaluations per raw counter sample group/source, includes
+Xcode counter graph metadata where available, and carries profiler-dispatch
+fields only when the raw counter timestamps overlap `streamData` dispatch tick
+windows.
 
 ## Main Commands
 

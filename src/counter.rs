@@ -72,6 +72,7 @@ pub struct RawCountersReport {
     pub aggregate_metadata: Vec<RawCounterAggregateMetadata>,
     pub sample_trace_indices: Vec<RawCounterSampleTraceIndex>,
     pub trace_maps: Vec<RawCounterTraceMapEntry>,
+    pub program_address_mappings: Vec<RawCounterProgramAddressMapping>,
     pub counter_info: Vec<RawCounterInfoEntry>,
     pub schemas: Vec<RawCounterSchema>,
     pub streams: Vec<RawCounterDecodedStream>,
@@ -257,6 +258,21 @@ pub struct RawCounterTraceMapEntry {
     pub trace_id: u64,
     pub scalar_value: Option<u64>,
     pub words: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RawCounterProgramAddressMapping {
+    pub archive_index: usize,
+    pub mapping_index: usize,
+    pub mapping_type: String,
+    pub binary_unique_id: Option<String>,
+    pub draw_call_index: Option<u64>,
+    pub draw_function_index: Option<u64>,
+    pub encoder_trace_id: Option<u64>,
+    pub encoder_index: Option<u64>,
+    pub shader_index: Option<u64>,
+    pub mapped_address: Option<u64>,
+    pub mapped_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -488,6 +504,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
     let aggregate_metadata = probe_aggregate_counter_metadata(&trace.path);
     let sample_trace_indices = probe_sample_trace_indices(&trace.path);
     let trace_maps = probe_trace_maps(&trace.path);
+    let program_address_mappings = probe_program_address_mappings(&trace.path);
     let counter_info = probe_counter_info_entries(&trace.path);
     let structured_layouts = probe_structured_counter_layouts(&trace.path);
     let normalized_counters = probe_normalized_counter_metrics(&trace.path);
@@ -609,6 +626,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         aggregate_metadata,
         sample_trace_indices,
         trace_maps,
+        program_address_mappings,
         counter_info,
         schemas,
         streams,
@@ -690,6 +708,28 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
                 entry.words
+            ));
+        }
+    }
+    if !report.program_address_mappings.is_empty() {
+        out.push_str(&format!(
+            "\nProgram address mappings: entries={}\n",
+            report.program_address_mappings.len()
+        ));
+        for mapping in report.program_address_mappings.iter().take(32) {
+            out.push_str(&format!(
+                "  APSData[{}] map={} enc_trace_id={} enc_index={} draw_function={} draw={} shader_index={} type={} binary={} addr={} size={}\n",
+                mapping.archive_index,
+                mapping.mapping_index,
+                format_optional_u64(mapping.encoder_trace_id),
+                format_optional_u64(mapping.encoder_index),
+                format_optional_u64(mapping.draw_function_index),
+                format_optional_u64(mapping.draw_call_index),
+                format_optional_u64(mapping.shader_index),
+                mapping.mapping_type,
+                mapping.binary_unique_id.as_deref().unwrap_or("-"),
+                format_optional_u64_hex(mapping.mapped_address),
+                format_optional_u64(mapping.mapped_size)
             ));
         }
     }
@@ -2950,6 +2990,18 @@ fn format_optional_usize(value: Option<usize>) -> String {
         .unwrap_or_else(|| "-".to_owned())
 }
 
+fn format_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_optional_u64_hex(value: Option<u64>) -> String {
+    value
+        .map(|value| format!("0x{value:x}"))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
 fn format_u64_hex_list(values: &[u64], limit: usize) -> String {
     if values.is_empty() {
         return "-".to_owned();
@@ -3165,6 +3217,78 @@ fn probe_trace_maps(trace_path: &Path) -> Vec<RawCounterTraceMapEntry> {
             .then_with(|| left.trace_id.cmp(&right.trace_id))
     });
     entries
+}
+
+fn probe_program_address_mappings(trace_path: &Path) -> Vec<RawCounterProgramAddressMapping> {
+    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
+        return Vec::new();
+    };
+    let stream_data_path = profiler_dir.join("streamData");
+    let Ok(plist) = Value::from_file(stream_data_path) else {
+        return Vec::new();
+    };
+    let Some(archive) = plist.as_dictionary() else {
+        return Vec::new();
+    };
+    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
+        return Vec::new();
+    };
+
+    let mut mappings = Vec::new();
+    for (archive_index, bytes) in ns_data_array_from_root_key(objects, root, "APSData")
+        .into_iter()
+        .enumerate()
+    {
+        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+            continue;
+        };
+        let Some(StreamArchiveValue::Array(entries)) = keyed.get("Program Address Mappings") else {
+            continue;
+        };
+        for (mapping_index, entry) in entries.iter().enumerate() {
+            let Some(entry) = entry.as_dictionary() else {
+                continue;
+            };
+            mappings.push(RawCounterProgramAddressMapping {
+                archive_index,
+                mapping_index,
+                mapping_type: stream_dict_string(entry, "type")
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                binary_unique_id: stream_dict_string(entry, "binaryUniqueId")
+                    .map(ToOwned::to_owned),
+                draw_call_index: stream_dict_u64(entry, "drawCallIndex"),
+                draw_function_index: stream_dict_u64(entry, "drawFunctionIndex"),
+                encoder_trace_id: stream_dict_u64(entry, "encID"),
+                encoder_index: stream_dict_u64(entry, "encIndex"),
+                shader_index: stream_dict_u64(entry, "index"),
+                mapped_address: stream_dict_u64(entry, "mappedAddress"),
+                mapped_size: stream_dict_u64(entry, "mappedSize"),
+            });
+        }
+    }
+    mappings.sort_by(|left, right| {
+        left.archive_index
+            .cmp(&right.archive_index)
+            .then_with(|| left.encoder_trace_id.cmp(&right.encoder_trace_id))
+            .then_with(|| left.draw_function_index.cmp(&right.draw_function_index))
+            .then_with(|| left.mapping_index.cmp(&right.mapping_index))
+    });
+    mappings
+}
+
+fn stream_dict_u64(values: &BTreeMap<String, StreamArchiveValue>, key: &str) -> Option<u64> {
+    values.get(key).and_then(StreamArchiveValue::as_u64)
+}
+
+fn stream_dict_string<'a>(
+    values: &'a BTreeMap<String, StreamArchiveValue>,
+    key: &str,
+) -> Option<&'a str> {
+    values.get(key).and_then(StreamArchiveValue::as_string)
 }
 
 fn parse_trace_id_sample_index_map(
@@ -4146,7 +4270,6 @@ fn summarize_stream_archive_value(objects: &[Value], value: &Value) -> StreamArc
         return StreamArchiveValue::Array(
             array
                 .iter()
-                .take(512)
                 .filter_map(|value| resolve_value(objects, value))
                 .map(|value| summarize_stream_archive_value(objects, value))
                 .collect(),
@@ -5030,6 +5153,7 @@ mod tests {
             aggregate_metadata: Vec::new(),
             sample_trace_indices: Vec::new(),
             trace_maps: Vec::new(),
+            program_address_mappings: Vec::new(),
             counter_info: Vec::new(),
             schemas: vec![RawCounterSchema {
                 sample_group: 0,
@@ -5138,6 +5262,7 @@ mod tests {
             aggregate_metadata: Vec::new(),
             sample_trace_indices: Vec::new(),
             trace_maps: Vec::new(),
+            program_address_mappings: Vec::new(),
             counter_info: Vec::new(),
             schemas: Vec::new(),
             streams: Vec::new(),
@@ -5154,6 +5279,45 @@ mod tests {
         assert!(text.contains("ALU Utilization (_hash)"));
         assert!(csv.contains("ALU Utilization"));
         assert!(csv.contains("ALUUtilization"));
+    }
+
+    #[test]
+    fn formats_program_address_mappings_when_present() {
+        let report = RawCountersReport {
+            trace_source: PathBuf::from("trace.gputrace"),
+            profiler_directory: PathBuf::from("trace.gputrace/raw"),
+            aggregate_metadata: Vec::new(),
+            sample_trace_indices: Vec::new(),
+            trace_maps: Vec::new(),
+            program_address_mappings: vec![RawCounterProgramAddressMapping {
+                archive_index: 26,
+                mapping_index: 1,
+                mapping_type: "compute".to_owned(),
+                binary_unique_id: Some("000000000000000e".to_owned()),
+                draw_call_index: Some(0),
+                draw_function_index: Some(1564),
+                encoder_trace_id: Some(2680109419),
+                encoder_index: Some(0),
+                shader_index: Some(0),
+                mapped_address: Some(0x10000005840),
+                mapped_size: Some(1590),
+            }],
+            counter_info: Vec::new(),
+            schemas: Vec::new(),
+            streams: Vec::new(),
+            metrics: Vec::new(),
+            derived_metrics: Vec::new(),
+            grouped_derived_metrics: Vec::new(),
+            encoder_sample_metrics: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let text = format_raw_counters_report(&report);
+
+        assert!(text.contains("Program address mappings: entries=1"));
+        assert!(text.contains("enc_trace_id=2680109419"));
+        assert!(text.contains("draw_function=1564"));
+        assert!(text.contains("addr=0x10000005840"));
     }
 
     #[test]
