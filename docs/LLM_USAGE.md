@@ -128,6 +128,7 @@ gputrace diff --bench-dir /abs/path/bench-traces --json
 gputrace xcode-counters trace-perfdata.gputrace --format summary
 gputrace xcode-counters trace-perfdata.gputrace --format json
 gputrace export-counters trace-perfdata.gputrace --format json
+gputrace xcode-mio trace-perfdata.gputrace --format json
 gputrace shaders trace-perfdata.gputrace --format json
 gputrace shader-hotspots trace-perfdata.gputrace kernel_name --search-path /abs/path/src --format json
 gputrace shader-source trace-perfdata.gputrace kernel_name --search-path /abs/path/src --format text
@@ -159,6 +160,13 @@ for known pipeline IDs and is known to disagree with Xcode's Cost view on real
 exports. For ranking without a counter CSV, use profiler duration fields. For
 Xcode counter parity, use an exported Xcode counter CSV with `xcode-counters`
 or `validate-counters`.
+
+On macOS with Xcode installed, `xcode-mio --format json` loads Xcode's private
+`GTShaderProfiler` framework and decodes the exported `streamData` into the
+same structured GPU command, encoder, and pipeline topology Xcode builds
+internally. Use it to confirm command counts, pipeline object ids, pipeline
+addresses, and function-name mapping. Do not treat `cost_record_count` as
+decoded Xcode Cost; it is only the number of private cost records observed.
 
 For a single machine-readable offline feed, prefer `export-counters --format
 json`. It combines profiler/timeline rows with decoded APS counter sample rows

@@ -25,5 +25,6 @@ pub mod timeline;
 pub mod timing;
 pub mod trace;
 pub mod xcode_counters;
+pub mod xcode_mio;
 
 pub use error::{Error, Result};

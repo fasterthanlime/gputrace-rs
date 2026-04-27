@@ -30,6 +30,7 @@ use crate::timeline;
 use crate::timing;
 use crate::trace::{RecordType, TraceBundle};
 use crate::xcode_counters;
+use crate::xcode_mio;
 
 #[derive(Debug, Parser)]
 #[command(name = "gputrace")]
@@ -71,6 +72,11 @@ enum CommandSet {
     MtlbStats(MtlbPathArgs),
     MtlbFunctions(MtlbFunctionsArgs),
     Profiler(ProfilerArgs),
+    #[command(
+        about = "Decode Xcode private MIO shader-profiler topology",
+        long_about = "Decode Xcode private MIO shader-profiler topology.\n\nThis macOS-only command loads Xcode's private GTShaderProfiler framework and asks it to process the exported streamData. It reports the structured GPU command, encoder, and pipeline topology that Xcode derives from the regular .gpuprofiler_raw export. Cost timeline bytes are not mislabeled as Xcode Cost; unresolved cost records remain exposed as counts until their layout is fully mapped."
+    )]
+    XcodeMio(XcodeMioArgs),
     #[command(
         about = "Report profiler bundle byte and decoder coverage",
         long_about = "Report profiler bundle byte and decoder coverage.\n\nThis is an end-user coverage/worklist report for Xcode-exported .gpuprofiler_raw bundles. It groups streamData, Profiling_f_*, Counters_f_*, Timeline_f_*, and other raw files by bytes and marks which families are decoded semantically, only decoded heuristically, or still opaque."
@@ -127,6 +133,13 @@ enum CommandSet {
 #[derive(Debug, Args)]
 struct TracePath {
     trace: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct XcodeMioArgs {
+    trace: PathBuf,
+    #[arg(short, long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Debug, Args)]
@@ -984,6 +997,15 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", profiler::format_report(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown profiler format")),
+            }
+        }
+        CommandSet::XcodeMio(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = xcode_mio::report(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", xcode_mio::format_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-mio format")),
             }
         }
         CommandSet::ProfilerCoverage(args) => {

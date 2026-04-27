@@ -148,6 +148,7 @@ Run the high-signal reports first:
 gputrace analyze /abs/path/input-perfdata.gputrace
 gputrace profiler /abs/path/input-perfdata.gputrace --format text
 gputrace profiler /abs/path/input-perfdata.gputrace --format json
+gputrace xcode-mio /abs/path/input-perfdata.gputrace --format json
 gputrace insights /abs/path/input-perfdata.gputrace --min-level high
 gputrace buffers list /abs/path/input-perfdata.gputrace --format json
 ```
@@ -166,6 +167,11 @@ On Xcode-exported profiler bundles, structural parser data can be sparse while
 `.gpuprofiler_raw/streamData` has the useful dispatch list. The structural
 commands above tolerate malformed short records and use profiler-backed
 dispatch/name fallbacks where the bundle shape permits it.
+On macOS with Xcode installed, `xcode-mio` loads Xcode's private
+`GTShaderProfiler` framework and reports the structured MIO command, encoder,
+and pipeline topology Xcode derives from the same export. It is useful for
+parity checks, but unresolved cost records are reported only as counts until the
+private cost timeline layout is fully mapped.
 `shaders` includes `Addr Hits` / `Addr %` in text output, and
 `profiling_address_hits` / `profiling_address_percent` in JSON/CSV, when
 `Profiling_f_*` address samples can be joined through APS program-address

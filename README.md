@@ -28,6 +28,7 @@ gputrace analyze trace.gputrace
 # Profiler and timing summaries when .gpuprofiler_raw data is present.
 gputrace profiler trace-perfdata.gputrace --format json
 gputrace profiler-coverage trace-perfdata.gputrace --format text
+gputrace xcode-mio trace-perfdata.gputrace --format json
 gputrace timing trace-perfdata.gputrace --format csv
 
 # Xcode-exported counter CSV analysis.
@@ -65,6 +66,11 @@ when a directory contains unrelated `*Counters.csv` files.
 `profiler` reports real `streamData` dispatch timing. Its
 `pipeline_id_scan_costs` field is a debug-only scan of `Profiling_f_*` bytes,
 not Xcode's Performance/Cost percentage.
+`xcode-mio` is macOS-only and loads Xcode's private `GTShaderProfiler`
+framework to decode the same exported `streamData` topology Xcode uses:
+GPU command count, encoder count, pipeline list, pipeline object ids, pipeline
+addresses, and function names. It intentionally reports unresolved cost records
+as counts rather than presenting them as Xcode Cost percentages.
 `shaders` keeps duration/cost as the primary ranking, but adds `Addr Hits` /
 `profiling_address_hits` when `Profiling_f_*` address samples can be joined
 through APS program-address mappings.
@@ -103,7 +109,7 @@ the raw counter timestamps overlap `streamData` dispatch tick windows.
 | Area | Commands |
 | --- | --- |
 | Trace overview | `stats`, `analyze`, `dump`, `dump-records`, `api-calls` |
-| Profiling and timing | `profiler`, `timing`, `timeline`, `raw-counters`, `xcode-counters`, `export-counters`, `validate-counters` |
+| Profiling and timing | `profiler`, `xcode-mio`, `timing`, `timeline`, `raw-counters`, `xcode-counters`, `export-counters`, `validate-counters` |
 | Diffing | `diff`, `markdown diff` |
 | Shader analysis | `shaders`, `shader-source`, `shader-hotspots`, `correlate` |
 | Command structure | `command-buffers`, `encoders`, `kernels`, `dependencies`, `tree`, `graph`, `fences` |
