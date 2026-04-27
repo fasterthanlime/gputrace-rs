@@ -106,6 +106,10 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
             )
         })
         .unwrap_or_default();
+    let has_profiler_dispatches = profiler_summary
+        .as_ref()
+        .is_some_and(|summary| !summary.dispatches.is_empty());
+    let suppress_legacy_limiter_rows = has_profiler_dispatches || !aps_rows.is_empty();
 
     let limiters_by_encoder = limiters
         .into_iter()
@@ -261,6 +265,13 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
         } else {
             timeline.source.clone()
         };
+        if suppress_legacy_limiter_rows
+            && metric_source == "raw-counter"
+            && encoder_dispatches.is_empty()
+            && kernel_name.is_none()
+        {
+            continue;
+        }
 
         rows.push(CounterExportRow {
             row_index: rows.len(),

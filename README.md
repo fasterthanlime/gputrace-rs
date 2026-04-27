@@ -74,7 +74,9 @@ share and labels each family as semantic, heuristic, partial, or opaque.
 `export-counters` is the preferred structured offline feed for downstream tools.
 It does not need an Xcode counter CSV. Its rows include `metric_source` so
 consumers can distinguish `profile-dispatch-time`, `profile-execution-cost`
-when available, timeline/raw-counter fallback rows, and `aps-counter-samples`.
+when available, and `aps-counter-samples`. Legacy timeline/raw-counter fallback
+rows are emitted only when richer profiler/APS rows are unavailable, because
+they are heuristic and can be noisier than the decoded profiler data.
 JSON output also includes `metrics` plus `metric_metadata` for APS-derived
 metrics, including Apple/Xcode counter graph keys, units, groups, timeline
 groups, visibility, and descriptions where the local Xcode/AGX catalogs provide

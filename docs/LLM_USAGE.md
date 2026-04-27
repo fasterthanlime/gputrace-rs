@@ -165,7 +165,8 @@ when present. Inspect each row's `metric_source`:
 - `profile-execution-cost`: per-kernel rows from decoded execution-cost data
   when present.
 - `aps-counter-samples`: rows from decoded `APSCounterData` sample windows.
-- `raw-counter` or timeline-derived sources: fallback timeline/counter rows.
+- `raw-counter` or timeline-derived sources: fallback timeline/counter rows,
+  emitted only when richer profiler/APS rows are unavailable.
 
 For `aps-counter-samples`, JSON rows include `metrics` and `metric_metadata`.
 `metric_metadata` contains the Apple counter key, type, description, unit,

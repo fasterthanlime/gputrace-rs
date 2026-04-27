@@ -238,7 +238,9 @@ gputrace export-counters /abs/path/input-perfdata.gputrace --format csv
 The JSON output combines profiler/timeline rows and decoded APS counter sample
 rows when present. Use `metric_source` to distinguish `profile-dispatch-time`,
 `profile-execution-cost`, `aps-counter-samples`, and fallback `raw-counter`
-rows. APS rows include `metrics` and `metric_metadata`; metadata is populated
+rows. Fallback raw-counter rows are suppressed when profiler/APS rows are
+available, because the fallback path is heuristic. APS rows include `metrics`
+and `metric_metadata`; metadata is populated
 from local Apple/Xcode counter catalogs with counter keys, units, groups,
 timeline groups, visibility flags, and descriptions where available.
 

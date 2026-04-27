@@ -51,7 +51,7 @@ enum CommandSet {
     DumpRecords(DumpRecordsArgs),
     #[command(
         about = "Export offline counter/profile rows from a trace bundle",
-        long_about = "Export offline counter/profile rows from a trace bundle.\n\nRows combine streamData/profile dispatch timing, profiler-backed fallback rows, and decoded APS counter sample rows when present. JSON includes APS-derived metric_metadata with Xcode counter graph units/groups/visibility. No Xcode Counters.csv is required; use xcode-counters for explicit CSV exports."
+        long_about = "Export offline counter/profile rows from a trace bundle.\n\nRows combine streamData/profile dispatch timing and decoded APS counter sample rows when present. Legacy raw-counter fallback rows are only emitted when richer profiler/APS rows are unavailable. JSON includes APS-derived metric_metadata with Xcode counter graph units/groups/visibility. No Xcode Counters.csv is required; use xcode-counters for explicit CSV exports."
     )]
     ExportCounters(ExportCountersArgs),
     #[command(
