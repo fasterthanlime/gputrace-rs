@@ -148,6 +148,10 @@ Profiler-backed exports may have little structural dispatch data while
 `streamData` contains the useful kernel list. In that case, `command-buffers`,
 `encoders`, `shaders`, `shader-source`, `shader-hotspots`, and
 `mtlb functions --used-only` use profiler timing/name fallbacks where possible.
+`shaders` also includes `profiling_address_hits` and
+`profiling_address_percent` when `Profiling_f_*` address samples can be joined
+through APS program-address mappings; keep duration/cost as the primary ranking
+signal and use address hits as an additional per-shader signal.
 
 Do not interpret `profiler.stream_data_summary.pipeline_id_scan_costs` as
 Xcode Cost. It is a retained debug signal from scanning `Profiling_f_*` bytes

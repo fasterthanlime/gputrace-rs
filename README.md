@@ -65,6 +65,9 @@ when a directory contains unrelated `*Counters.csv` files.
 `profiler` reports real `streamData` dispatch timing. Its
 `pipeline_id_scan_costs` field is a debug-only scan of `Profiling_f_*` bytes,
 not Xcode's Performance/Cost percentage.
+`shaders` keeps duration/cost as the primary ranking, but adds `Addr Hits` /
+`profiling_address_hits` when `Profiling_f_*` address samples can be joined
+through APS program-address mappings.
 
 `profiler-coverage` reports byte coverage for Xcode `.gpuprofiler_raw` exports.
 Use it when checking reversal progress: it groups `streamData`,

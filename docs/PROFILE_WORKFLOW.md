@@ -166,6 +166,11 @@ On Xcode-exported profiler bundles, structural parser data can be sparse while
 `.gpuprofiler_raw/streamData` has the useful dispatch list. The structural
 commands above tolerate malformed short records and use profiler-backed
 dispatch/name fallbacks where the bundle shape permits it.
+`shaders` includes `Addr Hits` / `Addr %` in text output, and
+`profiling_address_hits` / `profiling_address_percent` in JSON/CSV, when
+`Profiling_f_*` address samples can be joined through APS program-address
+mappings. Treat those as an additional shader-local signal; real duration/cost
+ranking remains primary.
 
 If Xcode reports large unused resources, check `analyze` and `buffers list` for
 `unused_resource_groups`; those are parsed from

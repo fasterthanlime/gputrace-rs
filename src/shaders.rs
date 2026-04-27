@@ -36,6 +36,8 @@ pub struct ShaderEntry {
     pub percent_of_total: Option<f64>,
     pub execution_cost_percent: Option<f64>,
     pub execution_cost_samples: usize,
+    pub profiling_address_hits: usize,
+    pub profiling_address_percent: Option<f64>,
     pub sample_count: usize,
     pub avg_sampling_density: Option<f64>,
     pub threadgroups: [u64; 3],
@@ -153,6 +155,7 @@ struct ShaderThreadMetrics {
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderReport> {
     let index = ShaderSourceIndex::build_for_trace(&trace.path, search_paths)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    let profiling_address_summary = counter::probe_profiling_addresses(trace).ok();
     let limiter_metrics = counter::extract_limiters_for_trace(&trace.path);
     let xcode_counter_data = xcode_counters::parse(trace, None).ok();
     let regions = trace.command_buffer_regions()?;
@@ -180,6 +183,8 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
     let mut density_count_by_name = BTreeMap::<String, usize>::new();
     let mut occupancy_by_name = BTreeMap::<String, (f64, f64, usize)>::new();
     let mut limiter_by_name = BTreeMap::<String, (f64, f64, f64, usize)>::new();
+    let mut profiling_address_hits_by_name = BTreeMap::<String, usize>::new();
+    let mut total_profiling_address_hits = 0usize;
     let mut pipeline_stats_by_addr = BTreeMap::<u64, profiler::ProfilerPipelineStats>::new();
     let mut pipeline_stats_by_name = BTreeMap::<String, profiler::ProfilerPipelineStats>::new();
     let mut total_duration_ns = 0u64;
@@ -252,6 +257,12 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
             }
         }
     }
+    if let Some(summary) = &profiling_address_summary {
+        for hit in &summary.top_function_low32_hits {
+            profiling_address_hits_by_name.insert(hit.function_name.clone(), hit.hit_count);
+            total_profiling_address_hits += hit.hit_count;
+        }
+    }
 
     let kernels = trace.analyze_kernels()?;
     let kernels = if kernels.is_empty() {
@@ -314,6 +325,14 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 .cloned()
                 .or_else(|| pipeline_stats_by_name.get(&kernel_name).cloned());
             let execution_cost_percent = execution_cost_by_name.get(&kernel_name).copied();
+            let profiling_address_hits = profiling_address_hits_by_name
+                .get(&kernel_name)
+                .copied()
+                .unwrap_or(0);
+            let profiling_address_percent =
+                (total_profiling_address_hits > 0 && profiling_address_hits > 0).then(|| {
+                    profiling_address_hits as f64 / total_profiling_address_hits as f64 * 100.0
+                });
             let thread_metrics = thread_metrics_by_name
                 .get(&kernel_name)
                 .cloned()
@@ -356,6 +375,8 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                     .get(&kernel_name)
                     .copied()
                     .unwrap_or(0),
+                profiling_address_hits,
+                profiling_address_percent,
                 sample_count: sample_count_by_name.get(&kernel_name).copied().unwrap_or(0),
                 avg_sampling_density,
                 threadgroups: thread_metrics.threadgroups,
@@ -424,6 +445,11 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
         compare_option_f64_desc(right.execution_cost_percent, left.execution_cost_percent)
             .then_with(|| compare_option_u64_desc(right.total_duration_ns, left.total_duration_ns))
             .then_with(|| compare_option_f64_desc(right.percent_of_total, left.percent_of_total))
+            .then_with(|| {
+                right
+                    .profiling_address_hits
+                    .cmp(&left.profiling_address_hits)
+            })
             .then_with(|| right.simd_groups.cmp(&left.simd_groups))
             .then_with(|| right.dispatch_count.cmp(&left.dispatch_count))
             .then_with(|| left.name.cmp(&right.name))
@@ -816,6 +842,10 @@ pub fn format_report(report: &ShaderReport) -> String {
         .shaders
         .iter()
         .any(|shader| shader.kernel_alu_performance.is_some());
+    let has_profiling_address_hits = report
+        .shaders
+        .iter()
+        .any(|shader| shader.profiling_address_hits > 0);
     let has_simd_groups = report.shaders.iter().any(|shader| shader.simd_groups > 0);
     if has_profiler_timing {
         out.push_str(&format!(
@@ -829,6 +859,9 @@ pub fn format_report(report: &ShaderReport) -> String {
             " {:>14} {:>8} {:>8}",
             "Duration ns", "Time %", "Exec %",
         ));
+        if has_profiling_address_hits {
+            out.push_str(&format!(" {:>10} {:>8}", "Addr Hits", "Addr %"));
+        }
         if has_alu_perf {
             out.push_str(&format!(" {:>10}", "ALU Perf"));
         }
@@ -859,6 +892,9 @@ pub fn format_report(report: &ShaderReport) -> String {
         }
         if has_alu_perf {
             out.push_str(&format!(" {:>10}", "ALU Perf"));
+        }
+        if has_profiling_address_hits {
+            out.push_str(&format!(" {:>10} {:>8}", "Addr Hits", "Addr %"));
         }
         if has_pipeline_stats {
             out.push_str(&format!(
@@ -915,6 +951,16 @@ pub fn format_report(report: &ShaderReport) -> String {
                     .map(|value| format!("{value:.2}"))
                     .unwrap_or_else(|| "-".to_owned()),
             ));
+            if has_profiling_address_hits {
+                out.push_str(&format!(
+                    " {:>10} {:>8}",
+                    shader.profiling_address_hits,
+                    shader
+                        .profiling_address_percent
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned())
+                ));
+            }
             if has_alu_perf {
                 out.push_str(&format!(
                     " {:>10}",
@@ -1019,6 +1065,16 @@ pub fn format_report(report: &ShaderReport) -> String {
                         .unwrap_or_else(|| "-".to_owned()),
                 ));
             }
+            if has_profiling_address_hits {
+                out.push_str(&format!(
+                    " {:>10} {:>8}",
+                    shader.profiling_address_hits,
+                    shader
+                        .profiling_address_percent
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "-".to_owned())
+                ));
+            }
             if has_pipeline_stats {
                 out.push_str(&format!(
                     " {:>6} {:>8} {:>8} {:>8} {:>10}",
@@ -1105,7 +1161,7 @@ pub fn format_report(report: &ShaderReport) -> String {
 
 pub fn format_csv(report: &ShaderReport) -> String {
     let mut out = String::new();
-    out.push_str("name,pipeline_addr,dispatch_count,metric_source,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,weighted_cost,weighted_percent_of_total,kernel_alu_performance,execution_cost_samples,sample_count,avg_sampling_density,threadgroups_x,threadgroups_y,threadgroups_z,threads_per_group_x,threads_per_group_y,threads_per_group_z,total_threadgroups,threads_per_threadgroup,total_threads,estimated_occupancy_percent,compute_ratio,classification,estimated_bandwidth_gbps,estimated_bytes_accessed,bottlenecks,optimization_hints,occupancy_percent,occupancy_confidence,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_write_accesses,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
+    out.push_str("name,pipeline_addr,dispatch_count,metric_source,simd_groups,simd_percent_of_total,total_duration_ns,percent_of_total,execution_cost_percent,weighted_cost,weighted_percent_of_total,kernel_alu_performance,execution_cost_samples,profiling_address_hits,profiling_address_percent,sample_count,avg_sampling_density,threadgroups_x,threadgroups_y,threadgroups_z,threads_per_group_x,threads_per_group_y,threads_per_group_z,total_threadgroups,threads_per_threadgroup,total_threads,estimated_occupancy_percent,compute_ratio,classification,estimated_bandwidth_gbps,estimated_bytes_accessed,bottlenecks,optimization_hints,occupancy_percent,occupancy_confidence,alu_utilization_percent,last_level_cache_percent,device_memory_bandwidth_gbps,gpu_read_bandwidth_gbps,gpu_write_bandwidth_gbps,buffer_l1_miss_rate_percent,buffer_l1_read_accesses,buffer_l1_write_accesses,temporary_register_count,spilled_bytes,threadgroup_memory,instruction_count,alu_instruction_count,branch_instruction_count,compilation_time_ms,source_file,source_line\n");
     for shader in &report.shaders {
         let source_file = shader
             .source_file
@@ -1128,6 +1184,8 @@ pub fn format_csv(report: &ShaderReport) -> String {
             option_csv(shader.weighted_percent_of_total),
             option_csv(shader.kernel_alu_performance),
             shader.execution_cost_samples.to_string(),
+            shader.profiling_address_hits.to_string(),
+            option_csv(shader.profiling_address_percent),
             shader.sample_count.to_string(),
             option_csv(shader.avg_sampling_density),
             shader.threadgroups[0].to_string(),
@@ -2095,6 +2153,8 @@ mod tests {
                 weighted_cost: Some(9.85),
                 weighted_percent_of_total: Some(52.0),
                 last_level_cache_percent: Some(0.04),
+                profiling_address_hits: 123,
+                profiling_address_percent: Some(12.3),
                 device_memory_bandwidth_gbps: Some(8.2),
                 gpu_read_bandwidth_gbps: Some(6.1),
                 gpu_write_bandwidth_gbps: Some(2.3),
@@ -2122,6 +2182,8 @@ mod tests {
         assert!(output.contains("SIMD %"));
         assert!(output.contains("Time %"));
         assert!(output.contains("Exec %"));
+        assert!(output.contains("Addr Hits"));
+        assert!(output.contains("Addr %"));
         assert!(output.contains("ALU Perf"));
         assert!(output.contains("Samples"));
         assert!(output.contains("Samples/us"));
@@ -2171,6 +2233,8 @@ mod tests {
                 weighted_percent_of_total: None,
                 kernel_alu_performance: Some(2048.0),
                 execution_cost_samples: 11,
+                profiling_address_hits: 123,
+                profiling_address_percent: Some(12.3),
                 sample_count: 4,
                 avg_sampling_density: Some(0.2),
                 threadgroups: [16, 1, 1],
@@ -2213,6 +2277,8 @@ mod tests {
         assert!(output.contains("metric_source"));
         assert!(output.contains("weighted_percent_of_total"));
         assert!(output.contains("kernel_alu_performance"));
+        assert!(output.contains("profiling_address_hits"));
+        assert!(output.contains("profiling_address_percent"));
         assert!(output.contains("gpu_read_bandwidth_gbps"));
         assert!(output.contains("buffer_l1_miss_rate_percent"));
         assert!(output.contains("simd_groups"));
@@ -2242,6 +2308,8 @@ mod tests {
             weighted_percent_of_total: None,
             kernel_alu_performance: Some(2048.0),
             execution_cost_samples: 0,
+            profiling_address_hits: 0,
+            profiling_address_percent: None,
             sample_count: 0,
             avg_sampling_density: None,
             threadgroups: [0, 0, 0],
