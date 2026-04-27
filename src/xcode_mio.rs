@@ -21,6 +21,7 @@ pub struct XcodeMioReport {
     pub cost_timeline: Option<XcodeMioCostTimeline>,
     pub timeline_binary_count: usize,
     pub timeline_binaries: Vec<XcodeMioTimelineBinary>,
+    pub timeline_pipeline_state_ids: Vec<u64>,
     pub shader_binary_info: Vec<XcodeMioShaderBinaryInfo>,
     pub decoded_cost_records: Vec<XcodeMioDecodedCostRecord>,
     pub draw_timeline_records: Vec<XcodeMioDrawTimelineRecord>,
@@ -48,7 +49,16 @@ pub struct XcodeMioPipeline {
     pub scope_costs: Vec<XcodeMioPipelineScopeCost>,
     pub shader_tracks: Vec<XcodeMioPipelineShaderTrack>,
     pub shader_binaries: Vec<XcodeMioPipelineShaderBinary>,
+    pub shader_binary_costs: Vec<XcodeMioPipelineShaderBinaryCost>,
+    pub execution_history: Vec<XcodeMioPipelineExecutionHistory>,
     pub shader_binary_references: Vec<XcodeMioPipelineShaderBinaryReference>,
+    pub pipeline_counters: Vec<XcodeMioPipelineCounter>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioPipelineCounter {
+    pub name: String,
+    pub value: f64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -63,6 +73,10 @@ pub struct XcodeMioTimelineBinary {
     pub cost_count: u64,
     pub total_cost: f64,
     pub total_instruction_count: u64,
+    pub instruction_cost_record_count: u64,
+    pub instruction_nonzero_record_count: u64,
+    pub instruction_total_cost: f64,
+    pub instruction_total_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -91,6 +105,36 @@ pub struct XcodeMioPipelineShaderBinary {
     pub cost_count: u64,
     pub total_cost: f64,
     pub total_instruction_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioPipelineShaderBinaryCost {
+    pub source: &'static str,
+    pub pipeline_id_kind: &'static str,
+    pub pipeline_id: u64,
+    pub binary_index: u64,
+    pub address: u64,
+    pub program_type: u16,
+    pub record_count: u64,
+    pub nonzero_record_count: u64,
+    pub total_cost: f64,
+    pub total_instruction_count: u64,
+    pub alu_cost: f64,
+    pub non_alu_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioPipelineExecutionHistory {
+    pub style: u32,
+    pub options: u32,
+    pub program_type: u16,
+    pub pipeline_id_kind: &'static str,
+    pub pipeline_id: u64,
+    pub top_cost_percentage: f64,
+    pub duration_percentage: f64,
+    pub total_duration_ns: u64,
+    pub total_cost: f64,
+    pub instruction_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -266,11 +310,12 @@ pub fn format_report(report: &XcodeMioReport) -> String {
     }
     if report.timeline_binary_count > 0 || !report.shader_binary_info.is_empty() {
         out.push_str(&format!(
-            "timeline_binaries={} shader_binary_info={}\n\n",
+            "timeline_binaries={} timeline_pipeline_states={} shader_binary_info={}\n\n",
             report
                 .timeline_binaries
                 .len()
                 .max(report.timeline_binary_count),
+            report.timeline_pipeline_state_ids.len(),
             report.shader_binary_info.len()
         ));
     }
@@ -318,6 +363,153 @@ pub fn format_report(report: &XcodeMioReport) -> String {
             out.push_str(&format!(
                 "  {:>4} refs  {:>4} binaries  raw1={:<5} kind={}/{}  {:<56}\n",
                 record_count, binary_count, raw1, raw5, raw6, name,
+            ));
+        }
+        out.push('\n');
+    }
+    let mut pipeline_counters = report
+        .pipelines
+        .iter()
+        .filter(|pipeline| !pipeline.pipeline_counters.is_empty())
+        .collect::<Vec<_>>();
+    pipeline_counters.sort_by(|left, right| {
+        let left_max = left
+            .pipeline_counters
+            .iter()
+            .map(|counter| counter.value.abs())
+            .fold(0.0, f64::max);
+        let right_max = right
+            .pipeline_counters
+            .iter()
+            .map(|counter| counter.value.abs())
+            .fold(0.0, f64::max);
+        right_max
+            .partial_cmp(&left_max)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    if !pipeline_counters.is_empty() {
+        out.push_str("Pipelines by private pipeline counters:\n");
+        for pipeline in pipeline_counters.iter().take(12) {
+            let name = pipeline
+                .function_name
+                .as_deref()
+                .unwrap_or("<unknown function>");
+            let counters = pipeline
+                .pipeline_counters
+                .iter()
+                .take(4)
+                .map(|counter| format!("{}={:.3}", counter.name, counter.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("  {:<56} {}\n", name, counters));
+        }
+        out.push('\n');
+    }
+    let mut shader_binary_costs = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| {
+            pipeline
+                .shader_binary_costs
+                .iter()
+                .map(move |cost| (pipeline, cost))
+        })
+        .filter(|(_, cost)| cost.total_cost > 0.0 || cost.total_instruction_count > 0)
+        .collect::<Vec<_>>();
+    shader_binary_costs.sort_by(|(left_pipeline, left), (right_pipeline, right)| {
+        right
+            .total_cost
+            .partial_cmp(&left.total_cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .total_instruction_count
+                    .cmp(&left.total_instruction_count)
+            })
+            .then_with(|| left_pipeline.index.cmp(&right_pipeline.index))
+    });
+    if !shader_binary_costs.is_empty() {
+        let denominator = shader_binary_costs
+            .iter()
+            .map(|(_, cost)| cost.total_cost)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .sum::<f64>();
+        out.push_str("Pipelines by shader instruction-cost arrays:\n");
+        for (pipeline, cost) in shader_binary_costs.iter().take(20) {
+            let name = pipeline
+                .function_name
+                .as_deref()
+                .unwrap_or("<unknown function>");
+            let pct = if denominator > 0.0 {
+                100.0 * cost.total_cost / denominator
+            } else {
+                0.0
+            };
+            out.push_str(&format!(
+                "  {:>6.2}% cost={:>10.3} instr={:>10} nonzero={:>4}/{:<4} ptype={:<2} {:<56} {}={} binary={} addr=0x{:x}\n",
+                pct,
+                cost.total_cost,
+                cost.total_instruction_count,
+                cost.nonzero_record_count,
+                cost.record_count,
+                cost.program_type,
+                name,
+                cost.pipeline_id_kind,
+                cost.pipeline_id,
+                cost.binary_index,
+                cost.address,
+            ));
+        }
+        out.push('\n');
+    }
+    let mut execution_history = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| {
+            pipeline
+                .execution_history
+                .iter()
+                .map(move |history| (pipeline, history))
+        })
+        .filter(|(_, history)| {
+            history.top_cost_percentage > 0.0
+                || history.duration_percentage > 0.0
+                || history.total_cost > 0.0
+        })
+        .collect::<Vec<_>>();
+    execution_history.sort_by(|(left_pipeline, left), (right_pipeline, right)| {
+        right
+            .top_cost_percentage
+            .partial_cmp(&left.top_cost_percentage)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .total_cost
+                    .partial_cmp(&left.total_cost)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left_pipeline.index.cmp(&right_pipeline.index))
+    });
+    if !execution_history.is_empty() {
+        out.push_str("Pipelines by Xcode execution-history cost:\n");
+        for (pipeline, history) in execution_history.iter().take(20) {
+            let name = pipeline
+                .function_name
+                .as_deref()
+                .unwrap_or("<unknown function>");
+            out.push_str(&format!(
+                "  {:>6.2}% dur={:>6.2}% cost={:>10.3} instr={:>10} ptype={:<2} style={}/{} {:<56} {}={}\n",
+                history.top_cost_percentage,
+                history.duration_percentage,
+                history.total_cost,
+                history.instruction_count,
+                history.program_type,
+                history.style,
+                history.options,
+                name,
+                history.pipeline_id_kind,
+                history.pipeline_id,
             ));
         }
         out.push('\n');
@@ -498,7 +690,7 @@ pub fn format_report(report: &XcodeMioReport) -> String {
 #[cfg(target_os = "macos")]
 mod platform {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
     use std::mem;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -507,7 +699,8 @@ mod platform {
     use super::{
         XcodeMioBinaryTrace, XcodeMioCostTimeline, XcodeMioDecodedCostRecord,
         XcodeMioDrawMetadataRecord, XcodeMioDrawTimelineRecord, XcodeMioGpuCommand,
-        XcodeMioPipeline, XcodeMioPipelineScopeCost, XcodeMioPipelineShaderBinary,
+        XcodeMioPipeline, XcodeMioPipelineCounter, XcodeMioPipelineExecutionHistory,
+        XcodeMioPipelineScopeCost, XcodeMioPipelineShaderBinary, XcodeMioPipelineShaderBinaryCost,
         XcodeMioPipelineShaderBinaryReference, XcodeMioPipelineShaderStat,
         XcodeMioPipelineShaderTrack, XcodeMioReport, XcodeMioShaderBinaryInfo,
         XcodeMioTimelineBinary,
@@ -618,7 +811,10 @@ mod platform {
                 scope_costs: Vec::new(),
                 shader_tracks: Vec::new(),
                 shader_binaries: Vec::new(),
+                shader_binary_costs: Vec::new(),
+                execution_history: Vec::new(),
                 shader_binary_references: Vec::new(),
+                pipeline_counters: Vec::new(),
             });
         }
 
@@ -662,10 +858,13 @@ mod platform {
         let mut draw_metadata_records = Vec::new();
         let mut timeline_binary_count = 0;
         let mut timeline_binaries = Vec::new();
+        let mut timeline_pipeline_state_ids = Vec::new();
         let mut shader_binary_info = Vec::new();
         if let Some(timeline) = cost_timeline_object {
             timeline_binary_count = unsafe { runtime.timeline_binary_count(timeline) };
             timeline_binaries = unsafe { runtime.decode_timeline_binaries(timeline) };
+            timeline_pipeline_state_ids =
+                unsafe { runtime.decode_timeline_pipeline_state_ids(timeline) };
             shader_binary_info = unsafe { runtime.decode_shader_binary_info(timeline) };
             attach_shader_binary_references(
                 &shader_binary_info,
@@ -691,9 +890,15 @@ mod platform {
                     timeline,
                     &decoded_cost_records,
                     &mut decoded_pipelines,
+                    &timeline_pipeline_state_ids,
                 )
             } {
                 warnings.push(format!("private per-pipeline cost probe failed: {error}"));
+            }
+            if let Err(error) =
+                unsafe { runtime.decode_pipeline_counters(mio, &mut decoded_pipelines) }
+            {
+                warnings.push(format!("private pipeline counter probe failed: {error}"));
             }
         }
         if profiler_summary.is_some_and(|summary| summary.num_gpu_commands != command_count) {
@@ -720,6 +925,7 @@ mod platform {
             cost_timeline,
             timeline_binary_count,
             timeline_binaries,
+            timeline_pipeline_state_ids,
             shader_binary_info,
             decoded_cost_records,
             draw_timeline_records,
@@ -870,6 +1076,7 @@ mod platform {
             timeline: Id,
             cost_records: &[XcodeMioDecodedCostRecord],
             pipelines: &mut [XcodeMioPipeline],
+            timeline_pipeline_state_ids: &[u64],
         ) -> Result<()> {
             unsafe {
                 self.decode_pipeline_shader_stats(timeline, pipelines)?;
@@ -890,6 +1097,74 @@ mod platform {
                     )?;
                 }
                 self.decode_pipeline_shader_binaries(timeline, pipelines)?;
+                self.decode_pipeline_execution_history(
+                    timeline,
+                    pipelines,
+                    timeline_pipeline_state_ids,
+                )?;
+                self.decode_pipeline_execution_history(
+                    mio,
+                    pipelines,
+                    timeline_pipeline_state_ids,
+                )?;
+            }
+            Ok(())
+        }
+
+        unsafe fn decode_pipeline_counters(
+            &mut self,
+            mio: Id,
+            pipelines: &mut [XcodeMioPipeline],
+        ) -> Result<()> {
+            unsafe {
+                let counters = self.send_id_allow_nil(mio, "nonOverlappingCounters")?;
+                if counters.is_null() {
+                    return Ok(());
+                }
+                let names = self.send_id_allow_nil(counters, "pipelineStateCounterNames")?;
+                if names.is_null() {
+                    return Ok(());
+                }
+                let name_count = self.array_count(names)?;
+                let value_count = send_u64(counters, "numPipelineStateCounters")? as usize;
+                let count = name_count.min(value_count);
+                let mut counter_names = Vec::with_capacity(count);
+                for index in 0..count {
+                    let name = self.array_object(names, index)?;
+                    counter_names.push(
+                        nsstring_to_string(name)
+                            .unwrap_or_else(|| format!("pipeline_counter_{index}")),
+                    );
+                }
+                for pipeline in pipelines {
+                    let values = send_ptr_u64_u32(
+                        counters,
+                        "counterValuesForPipelineStateId:encoderFunctionIndex:",
+                        pipeline.object_id,
+                        pipeline.function_index as u32,
+                    )?;
+                    if values.is_null() {
+                        continue;
+                    }
+                    let values = values.cast::<f64>();
+                    for (index, name) in counter_names.iter().enumerate() {
+                        let value = *values.add(index);
+                        if !value.is_finite() || value == 0.0 {
+                            continue;
+                        }
+                        pipeline.pipeline_counters.push(XcodeMioPipelineCounter {
+                            name: name.clone(),
+                            value,
+                        });
+                    }
+                    pipeline.pipeline_counters.sort_by(|left, right| {
+                        right
+                            .value
+                            .abs()
+                            .partial_cmp(&left.value.abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
             }
             Ok(())
         }
@@ -1036,6 +1311,29 @@ mod platform {
             records
         }
 
+        unsafe fn decode_timeline_pipeline_state_ids(&mut self, timeline: Id) -> Vec<u64> {
+            let values = Arc::new(Mutex::new(Vec::new()));
+            let callback_values = Arc::clone(&values);
+            let block = RcBlock::new(move |pipeline_state_id: u64| {
+                if let Ok(mut values) = callback_values.lock() {
+                    values.push(pipeline_state_id);
+                }
+            });
+            let block_ptr = RcBlock::as_ptr(&block).cast::<c_void>();
+            if unsafe { send_void_id(timeline, "enumeratePipelineStates:", block_ptr.cast()) }
+                .is_err()
+            {
+                return Vec::new();
+            }
+            let mut values = values
+                .lock()
+                .map(|values| values.clone())
+                .unwrap_or_default();
+            values.sort_unstable();
+            values.dedup();
+            values
+        }
+
         unsafe fn decode_draw_timeline_records(
             &mut self,
             timeline: Id,
@@ -1141,7 +1439,7 @@ mod platform {
                         ("function_index", pipeline.function_index),
                     ];
                     for (shader_id_kind, shader_id) in candidates {
-                        for program_type in 0..=16 {
+                        for program_type in program_type_candidates(pipeline) {
                             let stat = send_id_u64_u16_allow_nil(
                                 stats,
                                 "shaderStatForShader:programType:",
@@ -1231,7 +1529,7 @@ mod platform {
                         ("pipeline_index", pipeline.index as u64),
                     ];
                     for (pipeline_id_kind, pipeline_id) in candidates {
-                        for program_type in 0..=16 {
+                        for program_type in program_type_candidates(pipeline) {
                             let track = send_id_u64_u16_allow_nil(
                                 helper,
                                 "generateAggregatedShaderTrackForPipelineState:programType:",
@@ -1339,6 +1637,100 @@ mod platform {
             }
             Ok(())
         }
+
+        unsafe fn decode_pipeline_execution_history(
+            &mut self,
+            timeline: Id,
+            pipelines: &mut [XcodeMioPipeline],
+            timeline_pipeline_state_ids: &[u64],
+        ) -> Result<()> {
+            unsafe {
+                if !responds_to_selector(
+                    timeline,
+                    "executionHistoryForPipelineState:programType:delegate:progressController:",
+                ) {
+                    return Ok(());
+                }
+                let history_class = lookup_class("GTMioShaderExecutionHistory")?;
+                let delegate = lookup_class("GTMioShaderExecutionHistoryDefaultDelegate")
+                    .ok()
+                    .and_then(|class| send_id_allow_nil(class, "shared").ok())
+                    .unwrap_or(std::ptr::null_mut());
+
+                for style in [1_u32, 2, 4] {
+                    for options in 0_u32..=15 {
+                        let history = send_id(history_class, "alloc")?;
+                        let history = send_id_id_u32_u32_id(
+                            history,
+                            "initWithTraceData:style:options:delegate:",
+                            timeline,
+                            style,
+                            options,
+                            delegate,
+                        )?;
+                        for pipeline in pipelines.iter_mut() {
+                            let mut seen = BTreeSet::new();
+                            let identifiers = execution_history_pipeline_ids(
+                                pipeline,
+                                timeline_pipeline_state_ids,
+                            );
+                            for (pipeline_id_kind, pipeline_id) in identifiers {
+                                for program_type in program_type_candidates(pipeline) {
+                                    if !seen.insert((pipeline_id_kind, pipeline_id, program_type)) {
+                                        continue;
+                                    }
+                                    let generated = send_void_u64_u16_id_id(
+                                        timeline,
+                                        "executionHistoryForPipelineState:programType:delegate:progressController:",
+                                        pipeline_id,
+                                        program_type,
+                                        history,
+                                        std::ptr::null_mut(),
+                                    )
+                                    .is_ok();
+                                    if !generated {
+                                        continue;
+                                    }
+                                    let node =
+                                        send_id_u32_allow_nil(history, "nodeForStyle:", style)
+                                            .unwrap_or(std::ptr::null_mut());
+                                    if node.is_null() {
+                                        continue;
+                                    }
+                                    let decoded_node = decode_execution_history_node(node);
+                                    let top_cost_percentage = decoded_node.top_cost_percentage;
+                                    let duration_percentage = decoded_node.duration_percentage;
+                                    let total_duration_ns = decoded_node.total_duration_ns;
+                                    let total_cost = decoded_node.total_cost;
+                                    if top_cost_percentage == 0.0
+                                        && duration_percentage == 0.0
+                                        && total_cost == 0.0
+                                        && total_duration_ns == 0
+                                    {
+                                        continue;
+                                    }
+                                    pipeline.execution_history.push(
+                                        XcodeMioPipelineExecutionHistory {
+                                            style,
+                                            options,
+                                            program_type,
+                                            pipeline_id_kind,
+                                            pipeline_id,
+                                            top_cost_percentage,
+                                            duration_percentage,
+                                            total_duration_ns,
+                                            total_cost,
+                                            instruction_count: decoded_node.instruction_count,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
     struct DecodedTimeline {
@@ -1403,6 +1795,25 @@ mod platform {
                 && self.cpi_weighted_instruction_count == 0
                 && self.active_thread_instruction_count == 0
         }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct DecodedCostAggregate {
+        record_count: u64,
+        nonzero_record_count: u64,
+        total_cost: f64,
+        total_instruction_count: u64,
+        alu_cost: f64,
+        non_alu_cost: f64,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct DecodedExecutionHistoryNode {
+        top_cost_percentage: f64,
+        duration_percentage: f64,
+        total_duration_ns: u64,
+        total_cost: f64,
+        instruction_count: u64,
     }
 
     unsafe fn decode_shader_track(
@@ -1512,6 +1923,40 @@ mod platform {
         }
     }
 
+    fn program_type_candidates(pipeline: &XcodeMioPipeline) -> Vec<u16> {
+        let mut candidates = BTreeSet::from([8_u16, 28_u16]);
+        for binary in &pipeline.shader_binaries {
+            candidates.insert(binary.program_type);
+        }
+        candidates.into_iter().collect()
+    }
+
+    fn execution_history_pipeline_ids(
+        pipeline: &XcodeMioPipeline,
+        timeline_pipeline_state_ids: &[u64],
+    ) -> Vec<(&'static str, u64)> {
+        let mut values = vec![
+            ("object_id", pipeline.object_id),
+            ("pointer_id", pipeline.pointer_id),
+            ("function_index", pipeline.function_index),
+            ("pipeline_index", pipeline.index as u64),
+        ];
+        let raw_ids = pipeline
+            .shader_binary_references
+            .iter()
+            .filter(|reference| reference.raw5 == 6 && reference.raw6 == 28)
+            .map(|reference| reference.raw1 as u64)
+            .collect::<BTreeSet<_>>();
+        values.extend(raw_ids.into_iter().map(|raw1| ("shader_binary_raw1", raw1)));
+        values.extend(
+            timeline_pipeline_state_ids
+                .iter()
+                .copied()
+                .map(|pipeline_state_id| ("timeline_pipeline_state_id", pipeline_state_id)),
+        );
+        values
+    }
+
     unsafe fn decode_timeline_binary(binary: Id, fallback_index: u64) -> XcodeMioTimelineBinary {
         unsafe {
             let index = send_u64(binary, "index").unwrap_or(fallback_index);
@@ -1524,6 +1969,8 @@ mod platform {
             let cost_count = send_u64(binary, "costCount").unwrap_or(0);
             let (total_cost, total_instruction_count) =
                 decode_binary_total_cost(binary, cost_count, instruction_info_count);
+            let instruction_costs =
+                decode_binary_instruction_costs(binary, instruction_info_count, "instructionCosts");
             XcodeMioTimelineBinary {
                 index,
                 address,
@@ -1535,6 +1982,10 @@ mod platform {
                 cost_count,
                 total_cost,
                 total_instruction_count,
+                instruction_cost_record_count: instruction_costs.record_count,
+                instruction_nonzero_record_count: instruction_costs.nonzero_record_count,
+                instruction_total_cost: instruction_costs.total_cost,
+                instruction_total_count: instruction_costs.total_instruction_count,
             }
         }
     }
@@ -1561,6 +2012,43 @@ mod platform {
             let cost_count = send_u64(binary, "costCount").unwrap_or(0);
             let (total_cost, total_instruction_count) =
                 decode_binary_total_cost(binary, cost_count, instruction_info_count);
+            for (source, costs) in [
+                (
+                    "instructionCostsForPipelineState",
+                    decode_binary_instruction_costs_for_pipeline_state(
+                        binary,
+                        pipeline_id,
+                        instruction_info_count,
+                    ),
+                ),
+                (
+                    "instructionCosts",
+                    decode_binary_instruction_costs(
+                        binary,
+                        instruction_info_count,
+                        "instructionCosts",
+                    ),
+                ),
+            ] {
+                if costs.total_cost > 0.0 || costs.total_instruction_count > 0 {
+                    pipeline
+                        .shader_binary_costs
+                        .push(XcodeMioPipelineShaderBinaryCost {
+                            source,
+                            pipeline_id_kind,
+                            pipeline_id,
+                            binary_index,
+                            address,
+                            program_type,
+                            record_count: costs.record_count,
+                            nonzero_record_count: costs.nonzero_record_count,
+                            total_cost: costs.total_cost,
+                            total_instruction_count: costs.total_instruction_count,
+                            alu_cost: costs.alu_cost,
+                            non_alu_cost: costs.non_alu_cost,
+                        });
+                }
+            }
             pipeline.shader_binaries.push(XcodeMioPipelineShaderBinary {
                 pipeline_id_kind,
                 pipeline_id,
@@ -1594,6 +2082,127 @@ mod platform {
                 return (0.0, 0);
             }
             decode_cost_info_sum(costs.cast(), cost_count as usize)
+        }
+    }
+
+    unsafe fn decode_binary_instruction_costs(
+        binary: Id,
+        instruction_info_count: u64,
+        selector: &str,
+    ) -> DecodedCostAggregate {
+        unsafe {
+            let Ok(costs) = send_ptr(binary, selector) else {
+                return DecodedCostAggregate::default();
+            };
+            decode_instruction_cost_pointer(costs, instruction_info_count)
+        }
+    }
+
+    unsafe fn decode_binary_instruction_costs_for_pipeline_state(
+        binary: Id,
+        pipeline_state_id: u64,
+        instruction_info_count: u64,
+    ) -> DecodedCostAggregate {
+        unsafe {
+            let Ok(costs) = send_ptr_u64(
+                binary,
+                "instructionCostsForPipelineState:",
+                pipeline_state_id,
+            ) else {
+                return DecodedCostAggregate::default();
+            };
+            decode_instruction_cost_pointer(costs, instruction_info_count)
+        }
+    }
+
+    unsafe fn decode_instruction_cost_pointer(
+        costs: *const c_void,
+        instruction_info_count: u64,
+    ) -> DecodedCostAggregate {
+        if costs.is_null() || instruction_info_count == 0 || instruction_info_count > 1_000_000 {
+            return DecodedCostAggregate::default();
+        }
+        let costs = costs.cast::<RawGtmioCostInfo>();
+        let mut aggregate = DecodedCostAggregate {
+            record_count: instruction_info_count,
+            ..DecodedCostAggregate::default()
+        };
+        for index in 0..instruction_info_count as usize {
+            let cost = unsafe { *costs.add(index) };
+            let total_cost = cost.alu_cost + cost.non_alu_cost;
+            if !cost.is_empty() {
+                aggregate.nonzero_record_count += 1;
+            }
+            if total_cost.is_finite() {
+                aggregate.total_cost += total_cost;
+                aggregate.alu_cost += cost.alu_cost;
+                aggregate.non_alu_cost += cost.non_alu_cost;
+            }
+            aggregate.total_instruction_count = aggregate
+                .total_instruction_count
+                .saturating_add(cost.instruction_count);
+        }
+        aggregate
+    }
+
+    unsafe fn decode_execution_history_node(root: Id) -> DecodedExecutionHistoryNode {
+        unsafe {
+            let mut best = DecodedExecutionHistoryNode::default();
+            let mut stack = vec![root];
+            let mut visited = 0_usize;
+            while let Some(node) = stack.pop() {
+                visited += 1;
+                if visited > 20_000 {
+                    break;
+                }
+                let top_cost_percentage = send_f64(node, "topCostPercentage").unwrap_or(0.0);
+                let duration_percentage = send_f64(node, "durationPercentage").unwrap_or(0.0);
+                let total_duration_ns = send_u64(node, "totalDuration").unwrap_or(0);
+                let mut cost = RawGtmioCostInfo::default();
+                let found = send_i8_u16_u64_cost_mut(
+                    node,
+                    "costForScope:scopeIdentifier:cost:",
+                    0,
+                    0,
+                    &mut cost,
+                )
+                .unwrap_or(0);
+                let total_cost = if found != 0 {
+                    cost.alu_cost + cost.non_alu_cost
+                } else {
+                    0.0
+                };
+                let candidate = DecodedExecutionHistoryNode {
+                    top_cost_percentage,
+                    duration_percentage,
+                    total_duration_ns,
+                    total_cost,
+                    instruction_count: cost.instruction_count,
+                };
+                if candidate
+                    .top_cost_percentage
+                    .partial_cmp(&best.top_cost_percentage)
+                    .unwrap_or(std::cmp::Ordering::Less)
+                    .is_gt()
+                    || (candidate.top_cost_percentage == best.top_cost_percentage
+                        && candidate.total_cost > best.total_cost)
+                {
+                    best = candidate;
+                }
+                let Ok(children) = send_id_allow_nil(node, "children") else {
+                    continue;
+                };
+                if children.is_null() {
+                    continue;
+                }
+                let child_count = send_u64(children, "count").unwrap_or(0).min(20_000);
+                for index in 0..child_count as usize {
+                    if let Ok(child) = send_id_usize(children, "objectAtIndex:", index) {
+                        stack.push(child);
+                    }
+                }
+            }
+            best
         }
     }
 
@@ -1741,6 +2350,17 @@ mod platform {
         u16::from_ne_bytes(bytes[offset..offset + 2].try_into().expect("u16 slice"))
     }
 
+    unsafe fn nsstring_to_string(value: Id) -> Option<String> {
+        let bytes = unsafe { send_ptr(value, "UTF8String").ok()? };
+        if bytes.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(bytes.cast::<c_char>()) }
+            .to_str()
+            .ok()
+            .map(ToOwned::to_owned)
+    }
+
     unsafe fn load_framework(path: &str) -> Result<()> {
         let path = CString::new(path).expect("framework path contains no NUL");
         let handle = unsafe { dlopen(path.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
@@ -1778,6 +2398,21 @@ mod platform {
         } else {
             Ok(sel)
         }
+    }
+
+    unsafe fn responds_to_selector(receiver: Id, selector_name: &str) -> bool {
+        if receiver.is_null() {
+            return false;
+        }
+        let Ok(responds_to_selector) = (unsafe { selector("respondsToSelector:") }) else {
+            return false;
+        };
+        let Ok(target_selector) = (unsafe { selector(selector_name) }) else {
+            return false;
+        };
+        let f: extern "C" fn(Id, Sel, Sel) -> i8 =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        f(receiver, responds_to_selector, target_selector) != 0
     }
 
     unsafe fn send_id(receiver: Id, sel: &str) -> Result<Id> {
@@ -1859,6 +2494,32 @@ mod platform {
         }
     }
 
+    unsafe fn send_id_id_u32_u32_id(
+        receiver: Id,
+        sel: &str,
+        first: Id,
+        second: u32,
+        third: u32,
+        fourth: Id,
+    ) -> Result<Id> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, Id, u32, u32, Id) -> Id =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        let value = f(receiver, sel, first, second, third, fourth);
+        if value.is_null() {
+            Err(Error::InvalidInput(
+                "Objective-C message returned nil".to_owned(),
+            ))
+        } else {
+            Ok(value)
+        }
+    }
+
     unsafe fn send_id_u64_u16_allow_nil(
         receiver: Id,
         sel: &str,
@@ -1884,6 +2545,18 @@ mod platform {
         }
         let sel = unsafe { selector(sel)? };
         let f: extern "C" fn(Id, Sel, u64) -> Id =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, arg))
+    }
+
+    unsafe fn send_id_u32_allow_nil(receiver: Id, sel: &str, arg: u32) -> Result<Id> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u32) -> Id =
             unsafe { mem::transmute(objc_msgSend as *const ()) };
         Ok(f(receiver, sel, arg))
     }
@@ -1916,6 +2589,38 @@ mod platform {
         let sel = unsafe { selector(sel)? };
         let f: extern "C" fn(Id, Sel) = unsafe { mem::transmute(objc_msgSend as *const ()) };
         f(receiver, sel);
+        Ok(())
+    }
+
+    unsafe fn send_void_id(receiver: Id, sel: &str, arg: Id) -> Result<()> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, Id) = unsafe { mem::transmute(objc_msgSend as *const ()) };
+        f(receiver, sel, arg);
+        Ok(())
+    }
+
+    unsafe fn send_void_u64_u16_id_id(
+        receiver: Id,
+        sel: &str,
+        first: u64,
+        second: u16,
+        third: Id,
+        fourth: Id,
+    ) -> Result<()> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u64, u16, Id, Id) =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        f(receiver, sel, first, second, third, fourth);
         Ok(())
     }
 
@@ -1975,6 +2680,17 @@ mod platform {
         Ok(f(receiver, sel, arg))
     }
 
+    unsafe fn send_f64(receiver: Id, sel: &str) -> Result<f64> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel) -> f64 = unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel))
+    }
+
     unsafe fn send_void_i8(receiver: Id, sel: &str, arg: i8) -> Result<()> {
         if receiver.is_null() {
             return Err(Error::InvalidInput(format!(
@@ -1997,6 +2713,35 @@ mod platform {
         let f: extern "C" fn(Id, Sel) -> *const c_void =
             unsafe { mem::transmute(objc_msgSend as *const ()) };
         Ok(f(receiver, sel))
+    }
+
+    unsafe fn send_ptr_u64(receiver: Id, sel: &str, arg: u64) -> Result<*const c_void> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u64) -> *const c_void =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, arg))
+    }
+
+    unsafe fn send_ptr_u64_u32(
+        receiver: Id,
+        sel: &str,
+        first: u64,
+        second: u32,
+    ) -> Result<*const c_void> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u64, u32) -> *const c_void =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, first, second))
     }
 
     unsafe fn send_i8_u16_u64_cost_mut(
