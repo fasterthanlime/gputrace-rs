@@ -31,6 +31,7 @@ fn top_level_help_lists_current_analysis_commands() {
         "raw-counters",
         "validate-counters",
         "profiler",
+        "profiler-coverage",
         "mtlb-functions",
         "xcode-counters",
         "xcode-windows",
@@ -98,6 +99,18 @@ fn raw_counters_help_mentions_trace_and_formats() {
     assert!(help.contains("APSCounterData"));
     assert!(help.contains("derived.js"));
     assert!(help.contains("independent of Xcode Counters.csv"));
+}
+
+#[test]
+fn profiler_coverage_help_mentions_byte_coverage() {
+    let help = render_help(&["profiler-coverage"]);
+
+    assert!(help.contains("profiler-coverage"));
+    assert!(help.contains("<TRACE>"));
+    assert!(help.contains("--format <FORMAT>"));
+    assert!(help.contains("[default: text]"));
+    assert!(help.contains("Profiling_f_*"));
+    assert!(help.contains("opaque"));
 }
 
 #[test]

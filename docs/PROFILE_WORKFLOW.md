@@ -245,9 +245,11 @@ timeline groups, visibility flags, and descriptions where available.
 For end-user raw counter inspection without a counter CSV, use `raw-counters`.
 It reports the decoded `.gpuprofiler_raw/streamData` metadata, schemas,
 `GPRWCNTR` streams, raw counter ids, and any matching derived counter names from
-installed AGX Metal statistics/perf counter catalogs. In JSON, `derived_metrics`
-contains finite values from running Apple's local AGX `*-derived.js` formulas
-against decoded raw variables, without needing a separate Xcode counter CSV.
+installed AGX Metal statistics/perf counter catalogs. It also exposes embedded
+APS trace-id maps such as `TraceId to BatchId` and `TraceId to SampleIndex` for
+later dispatch/shader joins. In JSON, `derived_metrics` contains finite values
+from running Apple's local AGX `*-derived.js` formulas against decoded raw
+variables, without needing a separate Xcode counter CSV.
 `grouped_derived_metrics` splits those derived values by raw sample group/source
 and includes counter graph metadata plus profiler-dispatch join fields only when
 the bundle exposes overlapping raw counter and `streamData` tick windows:
@@ -256,6 +258,19 @@ the bundle exposes overlapping raw counter and `streamData` tick windows:
 gputrace raw-counters /abs/path/input-perfdata.gputrace --format text
 gputrace raw-counters /abs/path/input-perfdata.gputrace --format json
 ```
+
+To see what parts of the Xcode profiler bundle are decoded versus still opaque,
+use the coverage report:
+
+```bash
+gputrace profiler-coverage /abs/path/input-perfdata.gputrace --format text
+gputrace profiler-coverage /abs/path/input-perfdata.gputrace --format json
+```
+
+This is the right command when auditing reversal progress. It reports byte share
+for `streamData`, `Profiling_f_*`, `Counters_f_*`, `Timeline_f_*`, and other
+raw families, plus decoded APS archive counts and the largest files that are not
+byte-complete decoded yet.
 
 If you are debugging Xcode raw counter parity or correlating against an exported
 counter CSV, use the hidden structured probe:

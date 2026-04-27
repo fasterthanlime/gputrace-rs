@@ -176,9 +176,11 @@ parity/validation.
 
 For end-user raw counter inspection without a counter CSV, use `raw-counters`.
 It reads `.gpuprofiler_raw/streamData` and reports aggregate metadata,
-per-sample-group schemas, decoded `GPRWCNTR` streams, and raw counter ids. When
-available, it enriches raw hashes from installed AGX Metal statistics/perf
-counter plists under `/System/Library/Extensions`. The JSON report includes
+per-sample-group schemas, decoded `GPRWCNTR` streams, raw counter ids, and
+trace-id maps from embedded APS metadata such as `TraceId to BatchId` and
+`TraceId to SampleIndex`. When available, it enriches raw hashes from installed
+AGX Metal statistics/perf counter plists under `/System/Library/Extensions`.
+The JSON report includes
 `derived_metrics` when local AGX `*-derived.js` files can be evaluated from
 decoded raw variables. Treat these as offline Apple-formula counter values; they
 do not depend on, or require, an exported Xcode counter CSV.
@@ -193,6 +195,18 @@ gputrace raw-counters trace-perfdata.gputrace --format text
 gputrace raw-counters trace-perfdata.gputrace --format json
 gputrace raw-counters trace-perfdata.gputrace --format csv
 ```
+
+When you need to know whether a profiler export is fully understood, run:
+
+```bash
+gputrace profiler-coverage trace-perfdata.gputrace --format json
+```
+
+Treat this as the source of truth for reversal coverage. It reports byte share
+by profiler-bundle family and explicitly labels `streamData`, `Profiling_f_*`,
+`Counters_f_*`, `Timeline_f_*`, and other raw files as semantic, partial,
+heuristic, or opaque. Do not infer that missing values are unavailable from
+Xcode unless this report shows the relevant bytes have been accounted for.
 
 For raw counter reverse-engineering and CSV correlation, use the hidden
 structured `APSCounterData` probe instead of old `Counters_f_N` assumptions:

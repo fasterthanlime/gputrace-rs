@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use crate::counter;
 use crate::error::{Error, Result};
+use crate::trace::TraceBundle;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProfilerFileEntry {
@@ -155,6 +156,54 @@ pub struct ProfilerReport {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProfilerCoverageReport {
+    pub input_path: PathBuf,
+    pub profiler_directory: PathBuf,
+    pub total_bytes: u64,
+    pub total_files: usize,
+    pub groups: Vec<ProfilerCoverageGroup>,
+    pub top_opaque_files: Vec<ProfilerCoverageFile>,
+    pub decoded_summary: ProfilerCoverageDecodedSummary,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProfilerCoverageGroup {
+    pub kind: String,
+    pub file_count: usize,
+    pub byte_count: u64,
+    pub byte_percent: f64,
+    pub decoder_status: String,
+    pub decoded_signals: Vec<String>,
+    pub remaining_work: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilerCoverageFile {
+    pub name: String,
+    pub kind: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProfilerCoverageDecodedSummary {
+    pub stream_data_present: bool,
+    pub aggregate_metadata_blocks: usize,
+    pub counter_info_entries: usize,
+    pub counter_schemas: usize,
+    pub decoded_counter_streams: usize,
+    pub decoded_counter_metrics: usize,
+    pub derived_metric_groups: usize,
+    pub encoder_sample_metrics: usize,
+    pub trace_map_entries: usize,
+    pub stream_archives: usize,
+    pub aps_data_archives: usize,
+    pub aps_counter_data_archives: usize,
+    pub aps_timeline_data_archives: usize,
+    pub data_file_references: Vec<String>,
+}
+
 pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
     let input_path = path.as_ref().to_path_buf();
     let profiler_directory =
@@ -243,6 +292,219 @@ pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
     })
 }
 
+pub fn coverage_report(trace: &TraceBundle) -> Result<ProfilerCoverageReport> {
+    let input_path = trace.path.clone();
+    let profiler_directory =
+        find_profiler_directory(&input_path).ok_or_else(|| Error::NotFound(input_path.clone()))?;
+    let files = profiler_files(&profiler_directory)?;
+    let total_bytes = files.iter().map(|file| file.size).sum::<u64>();
+    let mut warnings = Vec::new();
+
+    let raw_counters = match counter::raw_counters_report(trace) {
+        Ok(report) => Some(report),
+        Err(error) => {
+            warnings.push(format!("raw-counters decoder failed: {error}"));
+            None
+        }
+    };
+    let probe = match counter::probe_raw_counters(trace, None, None, false) {
+        Ok(report) => Some(report),
+        Err(error) => {
+            warnings.push(format!("streamData archive probe failed: {error}"));
+            None
+        }
+    };
+
+    let stream_data_present = files.iter().any(|file| file.name == "streamData");
+    let decoded_summary = ProfilerCoverageDecodedSummary {
+        stream_data_present,
+        aggregate_metadata_blocks: raw_counters
+            .as_ref()
+            .map_or(0, |report| report.aggregate_metadata.len()),
+        counter_info_entries: raw_counters
+            .as_ref()
+            .map_or(0, |report| report.counter_info.len()),
+        counter_schemas: raw_counters
+            .as_ref()
+            .map_or(0, |report| report.schemas.len()),
+        decoded_counter_streams: raw_counters
+            .as_ref()
+            .map_or(0, |report| report.streams.len()),
+        decoded_counter_metrics: raw_counters
+            .as_ref()
+            .map_or(0, |report| report.metrics.len()),
+        derived_metric_groups: raw_counters
+            .as_ref()
+            .map_or(0, |report| report.grouped_derived_metrics.len()),
+        encoder_sample_metrics: raw_counters
+            .as_ref()
+            .map_or(0, |report| report.encoder_sample_metrics.len()),
+        trace_map_entries: raw_counters
+            .as_ref()
+            .map_or(0, |report| report.trace_maps.len()),
+        stream_archives: probe
+            .as_ref()
+            .map_or(0, |report| report.stream_archives.len()),
+        aps_data_archives: archive_count(probe.as_ref(), "APSData"),
+        aps_counter_data_archives: archive_count(probe.as_ref(), "APSCounterData"),
+        aps_timeline_data_archives: archive_count(probe.as_ref(), "APSTimelineData"),
+        data_file_references: data_file_references(probe.as_ref()),
+    };
+
+    let mut groups = Vec::new();
+    for kind in [
+        "streamData",
+        "profiling",
+        "counter",
+        "timeline",
+        "kdebug",
+        "other",
+    ] {
+        let matching = files
+            .iter()
+            .filter(|file| file.kind == kind)
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            continue;
+        }
+        let byte_count = matching.iter().map(|file| file.size).sum::<u64>();
+        groups.push(coverage_group(
+            kind,
+            matching.len(),
+            byte_count,
+            total_bytes,
+            &decoded_summary,
+        ));
+    }
+
+    let mut top_opaque_files = files
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.kind.as_str(),
+                "profiling" | "counter" | "timeline" | "kdebug"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    top_opaque_files.sort_by(|left, right| {
+        right
+            .size
+            .cmp(&left.size)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    top_opaque_files.truncate(12);
+
+    if total_bytes > 0 {
+        let opaque_bytes = top_opaque_kind_bytes(&files);
+        if opaque_bytes > 0 {
+            warnings.push(format!(
+                "{} bytes ({:.2}%) are in raw file families that are not byte-complete decoded yet",
+                opaque_bytes,
+                percent(opaque_bytes, total_bytes)
+            ));
+        }
+    }
+
+    Ok(ProfilerCoverageReport {
+        input_path,
+        profiler_directory,
+        total_bytes,
+        total_files: files.len(),
+        groups,
+        top_opaque_files,
+        decoded_summary,
+        warnings,
+    })
+}
+
+pub fn format_coverage_report(report: &ProfilerCoverageReport) -> String {
+    let mut out = String::new();
+    out.push_str("GPU Profiler Coverage\n");
+    out.push_str("=====================\n");
+    out.push_str(&format!("input={}\n", report.input_path.display()));
+    out.push_str(&format!(
+        "profiler_directory={}\n",
+        report.profiler_directory.display()
+    ));
+    out.push_str(&format!(
+        "files={} total_bytes={}\n\n",
+        report.total_files, report.total_bytes
+    ));
+
+    out.push_str("byte coverage by family\n");
+    out.push_str("-----------------------\n");
+    for group in &report.groups {
+        out.push_str(&format!(
+            "  {:<10} files={:<3} bytes={:<12} {:>6.2}% status={}\n",
+            group.kind,
+            group.file_count,
+            group.byte_count,
+            group.byte_percent,
+            group.decoder_status
+        ));
+        if !group.decoded_signals.is_empty() {
+            out.push_str(&format!(
+                "    decoded: {}\n",
+                group.decoded_signals.join("; ")
+            ));
+        }
+        if !group.remaining_work.is_empty() {
+            out.push_str(&format!(
+                "    remaining: {}\n",
+                group.remaining_work.join("; ")
+            ));
+        }
+    }
+
+    out.push_str("\ndecoded streamData structures\n");
+    out.push_str("-----------------------------\n");
+    let summary = &report.decoded_summary;
+    out.push_str(&format!(
+        "present={} archives={} APSData={} APSCounterData={} APSTimelineData={}\n",
+        summary.stream_data_present,
+        summary.stream_archives,
+        summary.aps_data_archives,
+        summary.aps_counter_data_archives,
+        summary.aps_timeline_data_archives
+    ));
+    out.push_str(&format!(
+        "aggregate_metadata={} counter_info={} schemas={} streams={} metrics={} encoder_sample_metrics={} trace_map_entries={} derived_groups={}\n",
+        summary.aggregate_metadata_blocks,
+        summary.counter_info_entries,
+        summary.counter_schemas,
+        summary.decoded_counter_streams,
+        summary.decoded_counter_metrics,
+        summary.encoder_sample_metrics,
+        summary.trace_map_entries,
+        summary.derived_metric_groups
+    ));
+    if !summary.data_file_references.is_empty() {
+        out.push_str("data_file_references:");
+        for reference in &summary.data_file_references {
+            out.push_str(&format!(" {reference}"));
+        }
+        out.push('\n');
+    }
+
+    if !report.top_opaque_files.is_empty() {
+        out.push_str("\nlargest not-byte-complete raw files\n");
+        out.push_str("-----------------------------------\n");
+        for file in &report.top_opaque_files {
+            out.push_str(&format!(
+                "  {:<10} {:>12} {}\n",
+                file.kind, file.size, file.name
+            ));
+        }
+    }
+
+    for warning in &report.warnings {
+        out.push_str(&format!("~ {warning}\n"));
+    }
+
+    out
+}
+
 pub fn stream_data_summary<P: AsRef<Path>>(path: P) -> Result<ProfilerStreamDataSummary> {
     let input_path = path.as_ref().to_path_buf();
     let profiler_directory =
@@ -252,6 +514,151 @@ pub fn stream_data_summary<P: AsRef<Path>>(path: P) -> Result<ProfilerStreamData
         return Err(Error::MissingFile(stream_data_path));
     }
     parse_stream_data(&stream_data_path, Some(&profiler_directory))
+}
+
+fn profiler_files(profiler_directory: &Path) -> Result<Vec<ProfilerCoverageFile>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(profiler_directory)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        files.push(ProfilerCoverageFile {
+            kind: classify_file(&name),
+            name,
+            size: metadata.len(),
+        });
+    }
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(files)
+}
+
+fn archive_count(report: Option<&counter::RawCounterProbeReport>, group: &str) -> usize {
+    report.map_or(0, |report| {
+        report
+            .stream_archives
+            .iter()
+            .filter(|archive| archive.group == group)
+            .count()
+    })
+}
+
+fn data_file_references(report: Option<&counter::RawCounterProbeReport>) -> Vec<String> {
+    let mut references = report
+        .into_iter()
+        .flat_map(|report| report.stream_archives.iter())
+        .filter_map(|archive| archive.data_file.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    references.sort();
+    references
+}
+
+fn coverage_group(
+    kind: &str,
+    file_count: usize,
+    byte_count: u64,
+    total_bytes: u64,
+    summary: &ProfilerCoverageDecodedSummary,
+) -> ProfilerCoverageGroup {
+    let (decoder_status, decoded_signals, remaining_work) = match kind {
+        "streamData" => (
+            "partial-semantic",
+            vec![
+                "binary plist root/keyed archives".to_owned(),
+                format!(
+                    "{} APSCounterData schemas, {} decoded streams, {} decoded metrics",
+                    summary.counter_schemas,
+                    summary.decoded_counter_streams,
+                    summary.decoded_counter_metrics
+                ),
+                format!(
+                    "{} dispatch/timeline counter sample rows",
+                    summary.encoder_sample_metrics
+                ),
+            ],
+            vec![
+                "not every embedded data blob has a named record layout yet".to_owned(),
+                "cost/source-line MIO/USC structures are still being mapped".to_owned(),
+            ],
+        ),
+        "profiling" => (
+            "heuristic-only",
+            vec![
+                "current profiler command can scan pipeline ids and occupancy-looking values"
+                    .to_owned(),
+            ],
+            vec![
+                "decode MIO/USC profiling records from Profiling_f_*".to_owned(),
+                "map per-shader/per-line cost records instead of byte scans".to_owned(),
+            ],
+        ),
+        "counter" => (
+            "partial-heuristic",
+            vec![
+                "legacy Counters_f_* metric extraction exists for a subset of known counters"
+                    .to_owned(),
+                "streamData APSCounterData path is decoded separately".to_owned(),
+            ],
+            vec![
+                "prove record layouts for every Counters_f_* payload".to_owned(),
+                "join sampled counters to dispatch/shader windows when timestamps line up"
+                    .to_owned(),
+            ],
+        ),
+        "timeline" => (
+            "partial-structural",
+            vec!["APSTimelineData GPRWCNTR timestamps are decoded from streamData".to_owned()],
+            vec![
+                "decode external Timeline_f_* record families byte-completely".to_owned(),
+                "join all timeline samples back to command buffers/encoders".to_owned(),
+            ],
+        ),
+        "kdebug" => (
+            "opaque",
+            Vec::new(),
+            vec!["decode kdebug raw event payloads or explicitly mark as out of scope".to_owned()],
+        ),
+        _ => (
+            "unknown",
+            Vec::new(),
+            vec!["classify and decode this file family".to_owned()],
+        ),
+    };
+
+    ProfilerCoverageGroup {
+        kind: kind.to_owned(),
+        file_count,
+        byte_count,
+        byte_percent: percent(byte_count, total_bytes),
+        decoder_status: decoder_status.to_owned(),
+        decoded_signals,
+        remaining_work,
+    }
+}
+
+fn top_opaque_kind_bytes(files: &[ProfilerCoverageFile]) -> u64 {
+    files
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.kind.as_str(),
+                "profiling" | "counter" | "timeline" | "kdebug"
+            )
+        })
+        .map(|file| file.size)
+        .sum()
+}
+
+fn percent(value: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        value as f64 / total as f64 * 100.0
+    }
 }
 
 pub fn raw_encoder_timings<P: AsRef<Path>>(path: P) -> Result<Vec<ProfilerRawEncoderTiming>> {
@@ -2262,6 +2669,67 @@ mod tests {
         assert!(text.contains("occ_mgr=72.00%"));
         assert!(text.contains("encoder 0: 37.50%"));
         assert!(text.contains("regs=32"));
+    }
+
+    #[test]
+    fn formats_coverage_report_with_decoder_status() {
+        let report = ProfilerCoverageReport {
+            input_path: PathBuf::from("trace.gputrace"),
+            profiler_directory: PathBuf::from("trace.gputrace.gpuprofiler_raw"),
+            total_bytes: 1024,
+            total_files: 3,
+            groups: vec![
+                ProfilerCoverageGroup {
+                    kind: "streamData".to_owned(),
+                    file_count: 1,
+                    byte_count: 256,
+                    byte_percent: 25.0,
+                    decoder_status: "partial-semantic".to_owned(),
+                    decoded_signals: vec!["1 APSCounterData schemas".to_owned()],
+                    remaining_work: vec!["cost/source-line MIO/USC structures".to_owned()],
+                },
+                ProfilerCoverageGroup {
+                    kind: "profiling".to_owned(),
+                    file_count: 2,
+                    byte_count: 768,
+                    byte_percent: 75.0,
+                    decoder_status: "heuristic-only".to_owned(),
+                    decoded_signals: vec!["pipeline ids".to_owned()],
+                    remaining_work: vec!["decode MIO/USC profiling records".to_owned()],
+                },
+            ],
+            top_opaque_files: vec![ProfilerCoverageFile {
+                name: "Profiling_f_0.raw".to_owned(),
+                kind: "profiling".to_owned(),
+                size: 512,
+            }],
+            decoded_summary: ProfilerCoverageDecodedSummary {
+                stream_data_present: true,
+                aggregate_metadata_blocks: 1,
+                counter_info_entries: 2,
+                counter_schemas: 1,
+                decoded_counter_streams: 3,
+                decoded_counter_metrics: 4,
+                derived_metric_groups: 5,
+                encoder_sample_metrics: 6,
+                trace_map_entries: 7,
+                stream_archives: 7,
+                aps_data_archives: 8,
+                aps_counter_data_archives: 9,
+                aps_timeline_data_archives: 10,
+                data_file_references: vec!["Profiling_f_0.raw".to_owned()],
+            },
+            warnings: vec!["raw file families are not byte-complete decoded yet".to_owned()],
+        };
+
+        let text = format_coverage_report(&report);
+        assert!(text.contains("GPU Profiler Coverage"));
+        assert!(text.contains("status=partial-semantic"));
+        assert!(text.contains("status=heuristic-only"));
+        assert!(text.contains("decode MIO/USC profiling records"));
+        assert!(text.contains("APSCounterData"));
+        assert!(text.contains("Profiling_f_0.raw"));
+        assert!(text.contains("not byte-complete"));
     }
 
     #[test]

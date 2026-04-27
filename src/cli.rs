@@ -69,6 +69,11 @@ enum CommandSet {
     MtlbStats(MtlbPathArgs),
     MtlbFunctions(MtlbFunctionsArgs),
     Profiler(ProfilerArgs),
+    #[command(
+        about = "Report profiler bundle byte and decoder coverage",
+        long_about = "Report profiler bundle byte and decoder coverage.\n\nThis is an end-user coverage/worklist report for Xcode-exported .gpuprofiler_raw bundles. It groups streamData, Profiling_f_*, Counters_f_*, Timeline_f_*, and other raw files by bytes and marks which families are decoded semantically, only decoded heuristically, or still opaque."
+    )]
+    ProfilerCoverage(ProfilerCoverageArgs),
     Timeline(TimelineArgs),
     Kernels(KernelsArgs),
     Encoders(EncodersArgs),
@@ -266,6 +271,19 @@ struct RawCountersArgs {
         long,
         default_value = "text",
         help = "Output format: text, json, or csv"
+    )]
+    format: String,
+}
+
+#[derive(Debug, Args)]
+struct ProfilerCoverageArgs {
+    #[arg(help = "Trace bundle or exported perfdata .gputrace path")]
+    trace: PathBuf,
+    #[arg(
+        short,
+        long,
+        default_value = "text",
+        help = "Output format: text or json"
     )]
     format: String,
 }
@@ -944,6 +962,19 @@ pub fn run() -> Result<()> {
                 "text" | "table" => print!("{}", profiler::format_report(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown profiler format")),
+            }
+        }
+        CommandSet::ProfilerCoverage(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = profiler::coverage_report(&trace)?;
+            match args.format.as_str() {
+                "text" | "table" => print!("{}", profiler::format_coverage_report(&report)),
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown profiler-coverage format",
+                    ));
+                }
             }
         }
         CommandSet::Fences(args) => {

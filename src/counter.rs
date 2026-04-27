@@ -71,6 +71,7 @@ pub struct RawCountersReport {
     pub profiler_directory: PathBuf,
     pub aggregate_metadata: Vec<RawCounterAggregateMetadata>,
     pub sample_trace_indices: Vec<RawCounterSampleTraceIndex>,
+    pub trace_maps: Vec<RawCounterTraceMapEntry>,
     pub counter_info: Vec<RawCounterInfoEntry>,
     pub schemas: Vec<RawCounterSchema>,
     pub streams: Vec<RawCounterDecodedStream>,
@@ -247,6 +248,15 @@ pub struct RawCounterSampleTraceIndex {
     pub trace_id: u64,
     pub words: Vec<u64>,
     pub sample_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterTraceMapEntry {
+    pub archive_index: usize,
+    pub map_name: String,
+    pub trace_id: u64,
+    pub scalar_value: Option<u64>,
+    pub words: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -477,6 +487,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
     let catalog = load_agx_counter_catalog();
     let aggregate_metadata = probe_aggregate_counter_metadata(&trace.path);
     let sample_trace_indices = probe_sample_trace_indices(&trace.path);
+    let trace_maps = probe_trace_maps(&trace.path);
     let counter_info = probe_counter_info_entries(&trace.path);
     let structured_layouts = probe_structured_counter_layouts(&trace.path);
     let normalized_counters = probe_normalized_counter_metrics(&trace.path);
@@ -597,6 +608,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         profiler_directory,
         aggregate_metadata,
         sample_trace_indices,
+        trace_maps,
         counter_info,
         schemas,
         streams,
@@ -659,6 +671,22 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
                 entry.trace_id,
                 entry
                     .sample_index
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                entry.words
+            ));
+        }
+    }
+    if !report.trace_maps.is_empty() {
+        out.push_str("\nTrace maps:\n");
+        for entry in report.trace_maps.iter().take(32) {
+            out.push_str(&format!(
+                "  APSData[{}] {} trace_id={} value={} words={:?}\n",
+                entry.archive_index,
+                entry.map_name,
+                entry.trace_id,
+                entry
+                    .scalar_value
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
                 entry.words
@@ -3089,6 +3117,56 @@ fn probe_sample_trace_indices(trace_path: &Path) -> Vec<RawCounterSampleTraceInd
     entries
 }
 
+fn probe_trace_maps(trace_path: &Path) -> Vec<RawCounterTraceMapEntry> {
+    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
+        return Vec::new();
+    };
+    let stream_data_path = profiler_dir.join("streamData");
+    let Ok(plist) = Value::from_file(stream_data_path) else {
+        return Vec::new();
+    };
+    let Some(archive) = plist.as_dictionary() else {
+        return Vec::new();
+    };
+    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
+        return Vec::new();
+    };
+
+    let map_names = [
+        "TraceId to BatchId",
+        "TraceId to Coalesced BatchId",
+        "TraceId to SampleIndex",
+        "TraceId to Tile Info",
+        "Blit TraceId to Sample Index",
+        "Blit Split TraceId to Sample Index",
+        "MTLFX TraceIds",
+    ];
+    let mut entries = Vec::new();
+    for (archive_index, bytes) in ns_data_array_from_root_key(objects, root, "APSData")
+        .into_iter()
+        .enumerate()
+    {
+        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+            continue;
+        };
+        for map_name in map_names {
+            let Some(data) = keyed.get(map_name).and_then(StreamArchiveValue::as_data) else {
+                continue;
+            };
+            entries.extend(parse_trace_map_entries(archive_index, map_name, data));
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.map_name
+            .cmp(&right.map_name)
+            .then_with(|| left.trace_id.cmp(&right.trace_id))
+    });
+    entries
+}
+
 fn parse_trace_id_sample_index_map(
     archive_index: usize,
     data: &[u8],
@@ -3136,6 +3214,60 @@ fn parse_trace_id_sample_index_map(
             archive_index,
             trace_id,
             sample_index: words.get(3).and_then(|value| (*value).try_into().ok()),
+            words,
+        });
+    }
+    entries
+}
+
+fn parse_trace_map_entries(
+    archive_index: usize,
+    map_name: &str,
+    data: &[u8],
+) -> Vec<RawCounterTraceMapEntry> {
+    let Ok(plist) = Value::from_reader(Cursor::new(data)) else {
+        return Vec::new();
+    };
+    let Some(archive) = plist.as_dictionary() else {
+        return Vec::new();
+    };
+    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(top) = archive.get("$top").and_then(Value::as_dictionary) else {
+        return Vec::new();
+    };
+    let Some(root_uid) = top.get("root").and_then(as_uid) else {
+        return Vec::new();
+    };
+    let Some(root) = object_dictionary(objects, root_uid) else {
+        return Vec::new();
+    };
+    let Some(keys) = root.get("NS.keys").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(values) = root.get("NS.objects").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    if keys.len() != values.len() {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::new();
+    for (key, value) in keys.iter().zip(values.iter()) {
+        let Some(trace_id) = resolve_value(objects, key).and_then(as_u64) else {
+            continue;
+        };
+        let Some(value) = resolve_value(objects, value) else {
+            continue;
+        };
+        let scalar_value = as_u64(value);
+        let words = ns_number_array(objects, value).unwrap_or_default();
+        entries.push(RawCounterTraceMapEntry {
+            archive_index,
+            map_name: map_name.to_owned(),
+            trace_id,
+            scalar_value,
             words,
         });
     }
@@ -4775,7 +4907,12 @@ fn extract_float_values(data: &[u8], min: f64, max: f64, max_count: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plist::Integer;
     use tempfile::tempdir;
+
+    fn test_integer(value: u64) -> Value {
+        Value::Integer(Integer::from(value))
+    }
 
     fn sample_record(values: &[f32]) -> Vec<u8> {
         let mut record = vec![0u8; 464];
@@ -4847,12 +4984,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_trace_map_entries_from_keyed_dictionary() {
+        let mut root = Dictionary::new();
+        root.insert(
+            "NS.keys".to_owned(),
+            Value::Array(vec![test_integer(42), test_integer(43)]),
+        );
+        root.insert(
+            "NS.objects".to_owned(),
+            Value::Array(vec![
+                test_integer(7),
+                Value::Array(vec![test_integer(1), test_integer(2), test_integer(3)]),
+            ]),
+        );
+        let mut top = Dictionary::new();
+        top.insert("root".to_owned(), Value::Uid(Uid::new(1)));
+        let mut archive = Dictionary::new();
+        archive.insert("$top".to_owned(), Value::Dictionary(top));
+        archive.insert(
+            "$objects".to_owned(),
+            Value::Array(vec![
+                Value::String("$null".to_owned()),
+                Value::Dictionary(root),
+            ]),
+        );
+        let mut bytes = Vec::new();
+        Value::Dictionary(archive)
+            .to_writer_binary(&mut bytes)
+            .unwrap();
+
+        let entries = parse_trace_map_entries(26, "TraceId to BatchId", &bytes);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].trace_id, 42);
+        assert_eq!(entries[0].scalar_value, Some(7));
+        assert_eq!(entries[1].trace_id, 43);
+        assert_eq!(entries[1].words, vec![1, 2, 3]);
+    }
+
+    #[test]
     fn formats_raw_counter_report_without_unbounded_rows_in_text_summary() {
         let report = RawCountersReport {
             trace_source: PathBuf::from("trace.gputrace"),
             profiler_directory: PathBuf::from("trace.gputrace/raw"),
             aggregate_metadata: Vec::new(),
             sample_trace_indices: Vec::new(),
+            trace_maps: Vec::new(),
             counter_info: Vec::new(),
             schemas: vec![RawCounterSchema {
                 sample_group: 0,
@@ -4960,6 +5137,7 @@ mod tests {
             profiler_directory: PathBuf::from("trace.gputrace/raw"),
             aggregate_metadata: Vec::new(),
             sample_trace_indices: Vec::new(),
+            trace_maps: Vec::new(),
             counter_info: Vec::new(),
             schemas: Vec::new(),
             streams: Vec::new(),

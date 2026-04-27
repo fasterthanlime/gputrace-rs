@@ -27,6 +27,7 @@ gputrace analyze trace.gputrace
 
 # Profiler and timing summaries when .gpuprofiler_raw data is present.
 gputrace profiler trace-perfdata.gputrace --format json
+gputrace profiler-coverage trace-perfdata.gputrace --format text
 gputrace timing trace-perfdata.gputrace --format csv
 
 # Xcode-exported counter CSV analysis.
@@ -64,6 +65,11 @@ when a directory contains unrelated `*Counters.csv` files.
 `profiler` reports real `streamData` dispatch timing. Its
 `pipeline_id_scan_costs` field is a debug-only scan of `Profiling_f_*` bytes,
 not Xcode's Performance/Cost percentage.
+
+`profiler-coverage` reports byte coverage for Xcode `.gpuprofiler_raw` exports.
+Use it when checking reversal progress: it groups `streamData`,
+`Profiling_f_*`, `Counters_f_*`, `Timeline_f_*`, and other raw files by byte
+share and labels each family as semantic, heuristic, partial, or opaque.
 
 `export-counters` is the preferred structured offline feed for downstream tools.
 It does not need an Xcode counter CSV. Its rows include `metric_source` so
