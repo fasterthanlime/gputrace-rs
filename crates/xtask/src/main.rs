@@ -29,11 +29,12 @@ fn usage() {
 }
 
 fn reject_extra_args(args: impl Iterator<Item = String>) {
-    for arg in args {
-        if arg == "--help" || arg == "-h" {
-            usage();
-            std::process::exit(0);
-        }
+    let args: Vec<String> = args.collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        usage();
+        std::process::exit(0);
+    }
+    if let Some(arg) = args.first() {
         eprintln!("unknown install option: {arg}");
         usage();
         std::process::exit(1);
