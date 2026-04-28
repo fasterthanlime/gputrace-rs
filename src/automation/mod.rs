@@ -245,7 +245,7 @@ pub fn toggle_checkbox(
 }
 
 pub fn show_performance(trace_path: Option<&Path>) -> Result<XcodeActionResult> {
-    click_button(trace_path, &["Show Performance"])
+    click_button(trace_path, &["Show Performance", "Open Performance"])
 }
 
 pub fn show_dependencies(trace_path: Option<&Path>) -> Result<XcodeActionResult> {
@@ -412,9 +412,6 @@ pub fn run_profile(request: &XcodeProfileRun) -> Result<XcodeExportResult> {
             )));
         }
     }
-
-    info!("xcode profile: show performance");
-    let _ = show_performance(trace_path);
 
     info!("xcode profile: export profiled trace");
     let export = export_profile_trace(trace_path, &output_path)?;

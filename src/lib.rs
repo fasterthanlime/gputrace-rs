@@ -20,6 +20,8 @@ pub mod insights;
 pub mod markdown;
 pub mod mtlb;
 pub mod profiler;
+pub mod replay_service;
+pub mod report;
 pub mod shaders;
 pub mod timeline;
 pub mod timing;

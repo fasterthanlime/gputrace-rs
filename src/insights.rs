@@ -8,6 +8,7 @@ use crate::profiler;
 use crate::shaders;
 use crate::timing;
 use crate::trace::TraceBundle;
+use crate::xcode_mio;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -53,12 +54,55 @@ pub struct InsightsReport {
 }
 
 pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsReport> {
-    let analysis = analysis::analyze(trace);
-    let timing = timing::report(trace)?;
-    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
-    let shader_report = shaders::report(trace, &shaders::default_search_paths()).ok();
+    let xcode_mio_report = xcode_mio::analysis_report(trace).ok();
+    report_with_xcode_mio(trace, min_level, xcode_mio_report)
+}
+
+pub fn report_with_xcode_mio(
+    trace: &TraceBundle,
+    min_level: Option<&str>,
+    xcode_mio_report: Option<xcode_mio::XcodeMioAnalysisReport>,
+) -> Result<InsightsReport> {
+    report_with_context(trace, min_level, xcode_mio_report, None, None, None)
+}
+
+pub fn report_with_context(
+    trace: &TraceBundle,
+    min_level: Option<&str>,
+    xcode_mio_report: Option<xcode_mio::XcodeMioAnalysisReport>,
+    precomputed_timing: Option<timing::TimingReport>,
+    precomputed_profiler_summary: Option<profiler::ProfilerStreamDataSummary>,
+    precomputed_shader_report: Option<shaders::ShaderReport>,
+) -> Result<InsightsReport> {
+    let profiler_summary =
+        precomputed_profiler_summary.or_else(|| profiler::stream_data_summary(&trace.path).ok());
+    let timing = if let Some(report) = precomputed_timing {
+        report
+    } else {
+        timing::report_with_profiler_summary(trace, profiler_summary.as_ref())?
+    };
+    let analysis =
+        analysis::analyze_with_context(trace, xcode_mio_report.clone(), Some(timing.clone()));
+    let shader_report = precomputed_shader_report.or_else(|| {
+        shaders::report_with_profiler_summary(
+            trace,
+            &shaders::default_search_paths(),
+            profiler_summary.as_ref(),
+        )
+        .ok()
+    });
+    let dispatch_time_exceeds_total = timing.kernels.iter().fold(0u64, |sum, kernel| {
+        sum.saturating_add(kernel.synthetic_duration_ns)
+    }) > timing.total_duration_ns;
     let time_label = if timing.synthetic {
         "synthetic GPU time"
+    } else if dispatch_time_exceeds_total {
+        "summed profiler dispatch time"
+    } else {
+        "GPU time"
+    };
+    let time_title = if dispatch_time_exceeds_total {
+        "profiler dispatch time"
     } else {
         "GPU time"
     };
@@ -70,7 +114,7 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                 insight_type: InsightType::Bottleneck,
                 severity: InsightSeverity::Critical,
                 shader_name: Some(top_kernel.name.clone()),
-                title: format!("{} dominates GPU time", top_kernel.name),
+                title: format!("{} dominates {time_title}", top_kernel.name),
                 description: format!(
                     "{} accounts for {:.1}% of {} across {} dispatches.",
                     top_kernel.name,
@@ -91,7 +135,7 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                 insight_type: InsightType::Bottleneck,
                 severity: InsightSeverity::High,
                 shader_name: Some(top_kernel.name.clone()),
-                title: format!("{} is a major bottleneck", top_kernel.name),
+                title: format!("{} is a major {time_title} bottleneck", top_kernel.name),
                 description: format!(
                     "{} accounts for {:.1}% of {} across {} dispatches.",
                     top_kernel.name,
@@ -106,6 +150,36 @@ pub fn report(trace: &TraceBundle, min_level: Option<&str>) -> Result<InsightsRe
                 impact: Some("Large contributor to GPU runtime.".to_owned()),
             });
         }
+    }
+
+    if let Some(report) = &xcode_mio_report
+        && let Some(top_pipeline) = report.top_pipelines.first()
+        && top_pipeline.command_percent > 25.0
+    {
+        let name = top_pipeline
+            .function_name
+            .clone()
+            .unwrap_or_else(|| "<unknown function>".to_owned());
+        insights.push(PerformanceInsight {
+            insight_type: InsightType::Info,
+            severity: InsightSeverity::Low,
+            shader_name: Some(name.clone()),
+            title: format!("{name} dominates Xcode MIO command topology"),
+            description: format!(
+                "Xcode's private MIO backend reports {name} as {} of {} GPU commands ({:.1}%), with {} executable shader-binary references.",
+                top_pipeline.command_count,
+                report.gpu_command_count,
+                top_pipeline.command_percent,
+                top_pipeline.executable_shader_binary_reference_count,
+            ),
+            recommendations: vec![
+                "Use `xcode-mio --format summary-json` for the Xcode-derived topology fields."
+                    .to_owned(),
+                "Treat this as structure/topology until private GUI Cost fields are decoded."
+                    .to_owned(),
+            ],
+            impact: Some("Shows where Xcode attributes repeated GPU command structure.".to_owned()),
+        });
     }
 
     if profiler_summary.is_none()

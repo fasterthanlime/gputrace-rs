@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -25,6 +26,8 @@ use crate::insights;
 use crate::markdown;
 use crate::mtlb;
 use crate::profiler;
+use crate::replay_service;
+use crate::report;
 use crate::shaders;
 use crate::timeline;
 use crate::timing;
@@ -45,6 +48,11 @@ pub struct Cli {
 enum CommandSet {
     Stats(TracePath),
     Analyze(TracePath),
+    #[command(
+        about = "Write a one-shot markdown report directory for a trace",
+        long_about = "Write a one-shot markdown report directory for a trace.\n\nThis opens the trace once from the CLI, runs the retained offline analyzers, reuses the Xcode MIO private-framework summary across analysis/insights, and writes agent-readable Markdown files into the output directory."
+    )]
+    Report(ReportArgs),
     AnalyzeUsage(AnalyzeUsageArgs),
     ApiCalls(ApiCallsArgs),
     ClearBuffers(ClearBuffersArgs),
@@ -102,31 +110,58 @@ enum CommandSet {
     Insights(InsightsArgs),
     Diff(DiffArgs),
     Markdown(MarkdownArgs),
+    #[command(
+        alias = "capture-profile",
+        about = "Profile an existing .gputrace headlessly via MTLReplayer.app",
+        long_about = "Profile an existing .gputrace headlessly via MTLReplayer.app.\n\nDirectly invokes the Apple-shipped MTLReplayer.app CLI (no Xcode UI, no Accessibility permission required) and waits for it to write the .gpuprofiler_raw bundle. The exact invocation is:\n\n  open -W -a /System/Library/CoreServices/MTLReplayer.app \\\n    --args -CLI <trace> -collectProfilerData --all -runningInCI -verbose --output <dir>\n\nMTLReplayer.app is launched through `open` (LaunchServices) because Apple's trust cache puts a launch constraint on the binary that only LaunchServices satisfies. `-CLI` is the gating flag that puts MTLReplayer in headless mode (otherwise it idles as the GTDisplayService companion). `-collectProfilerData --all` is what drives the actual per-draw replay/profile loop."
+    )]
+    Profile(ProfileArgs),
     Version(VersionArgs),
+    #[command(hide = true)]
     XcodeButtons(XcodeTraceQueryArgs),
     XcodeCounters(XcodeCountersArgs),
     XcodeCheckPermissions(XcodePermissionArgs),
+    #[command(hide = true)]
     XcodeCheckboxes(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     XcodeClickButton(XcodeActionArgs),
+    #[command(hide = true)]
     XcodeClose(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     XcodeEnsureChecked(XcodeActionArgs),
+    #[command(hide = true)]
     XcodeExportCounters(XcodeExportArgs),
+    #[command(hide = true)]
     XcodeExportMemory(XcodeExportArgs),
+    #[command(hide = true)]
     XcodeShowCounters(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     XcodeShowDependencies(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     XcodeShowMemory(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     XcodeShowPerformance(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     XcodeShowSummary(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     XcodeInspect(XcodeTraceQueryArgs),
     #[command(alias = "xp", alias = "collect-xcode-profile")]
     XcodeProfile(XcodeProfileArgs),
+    #[command(hide = true)]
     XcodeSelectTab(XcodeActionArgs),
+    #[command(hide = true)]
     XcodeStatus(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     XcodeTabs(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     XcodeToggleCheckbox(XcodeActionArgs),
+    #[command(hide = true)]
     XcodeUiElements(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     XcodeWait(XcodeWaitArgs),
+    #[command(hide = true)]
     XcodeWindows(XcodeFormatArgs),
+    #[command(hide = true)]
     XcodeMenuItems(XcodeMenuItemsArgs),
 }
 
@@ -136,9 +171,45 @@ struct TracePath {
 }
 
 #[derive(Debug, Args)]
+struct ReportArgs {
+    #[arg(help = "Input .gputrace bundle to analyze")]
+    trace: PathBuf,
+    #[arg(
+        short,
+        long,
+        help = "Directory to create/update with markdown report files"
+    )]
+    output: PathBuf,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Override the .gpuprofiler_raw directory (sets GPUTRACE_PROFILER_DIR for this run). Useful when streamData lives somewhere other than next to the trace, e.g. /private/tmp/com.apple.gputools.profiling/<stem>_stream.gpuprofiler_raw or a directory produced by `MTLReplayer -CLI ... --output X`"
+    )]
+    profiler: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ProfileArgs {
+    #[arg(help = "Input .gputrace bundle to profile")]
+    trace: PathBuf,
+    #[arg(
+        short,
+        long,
+        help = "Directory MTLReplayer writes the .gpuprofiler_raw bundle into; defaults to <trace>-perfdata next to the trace"
+    )]
+    output: Option<PathBuf>,
+    #[arg(long, help = "Capture MTLReplayer stdout to this file")]
+    stdout_log: Option<PathBuf>,
+    #[arg(long, help = "Capture MTLReplayer stderr to this file")]
+    stderr_log: Option<PathBuf>,
+    #[arg(long, default_value = "text", value_parser = ["text", "json"], help = "Output format")]
+    format: String,
+}
+
+#[derive(Debug, Args)]
 struct XcodeMioArgs {
     trace: PathBuf,
-    #[arg(short, long, default_value = "text")]
+    #[arg(short, long, default_value = "summary")]
     format: String,
 }
 
@@ -710,19 +781,33 @@ enum XcodeProfileCommand {
     RunProfile(XcodeTraceQueryArgs),
     WaitProfile(XcodeProfileWaitArgs),
     Export(XcodeProfileExportArgs),
+    #[command(hide = true)]
     XcodeExportCounters(XcodeExportArgs),
+    #[command(hide = true)]
     XcodeExportMemory(XcodeExportArgs),
+    #[command(hide = true)]
     ListWindows(XcodeFormatArgs),
+    #[command(hide = true)]
     ListButtons(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     ClickButton(XcodeActionArgs),
+    #[command(hide = true)]
     ListTabs(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     SelectTab(XcodeActionArgs),
+    #[command(hide = true)]
     EnsureChecked(XcodeActionArgs),
+    #[command(hide = true)]
     ToggleCheckbox(XcodeActionArgs),
+    #[command(hide = true)]
     ShowPerformance(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     ShowSummary(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     ShowCounters(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     ShowMemory(XcodeTraceQueryArgs),
+    #[command(hide = true)]
     ShowDependencies(XcodeTraceQueryArgs),
 }
 
@@ -737,18 +822,39 @@ struct XcodeProfileOpenArgs {
 
 #[derive(Debug, Args)]
 struct XcodeProfileRunArgs {
+    #[arg(help = "Input .gputrace bundle to open, profile, and export")]
     trace: PathBuf,
-    #[arg(short, long)]
+    #[arg(
+        short,
+        long,
+        help = "Output perfdata .gputrace bundle; defaults to <input>-perfdata.gputrace"
+    )]
     output: Option<PathBuf>,
-    #[arg(long, default_value_t = 300)]
+    #[arg(
+        long,
+        default_value_t = 300,
+        help = "Maximum seconds to wait for Xcode open/profile/export steps"
+    )]
     timeout_seconds: u64,
-    #[arg(long, default_value_t = 0)]
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Seconds to wait if another Xcode profile is already running"
+    )]
     wait_seconds: u64,
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Proceed even if another Xcode profile appears to be running"
+    )]
     force: bool,
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Do not open the Accessibility permission prompt"
+    )]
     no_prompt: bool,
-    #[arg(long)]
+    #[arg(long, help = "Activate Xcode before starting automation")]
     activate: bool,
 }
 
@@ -781,6 +887,33 @@ pub fn run() -> Result<()> {
             let trace = TraceBundle::open(args.trace)?;
             let report = analysis::analyze(&trace);
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        CommandSet::Report(args) => {
+            if let Some(profiler) = &args.profiler {
+                // SAFETY: single-threaded CLI startup; downstream code reads this env var via
+                // `find_profiler_directory` to resolve a non-default profiler directory.
+                unsafe {
+                    std::env::set_var("GPUTRACE_PROFILER_DIR", profiler);
+                }
+            }
+            let report = report::generate(
+                &args.trace,
+                &report::ReportOptions {
+                    output_dir: args.output,
+                },
+            )?;
+            println!(
+                "Wrote {} markdown files to {} in {:.1} ms",
+                report.files.len(),
+                report.output_dir.display(),
+                report.total_ms
+            );
+            if !report.failures.is_empty() {
+                println!("{} sections failed:", report.failures.len());
+                for failure in &report.failures {
+                    println!("  - {}: {}", failure.section, failure.message);
+                }
+            }
         }
         CommandSet::AnalyzeUsage(args) => {
             let trace = TraceBundle::open(args.trace)?;
@@ -1003,7 +1136,15 @@ pub fn run() -> Result<()> {
             let trace = TraceBundle::open(args.trace)?;
             let report = xcode_mio::report(&trace)?;
             match args.format.as_str() {
-                "text" | "table" => print!("{}", xcode_mio::format_report(&report)),
+                "summary" | "text" | "table" => {
+                    let summary = xcode_mio::summarize_report(&report);
+                    print!("{}", xcode_mio::format_analysis_report(&summary));
+                }
+                "summary-json" => {
+                    let summary = xcode_mio::summarize_report(&report);
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                }
+                "raw-text" => print!("{}", xcode_mio::format_report(&report)),
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown xcode-mio format")),
             }
@@ -1390,6 +1531,40 @@ pub fn run() -> Result<()> {
                 print!("{}", buffers::markdown_diff(&report));
             }
         },
+        CommandSet::Profile(args) => {
+            let output_dir = args.output.unwrap_or_else(|| default_profile_output(&args.trace));
+            let report = replay_service::profile(&replay_service::ProfileOptions {
+                trace: args.trace.clone(),
+                output_dir: output_dir.clone(),
+                stdout_log: args.stdout_log,
+                stderr_log: args.stderr_log,
+            })?;
+            match args.format.as_str() {
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    let dir_str = report
+                        .gpuprofiler_raw
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none)".to_owned());
+                    println!(
+                        "MTLReplayer profile: trace={} output={} gpuprofiler_raw={} streamData={} elapsed_ms={:.1} open_exit={}",
+                        report.trace.display(),
+                        report.output_dir.display(),
+                        dir_str,
+                        report.has_stream_data,
+                        report.elapsed_ms,
+                        report.open_exit_code
+                    );
+                    if !report.has_stream_data {
+                        return Err(crate::Error::InvalidInput(format!(
+                            "MTLReplayer exited but no streamData was produced under {}",
+                            report.output_dir.display()
+                        )));
+                    }
+                }
+            }
+        }
         CommandSet::Version(args) => {
             let info = serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
@@ -1793,6 +1968,15 @@ fn validate_diff_by(by: Option<&str>) -> Result<()> {
             "invalid --by value {by:?}; expected one of function, encoder, pipeline, timeline-windows, dispatch, unmatched, matches, occurrences"
         )))
     }
+}
+
+fn default_profile_output(trace_path: &Path) -> PathBuf {
+    let parent = trace_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = trace_path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("trace");
+    parent.join(format!("{stem}-perfdata"))
 }
 
 fn run_xcode_profile_command(args: XcodeProfileArgs) -> Result<()> {

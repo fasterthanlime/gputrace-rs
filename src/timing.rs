@@ -80,10 +80,11 @@ fn finalize_kernel_timings(
     samples_by_name: &BTreeMap<String, Vec<u64>>,
     total_duration_ns: u64,
 ) {
+    let percent_denominator_ns = kernel_percent_denominator_ns(kernels, total_duration_ns);
     for kernel in kernels {
-        if total_duration_ns > 0 {
+        if percent_denominator_ns > 0 {
             kernel.percent_of_total =
-                (kernel.synthetic_duration_ns as f64 / total_duration_ns as f64) * 100.0;
+                (kernel.synthetic_duration_ns as f64 / percent_denominator_ns as f64) * 100.0;
         }
 
         let Some(samples) = samples_by_name.get(&kernel.name) else {
@@ -104,6 +105,15 @@ fn finalize_kernel_timings(
     }
 }
 
+fn kernel_percent_denominator_ns(kernels: &[KernelTiming], total_duration_ns: u64) -> u64 {
+    kernels
+        .iter()
+        .fold(0u64, |sum, kernel| {
+            sum.saturating_add(kernel.synthetic_duration_ns)
+        })
+        .max(total_duration_ns)
+}
+
 fn percentile_nearest_rank(sorted_samples: &[u64], percentile: u64) -> u64 {
     if sorted_samples.is_empty() {
         return 0;
@@ -114,7 +124,15 @@ fn percentile_nearest_rank(sorted_samples: &[u64], percentile: u64) -> u64 {
 }
 
 pub fn report(trace: &TraceBundle) -> Result<TimingReport> {
-    if let Ok(summary) = profiler::stream_data_summary(&trace.path) {
+    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    report_with_profiler_summary(trace, profiler_summary.as_ref())
+}
+
+pub fn report_with_profiler_summary(
+    trace: &TraceBundle,
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+) -> Result<TimingReport> {
+    if let Some(summary) = profiler_summary {
         return Ok(report_from_profiler(trace, &summary));
     }
     if let Ok(raw_timings) = profiler::raw_encoder_timings(&trace.path)
@@ -498,6 +516,13 @@ pub fn format_report(report: &TimingReport) -> String {
         out.push_str(
             "Kernel, dispatch, and encoder timing come from streamData; command-buffer rows prefer APSTimelineData spans when present.\n\n",
         );
+        if kernel_percent_denominator_ns(&report.kernels, report.total_duration_ns)
+            > report.total_duration_ns
+        {
+            out.push_str(
+                "Kernel percentages are shares of summed profiler dispatch time because attributed dispatch durations exceed wall-clock GPU time.\n\n",
+            );
+        }
     } else {
         out.push_str("Raw-profiler timing report\n");
         out.push_str(
@@ -664,6 +689,41 @@ mod tests {
         assert_eq!(percentile_nearest_rank(&[10, 20, 30, 40], 50), 20);
         assert_eq!(percentile_nearest_rank(&[10, 20, 30, 40], 95), 40);
         assert_eq!(percentile_nearest_rank(&[10], 99), 10);
+    }
+
+    #[test]
+    fn kernel_percent_denominator_uses_summed_dispatch_time_when_larger() {
+        let mut kernels = vec![
+            KernelTiming {
+                name: "a".into(),
+                dispatch_count: 1,
+                synthetic_duration_ns: 1_500,
+                percent_of_total: 0.0,
+                min_duration_ns: 0,
+                max_duration_ns: 0,
+                avg_duration_ns: 0.0,
+                p50_duration_ns: 0,
+                p95_duration_ns: 0,
+                p99_duration_ns: 0,
+            },
+            KernelTiming {
+                name: "b".into(),
+                dispatch_count: 1,
+                synthetic_duration_ns: 500,
+                percent_of_total: 0.0,
+                min_duration_ns: 0,
+                max_duration_ns: 0,
+                avg_duration_ns: 0.0,
+                p50_duration_ns: 0,
+                p95_duration_ns: 0,
+                p99_duration_ns: 0,
+            },
+        ];
+
+        finalize_kernel_timings(&mut kernels, &BTreeMap::new(), 1_000);
+
+        assert_eq!(kernels[0].percent_of_total, 75.0);
+        assert_eq!(kernels[1].percent_of_total, 25.0);
     }
 
     #[test]

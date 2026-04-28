@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Cursor;
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use plist::{Dictionary, Uid, Value};
 use rquickjs::{Context, Runtime};
@@ -15,6 +16,13 @@ use crate::xcode_counters;
 
 type SampleBlob = (String, Vec<u8>);
 type CounterSchemaByGroup = BTreeMap<usize, Vec<String>>;
+
+#[derive(Debug, Clone, Default)]
+struct StreamArchiveGroups {
+    aps_data: Vec<Vec<u8>>,
+    aps_counter_data: Vec<Vec<u8>>,
+    aps_timeline_data: Vec<Vec<u8>>,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CounterLimiter {
@@ -69,6 +77,7 @@ pub struct RawCounterProbeReport {
 pub struct RawCountersReport {
     pub trace_source: PathBuf,
     pub profiler_directory: PathBuf,
+    pub timings: Vec<RawCounterDecodeTiming>,
     pub aggregate_metadata: Vec<RawCounterAggregateMetadata>,
     pub sample_trace_indices: Vec<RawCounterSampleTraceIndex>,
     pub trace_maps: Vec<RawCounterTraceMapEntry>,
@@ -82,6 +91,12 @@ pub struct RawCountersReport {
     pub grouped_derived_metrics: Vec<RawCounterJsDerivedMetricGroup>,
     pub encoder_sample_metrics: Vec<RawCounterEncoderSampleMetric>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterDecodeTiming {
+    pub stage: String,
+    pub ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -295,6 +310,15 @@ pub struct ProfilingAddressFileSummary {
     pub byte_len: usize,
     pub full_address_hits: usize,
     pub low32_address_hits: usize,
+}
+
+#[derive(Debug)]
+struct ProfilingAddressFileProbe {
+    file_summary: ProfilingAddressFileSummary,
+    full_hits: Vec<usize>,
+    low32_hits: Vec<usize>,
+    first_full_offsets: Vec<Option<usize>>,
+    first_low32_offsets: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -554,98 +578,173 @@ pub fn probe_raw_counters(
 }
 
 pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersReport> {
+    let mut timings = Vec::new();
+    let profiler_directory_start = Instant::now();
     let profiler_directory = profiler::find_profiler_directory(&trace.path)
         .ok_or_else(|| crate::Error::NotFound(trace.path.clone()))?;
-    let (schema_map, fallback_counter_names, _) =
-        counter_schemas_and_sample_blobs(&trace.path).unwrap_or_default();
-    let catalog = load_agx_counter_catalog();
-    let aggregate_metadata = probe_aggregate_counter_metadata(&trace.path);
-    let sample_trace_indices = probe_sample_trace_indices(&trace.path);
-    let trace_maps = probe_trace_maps(&trace.path);
-    let program_address_mappings = probe_program_address_mappings(&trace.path);
-    let profiling_address_summary = probe_profiling_addresses(trace).ok();
-    let counter_info = probe_counter_info_entries(&trace.path);
-    let structured_layouts = probe_structured_counter_layouts(&trace.path);
-    let normalized_counters = probe_normalized_counter_metrics(&trace.path);
+    timings.push(raw_counter_decode_timing(
+        "find profiler directory",
+        profiler_directory_start,
+    ));
+    let stream_groups =
+        measure_raw_counter_stage(&mut timings, "load streamData APS archives", || {
+            load_stream_archive_groups(&trace.path).unwrap_or_default()
+        });
+    let (schema_map, fallback_counter_names, sample_blobs) =
+        measure_raw_counter_stage(&mut timings, "decode counter schemas/sample blobs", || {
+            counter_schemas_and_sample_blobs_from_groups(&stream_groups)
+        });
+    let catalog = measure_raw_counter_stage(&mut timings, "load AGX counter catalog", || {
+        load_agx_counter_catalog()
+    });
+    let profiler_summary =
+        measure_raw_counter_stage(&mut timings, "profiler streamData summary", || {
+            profiler::stream_data_summary(&trace.path).ok()
+        });
+    let aggregate_metadata =
+        measure_raw_counter_stage(&mut timings, "decode APS aggregate metadata", || {
+            probe_aggregate_counter_metadata_from_groups(&stream_groups)
+        });
+    let sample_trace_indices =
+        measure_raw_counter_stage(&mut timings, "decode sample trace indices", || {
+            probe_sample_trace_indices_from_groups(&stream_groups)
+        });
+    let trace_maps = measure_raw_counter_stage(&mut timings, "decode trace maps", || {
+        probe_trace_maps_from_groups(&stream_groups)
+    });
+    let program_address_mappings =
+        measure_raw_counter_stage(&mut timings, "decode program address mappings", || {
+            probe_program_address_mappings_from_groups(&stream_groups)
+        });
+    let profiling_address_summary =
+        measure_raw_counter_stage(&mut timings, "scan Profiling_f address hits", || {
+            probe_profiling_addresses(trace).ok()
+        });
+    let counter_info =
+        measure_raw_counter_stage(&mut timings, "decode counter info entries", || {
+            probe_counter_info_entries_from_groups(&stream_groups)
+        });
+    let structured_layouts =
+        measure_raw_counter_stage(&mut timings, "decode structured counter layouts", || {
+            probe_structured_counter_layouts_from_groups(&stream_groups)
+        });
+    let normalized_counters =
+        measure_raw_counter_stage(&mut timings, "normalize GPRW counter metrics", || {
+            probe_normalized_counter_metrics_from_parts(
+                &schema_map,
+                &fallback_counter_names,
+                &sample_blobs,
+            )
+        });
     let encoder_sample_metrics =
-        raw_counter_encoder_sample_metrics(&trace.path, &aggregate_metadata, &catalog);
-    let js_variables = raw_counter_js_variables(&trace.path);
-    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
-    let js_variable_groups = raw_counter_js_variable_groups(
-        &trace.path,
-        &aggregate_metadata,
-        profiler_summary
-            .as_ref()
-            .map(|summary| summary.dispatches.as_slice())
-            .unwrap_or(&[]),
+        measure_raw_counter_stage(&mut timings, "build encoder sample metrics", || {
+            raw_counter_encoder_sample_metrics_from_parts(
+                &schema_map,
+                &fallback_counter_names,
+                &sample_blobs,
+                &aggregate_metadata,
+                &catalog,
+            )
+        });
+    let js_variables = measure_raw_counter_stage(&mut timings, "aggregate JS variables", || {
+        raw_counter_js_variables_from_parts(&schema_map, &fallback_counter_names, &sample_blobs)
+    });
+    let js_variable_groups = measure_raw_counter_stage(
+        &mut timings,
+        "group JS variables by encoder/dispatch",
+        || {
+            raw_counter_js_variable_groups_from_parts(
+                &schema_map,
+                &fallback_counter_names,
+                &sample_blobs,
+                &aggregate_metadata,
+                profiler_summary
+                    .as_ref()
+                    .map(|summary| summary.dispatches.as_slice())
+                    .unwrap_or(&[]),
+            )
+        },
     );
-    let device_identifier = trace_agx_device_identifier(&trace.path);
+    let device_identifier = measure_raw_counter_stage(&mut timings, "identify AGX device", || {
+        trace_agx_device_identifier(&trace.path)
+    });
     let derived_metrics =
-        evaluate_agx_derived_metrics(&catalog, &js_variables, device_identifier.as_deref());
-    let grouped_derived_metrics = evaluate_agx_derived_metric_groups(
-        &catalog,
-        js_variable_groups,
-        device_identifier.as_deref(),
-    );
-    let schemas = schema_map
-        .iter()
-        .map(|(sample_group, counter_names)| RawCounterSchema {
-            sample_group: *sample_group,
-            counter_count: counter_names.len(),
-            counter_names: counter_names.clone(),
-        })
-        .collect::<Vec<_>>();
-    let streams = structured_layouts
-        .iter()
-        .map(|layout| {
-            let path_ids = parse_derived_counter_sample_path(&layout.path);
-            RawCounterDecodedStream {
-                path: layout.path.clone(),
-                sample_group: path_ids.sample_group,
-                source_index: path_ids.source_index,
-                ring_index: path_ids.ring_index,
-                byte_len: layout.byte_len,
-                record_size: layout.gprw_record_size,
-                record_count: layout.gprw_record_count,
-                counter_count: path_ids
-                    .sample_group
-                    .and_then(|group| schema_map.get(&group))
-                    .map(Vec::len),
-            }
-        })
-        .collect::<Vec<_>>();
-    let metrics = normalized_counters
-        .into_iter()
-        .map(|metric| {
-            let derived_counter_matches = catalog
-                .derived_by_hash
-                .get(&metric.raw_name)
-                .cloned()
-                .unwrap_or_default();
-            let hardware_selectors = catalog
-                .hardware_by_hash
-                .get(&metric.raw_name)
-                .cloned()
-                .unwrap_or_default();
-            RawCounterDecodedMetric {
-                path: metric.path,
-                sample_group: metric.sample_group,
-                source_index: metric.source_index,
-                ring_index: metric.ring_index,
-                counter_index: metric.counter_index,
-                raw_name: metric.raw_name,
-                sample_count: metric.sample_count,
-                min_percent_of_gpu_cycles: metric.min_percent,
-                mean_percent_of_gpu_cycles: metric.mean_percent,
-                max_percent_of_gpu_cycles: metric.max_percent,
-                encoder_ids: metric.encoder_ids,
-                kick_trace_ids: metric.kick_trace_ids,
-                source_ids: metric.source_ids,
-                derived_counter_matches,
-                hardware_selectors,
-            }
-        })
-        .collect::<Vec<_>>();
+        measure_raw_counter_stage(&mut timings, "evaluate AGX derived metrics", || {
+            evaluate_agx_derived_metrics(&catalog, &js_variables, device_identifier.as_deref())
+        });
+    let grouped_derived_metrics =
+        measure_raw_counter_stage(&mut timings, "evaluate grouped AGX derived metrics", || {
+            evaluate_agx_derived_metric_groups(
+                &catalog,
+                js_variable_groups,
+                device_identifier.as_deref(),
+            )
+        });
+    let schemas = measure_raw_counter_stage(&mut timings, "materialize schemas", || {
+        schema_map
+            .iter()
+            .map(|(sample_group, counter_names)| RawCounterSchema {
+                sample_group: *sample_group,
+                counter_count: counter_names.len(),
+                counter_names: counter_names.clone(),
+            })
+            .collect::<Vec<_>>()
+    });
+    let streams = measure_raw_counter_stage(&mut timings, "materialize streams", || {
+        structured_layouts
+            .iter()
+            .map(|layout| {
+                let path_ids = parse_derived_counter_sample_path(&layout.path);
+                RawCounterDecodedStream {
+                    path: layout.path.clone(),
+                    sample_group: path_ids.sample_group,
+                    source_index: path_ids.source_index,
+                    ring_index: path_ids.ring_index,
+                    byte_len: layout.byte_len,
+                    record_size: layout.gprw_record_size,
+                    record_count: layout.gprw_record_count,
+                    counter_count: path_ids
+                        .sample_group
+                        .and_then(|group| schema_map.get(&group))
+                        .map(Vec::len),
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    let metrics = measure_raw_counter_stage(&mut timings, "materialize decoded metrics", || {
+        normalized_counters
+            .into_iter()
+            .map(|metric| {
+                let derived_counter_matches = catalog
+                    .derived_by_hash
+                    .get(&metric.raw_name)
+                    .cloned()
+                    .unwrap_or_default();
+                let hardware_selectors = catalog
+                    .hardware_by_hash
+                    .get(&metric.raw_name)
+                    .cloned()
+                    .unwrap_or_default();
+                RawCounterDecodedMetric {
+                    path: metric.path,
+                    sample_group: metric.sample_group,
+                    source_index: metric.source_index,
+                    ring_index: metric.ring_index,
+                    counter_index: metric.counter_index,
+                    raw_name: metric.raw_name,
+                    sample_count: metric.sample_count,
+                    min_percent_of_gpu_cycles: metric.min_percent,
+                    mean_percent_of_gpu_cycles: metric.mean_percent,
+                    max_percent_of_gpu_cycles: metric.max_percent,
+                    encoder_ids: metric.encoder_ids,
+                    kick_trace_ids: metric.kick_trace_ids,
+                    source_ids: metric.source_ids,
+                    derived_counter_matches,
+                    hardware_selectors,
+                }
+            })
+            .collect::<Vec<_>>()
+    });
     let mut warnings = Vec::new();
     if schemas.is_empty() && !fallback_counter_names.is_empty() {
         warnings.push(
@@ -682,6 +781,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
     Ok(RawCountersReport {
         trace_source: trace.path.clone(),
         profiler_directory,
+        timings,
         aggregate_metadata,
         sample_trace_indices,
         trace_maps,
@@ -696,6 +796,24 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         encoder_sample_metrics,
         warnings,
     })
+}
+
+fn measure_raw_counter_stage<T>(
+    timings: &mut Vec<RawCounterDecodeTiming>,
+    stage: &str,
+    build: impl FnOnce() -> T,
+) -> T {
+    let start = Instant::now();
+    let value = build();
+    timings.push(raw_counter_decode_timing(stage, start));
+    value
+}
+
+fn raw_counter_decode_timing(stage: &str, start: Instant) -> RawCounterDecodeTiming {
+    RawCounterDecodeTiming {
+        stage: stage.to_owned(),
+        ms: start.elapsed().as_secs_f64() * 1_000.0,
+    }
 }
 
 pub fn probe_profiling_addresses(
@@ -726,36 +844,18 @@ pub fn probe_profiling_addresses(
         .collect::<Vec<_>>();
     files.sort_by_key(|(file_index, _, _)| *file_index);
 
-    for (file_index, file_name, path) in files {
-        let data = fs::read(path)?;
-        let mut file_full_hits = 0usize;
-        let mut file_low32_hits = 0usize;
-
-        for offset in (0..data.len().saturating_sub(7)).step_by(4) {
-            let value = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-            if let Some(mapping_index) = find_address_range(&ranges, value) {
-                full_hits[mapping_index] += 1;
-                file_full_hits += 1;
-                first_full_offsets[mapping_index].get_or_insert(offset);
+    for probe in probe_profiling_address_files(files, &ranges, &low32_ranges, mappings.len())? {
+        for mapping_index in 0..mappings.len() {
+            full_hits[mapping_index] += probe.full_hits[mapping_index];
+            low32_hits[mapping_index] += probe.low32_hits[mapping_index];
+            if first_full_offsets[mapping_index].is_none() {
+                first_full_offsets[mapping_index] = probe.first_full_offsets[mapping_index];
+            }
+            if first_low32_offsets[mapping_index].is_none() {
+                first_low32_offsets[mapping_index] = probe.first_low32_offsets[mapping_index];
             }
         }
-
-        for offset in (0..data.len().saturating_sub(3)).step_by(4) {
-            let value = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-            if let Some(mapping_index) = find_low32_address_range(&low32_ranges, value) {
-                low32_hits[mapping_index] += 1;
-                file_low32_hits += 1;
-                first_low32_offsets[mapping_index].get_or_insert(offset);
-            }
-        }
-
-        file_summaries.push(ProfilingAddressFileSummary {
-            file_index,
-            file_name,
-            byte_len: data.len(),
-            full_address_hits: file_full_hits,
-            low32_address_hits: file_low32_hits,
-        });
+        file_summaries.push(probe.file_summary);
     }
 
     Ok(ProfilingAddressProbeReport {
@@ -777,6 +877,105 @@ pub fn probe_profiling_addresses(
         ),
         top_shader_low32_hits: top_shader_low32_hits(trace, &mappings, &low32_hits),
         top_function_low32_hits: top_function_low32_hits(trace, &mappings, &low32_hits),
+    })
+}
+
+fn probe_profiling_address_files(
+    files: Vec<(usize, String, PathBuf)>,
+    ranges: &[ProfilingAddressRange],
+    low32_ranges: &[ProfilingLow32AddressRange],
+    mapping_count: usize,
+) -> crate::Result<Vec<ProfilingAddressFileProbe>> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(files.len())
+        .max(1);
+    let chunk_size = files.len().div_ceil(worker_count);
+    let mut probes = Vec::with_capacity(files.len());
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in files.chunks(chunk_size) {
+            let jobs = chunk.to_vec();
+            handles.push(scope.spawn(move || {
+                jobs.into_iter()
+                    .map(|(file_index, file_name, path)| {
+                        probe_profiling_address_file(
+                            file_index,
+                            file_name,
+                            &path,
+                            ranges,
+                            low32_ranges,
+                            mapping_count,
+                        )
+                    })
+                    .collect::<crate::Result<Vec<_>>>()
+            }));
+        }
+
+        for handle in handles {
+            let mut result = handle
+                .join()
+                .map_err(|_| crate::Error::InvalidTrace("profiling address worker panicked"))??;
+            probes.append(&mut result);
+        }
+        Ok::<(), crate::Error>(())
+    })?;
+
+    probes.sort_by_key(|probe| probe.file_summary.file_index);
+    Ok(probes)
+}
+
+fn probe_profiling_address_file(
+    file_index: usize,
+    file_name: String,
+    path: &Path,
+    ranges: &[ProfilingAddressRange],
+    low32_ranges: &[ProfilingLow32AddressRange],
+    mapping_count: usize,
+) -> crate::Result<ProfilingAddressFileProbe> {
+    let data = fs::read(path)?;
+    let mut full_hits = vec![0usize; mapping_count];
+    let mut low32_hits = vec![0usize; mapping_count];
+    let mut first_full_offsets = vec![None; mapping_count];
+    let mut first_low32_offsets = vec![None; mapping_count];
+    let mut file_full_hits = 0usize;
+    let mut file_low32_hits = 0usize;
+
+    for offset in (0..data.len().saturating_sub(7)).step_by(4) {
+        let value = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        if let Some(mapping_index) = find_address_range(ranges, value) {
+            full_hits[mapping_index] += 1;
+            file_full_hits += 1;
+            first_full_offsets[mapping_index].get_or_insert(offset);
+        }
+    }
+
+    for offset in (0..data.len().saturating_sub(3)).step_by(4) {
+        let value = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        if let Some(mapping_index) = find_low32_address_range(low32_ranges, value) {
+            low32_hits[mapping_index] += 1;
+            file_low32_hits += 1;
+            first_low32_offsets[mapping_index].get_or_insert(offset);
+        }
+    }
+
+    Ok(ProfilingAddressFileProbe {
+        file_summary: ProfilingAddressFileSummary {
+            file_index,
+            file_name,
+            byte_len: data.len(),
+            full_address_hits: file_full_hits,
+            low32_address_hits: file_low32_hits,
+        },
+        full_hits,
+        low32_hits,
+        first_full_offsets,
+        first_low32_offsets,
     })
 }
 
@@ -855,6 +1054,13 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
         report.derived_metrics.len(),
         report.grouped_derived_metrics.len()
     ));
+    if !report.timings.is_empty() {
+        out.push_str("Decode timings:\n");
+        for timing in &report.timings {
+            out.push_str(&format!("  {}: {:.1} ms\n", timing.stage, timing.ms));
+        }
+        out.push('\n');
+    }
     for warning in &report.warnings {
         out.push_str(&format!("warning: {warning}\n"));
     }
@@ -2147,12 +2353,11 @@ fn is_javascript_identifier(value: &str) -> bool {
     chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
 }
 
-fn raw_counter_js_variables(trace_path: &Path) -> BTreeMap<String, f64> {
-    let Some((counter_schemas, fallback_counter_names, sample_blobs)) =
-        counter_schemas_and_sample_blobs(trace_path)
-    else {
-        return BTreeMap::new();
-    };
+fn raw_counter_js_variables_from_parts(
+    counter_schemas: &CounterSchemaByGroup,
+    fallback_counter_names: &[String],
+    sample_blobs: &[SampleBlob],
+) -> BTreeMap<String, f64> {
     if counter_schemas.is_empty() && fallback_counter_names.is_empty() {
         return BTreeMap::new();
     }
@@ -2165,15 +2370,15 @@ fn raw_counter_js_variables(trace_path: &Path) -> BTreeMap<String, f64> {
         let Some((record_size, _)) = gprw_record_info(&data) else {
             continue;
         };
-        let records = gprw_u64_records(&data, record_size);
+        let records = gprw_u64_records(data, record_size);
         if records.is_empty() {
             continue;
         }
         let path_ids = parse_derived_counter_sample_path(&path);
         let Some(counter_names) = path_ids
             .sample_group
-            .and_then(|group| counter_schemas.get(&group))
-            .or((!fallback_counter_names.is_empty()).then_some(&fallback_counter_names))
+            .and_then(|group| counter_schemas.get(&group).map(Vec::as_slice))
+            .or((!fallback_counter_names.is_empty()).then_some(fallback_counter_names))
         else {
             continue;
         };
@@ -2208,16 +2413,13 @@ fn raw_counter_js_variables(trace_path: &Path) -> BTreeMap<String, f64> {
     variables
 }
 
-fn raw_counter_js_variable_groups(
-    trace_path: &Path,
+fn raw_counter_js_variable_groups_from_parts(
+    counter_schemas: &CounterSchemaByGroup,
+    fallback_counter_names: &[String],
+    sample_blobs: &[SampleBlob],
     aggregate_metadata: &[RawCounterAggregateMetadata],
     profiler_dispatches: &[profiler::ProfilerDispatch],
 ) -> Vec<RawCounterJsVariableGroup> {
-    let Some((counter_schemas, fallback_counter_names, sample_blobs)) =
-        counter_schemas_and_sample_blobs(trace_path)
-    else {
-        return Vec::new();
-    };
     if counter_schemas.is_empty() && fallback_counter_names.is_empty() {
         return Vec::new();
     }
@@ -2239,15 +2441,15 @@ fn raw_counter_js_variable_groups(
         let Some((record_size, _)) = gprw_record_info(&data) else {
             continue;
         };
-        let records = gprw_u64_records(&data, record_size);
+        let records = gprw_u64_records(data, record_size);
         if records.is_empty() {
             continue;
         }
         let path_ids = parse_derived_counter_sample_path(&path);
         let Some(counter_names) = path_ids
             .sample_group
-            .and_then(|group| counter_schemas.get(&group))
-            .or((!fallback_counter_names.is_empty()).then_some(&fallback_counter_names))
+            .and_then(|group| counter_schemas.get(&group).map(Vec::as_slice))
+            .or((!fallback_counter_names.is_empty()).then_some(fallback_counter_names))
         else {
             continue;
         };
@@ -2444,16 +2646,13 @@ fn records_in_tick_window(
     })
 }
 
-fn raw_counter_encoder_sample_metrics(
-    trace_path: &Path,
+fn raw_counter_encoder_sample_metrics_from_parts(
+    counter_schemas: &CounterSchemaByGroup,
+    fallback_counter_names: &[String],
+    sample_blobs: &[SampleBlob],
     aggregate_metadata: &[RawCounterAggregateMetadata],
     catalog: &RawCounterCatalog,
 ) -> Vec<RawCounterEncoderSampleMetric> {
-    let Some((counter_schemas, fallback_counter_names, sample_blobs)) =
-        counter_schemas_and_sample_blobs(trace_path)
-    else {
-        return Vec::new();
-    };
     if counter_schemas.is_empty() && fallback_counter_names.is_empty() {
         return Vec::new();
     }
@@ -2476,15 +2675,15 @@ fn raw_counter_encoder_sample_metrics(
         let Some((record_size, _)) = gprw_record_info(&data) else {
             continue;
         };
-        let records = gprw_u64_records(&data, record_size);
+        let records = gprw_u64_records(data, record_size);
         if records.is_empty() {
             continue;
         }
         let path_ids = parse_derived_counter_sample_path(&path);
         let Some(counter_names) = path_ids
             .sample_group
-            .and_then(|group| counter_schemas.get(&group))
-            .or((!fallback_counter_names.is_empty()).then_some(&fallback_counter_names))
+            .and_then(|group| counter_schemas.get(&group).map(Vec::as_slice))
+            .or((!fallback_counter_names.is_empty()).then_some(fallback_counter_names))
         else {
             continue;
         };
@@ -3229,28 +3428,21 @@ fn format_u64_hex_list(values: &[u64], limit: usize) -> String {
 }
 
 fn probe_aggregate_counter_metadata(trace_path: &Path) -> Vec<RawCounterAggregateMetadata> {
-    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
-        return Vec::new();
-    };
-    let stream_data_path = profiler_dir.join("streamData");
-    let Ok(plist) = Value::from_file(stream_data_path) else {
-        return Vec::new();
-    };
-    let Some(archive) = plist.as_dictionary() else {
-        return Vec::new();
-    };
-    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
-        return Vec::new();
-    };
+    load_stream_archive_groups(trace_path)
+        .as_ref()
+        .map(probe_aggregate_counter_metadata_from_groups)
+        .unwrap_or_default()
+}
 
-    ns_data_array_from_root_key(objects, root, "APSCounterData")
-        .into_iter()
+fn probe_aggregate_counter_metadata_from_groups(
+    groups: &StreamArchiveGroups,
+) -> Vec<RawCounterAggregateMetadata> {
+    groups
+        .aps_counter_data
+        .iter()
         .enumerate()
         .filter_map(|(archive_index, bytes)| {
-            let keyed = parse_keyed_archive_dictionary(&bytes)?;
+            let keyed = parse_keyed_archive_dictionary(bytes)?;
             if !keyed.contains_key("Derived Counter Sample Data") {
                 return None;
             }
@@ -3281,29 +3473,18 @@ fn probe_aggregate_counter_metadata(trace_path: &Path) -> Vec<RawCounterAggregat
 }
 
 fn probe_counter_info_entries(trace_path: &Path) -> Vec<RawCounterInfoEntry> {
-    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
-        return Vec::new();
-    };
-    let stream_data_path = profiler_dir.join("streamData");
-    let Ok(plist) = Value::from_file(stream_data_path) else {
-        return Vec::new();
-    };
-    let Some(archive) = plist.as_dictionary() else {
-        return Vec::new();
-    };
-    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
-        return Vec::new();
-    };
+    load_stream_archive_groups(trace_path)
+        .as_ref()
+        .map(probe_counter_info_entries_from_groups)
+        .unwrap_or_default()
+}
 
+fn probe_counter_info_entries_from_groups(
+    groups: &StreamArchiveGroups,
+) -> Vec<RawCounterInfoEntry> {
     let mut entries = Vec::new();
-    for (archive_index, bytes) in ns_data_array_from_root_key(objects, root, "APSCounterData")
-        .into_iter()
-        .enumerate()
-    {
-        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+    for (archive_index, bytes) in groups.aps_counter_data.iter().enumerate() {
+        let Some(keyed) = parse_keyed_archive_dictionary(bytes) else {
             continue;
         };
         let Some(counter_info) = keyed
@@ -3338,30 +3519,12 @@ fn probe_counter_info_entries(trace_path: &Path) -> Vec<RawCounterInfoEntry> {
     entries
 }
 
-fn probe_sample_trace_indices(trace_path: &Path) -> Vec<RawCounterSampleTraceIndex> {
-    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
-        return Vec::new();
-    };
-    let stream_data_path = profiler_dir.join("streamData");
-    let Ok(plist) = Value::from_file(stream_data_path) else {
-        return Vec::new();
-    };
-    let Some(archive) = plist.as_dictionary() else {
-        return Vec::new();
-    };
-    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
-        return Vec::new();
-    };
-
+fn probe_sample_trace_indices_from_groups(
+    groups: &StreamArchiveGroups,
+) -> Vec<RawCounterSampleTraceIndex> {
     let mut entries = Vec::new();
-    for (archive_index, bytes) in ns_data_array_from_root_key(objects, root, "APSData")
-        .into_iter()
-        .enumerate()
-    {
-        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+    for (archive_index, bytes) in groups.aps_data.iter().enumerate() {
+        let Some(keyed) = parse_keyed_archive_dictionary(bytes) else {
             continue;
         };
         let Some(data) = keyed
@@ -3380,24 +3543,7 @@ fn probe_sample_trace_indices(trace_path: &Path) -> Vec<RawCounterSampleTraceInd
     entries
 }
 
-fn probe_trace_maps(trace_path: &Path) -> Vec<RawCounterTraceMapEntry> {
-    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
-        return Vec::new();
-    };
-    let stream_data_path = profiler_dir.join("streamData");
-    let Ok(plist) = Value::from_file(stream_data_path) else {
-        return Vec::new();
-    };
-    let Some(archive) = plist.as_dictionary() else {
-        return Vec::new();
-    };
-    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
-        return Vec::new();
-    };
-
+fn probe_trace_maps_from_groups(groups: &StreamArchiveGroups) -> Vec<RawCounterTraceMapEntry> {
     let map_names = [
         "TraceId to BatchId",
         "TraceId to Coalesced BatchId",
@@ -3408,11 +3554,8 @@ fn probe_trace_maps(trace_path: &Path) -> Vec<RawCounterTraceMapEntry> {
         "MTLFX TraceIds",
     ];
     let mut entries = Vec::new();
-    for (archive_index, bytes) in ns_data_array_from_root_key(objects, root, "APSData")
-        .into_iter()
-        .enumerate()
-    {
-        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+    for (archive_index, bytes) in groups.aps_data.iter().enumerate() {
+        let Some(keyed) = parse_keyed_archive_dictionary(bytes) else {
             continue;
         };
         for map_name in map_names {
@@ -3698,29 +3841,18 @@ fn top_function_low32_hits(
 }
 
 fn probe_program_address_mappings(trace_path: &Path) -> Vec<RawCounterProgramAddressMapping> {
-    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
-        return Vec::new();
-    };
-    let stream_data_path = profiler_dir.join("streamData");
-    let Ok(plist) = Value::from_file(stream_data_path) else {
-        return Vec::new();
-    };
-    let Some(archive) = plist.as_dictionary() else {
-        return Vec::new();
-    };
-    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
-        return Vec::new();
-    };
+    load_stream_archive_groups(trace_path)
+        .as_ref()
+        .map(probe_program_address_mappings_from_groups)
+        .unwrap_or_default()
+}
 
+fn probe_program_address_mappings_from_groups(
+    groups: &StreamArchiveGroups,
+) -> Vec<RawCounterProgramAddressMapping> {
     let mut mappings = Vec::new();
-    for (archive_index, bytes) in ns_data_array_from_root_key(objects, root, "APSData")
-        .into_iter()
-        .enumerate()
-    {
-        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+    for (archive_index, bytes) in groups.aps_data.iter().enumerate() {
+        let Some(keyed) = parse_keyed_archive_dictionary(bytes) else {
             continue;
         };
         let Some(StreamArchiveValue::Array(entries)) = keyed.get("Program Address Mappings") else {
@@ -3944,32 +4076,45 @@ fn parse_encoder_infos(value: &StreamArchiveValue) -> Vec<RawCounterEncoderInfo>
 }
 
 fn probe_stream_archives(trace_path: &Path) -> Vec<RawCounterStreamArchive> {
+    load_stream_archive_groups(trace_path)
+        .as_ref()
+        .map(probe_stream_archives_from_groups)
+        .unwrap_or_default()
+}
+
+fn probe_stream_archives_from_groups(groups: &StreamArchiveGroups) -> Vec<RawCounterStreamArchive> {
+    [
+        ("APSData", &groups.aps_data),
+        ("APSCounterData", &groups.aps_counter_data),
+        ("APSTimelineData", &groups.aps_timeline_data),
+    ]
+    .into_iter()
+    .flat_map(|(group, archives)| {
+        archives
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, bytes)| summarize_stream_archive(group, index, bytes))
+    })
+    .collect()
+}
+
+fn load_stream_archive_groups(trace_path: &Path) -> Option<StreamArchiveGroups> {
     let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
-        return Vec::new();
+        return None;
     };
     let stream_data_path = profiler_dir.join("streamData");
     let Ok(plist) = Value::from_file(stream_data_path) else {
-        return Vec::new();
+        return None;
     };
-    let Some(archive) = plist.as_dictionary() else {
-        return Vec::new();
-    };
-    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
-        return Vec::new();
-    };
+    let archive = plist.as_dictionary()?;
+    let objects = archive.get("$objects").and_then(Value::as_array)?;
+    let root = objects.get(1).and_then(Value::as_dictionary)?;
 
-    ["APSData", "APSCounterData", "APSTimelineData"]
-        .into_iter()
-        .flat_map(|group| {
-            ns_data_array_from_root_key(objects, root, group)
-                .into_iter()
-                .enumerate()
-                .filter_map(move |(index, bytes)| summarize_stream_archive(group, index, &bytes))
-        })
-        .collect()
+    Some(StreamArchiveGroups {
+        aps_data: ns_data_array_from_root_key(objects, root, "APSData"),
+        aps_counter_data: ns_data_array_from_root_key(objects, root, "APSCounterData"),
+        aps_timeline_data: ns_data_array_from_root_key(objects, root, "APSTimelineData"),
+    })
 }
 
 fn probe_structured_counter_samples(
@@ -4042,29 +4187,18 @@ fn probe_structured_counter_samples(
 }
 
 fn probe_structured_counter_layouts(trace_path: &Path) -> Vec<RawCounterStructuredLayout> {
-    let Some(profiler_dir) = profiler::find_profiler_directory(trace_path) else {
-        return Vec::new();
-    };
-    let stream_data_path = profiler_dir.join("streamData");
-    let Ok(plist) = Value::from_file(stream_data_path) else {
-        return Vec::new();
-    };
-    let Some(archive) = plist.as_dictionary() else {
-        return Vec::new();
-    };
-    let Some(objects) = archive.get("$objects").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let Some(root) = objects.get(1).and_then(Value::as_dictionary) else {
-        return Vec::new();
-    };
+    load_stream_archive_groups(trace_path)
+        .as_ref()
+        .map(probe_structured_counter_layouts_from_groups)
+        .unwrap_or_default()
+}
 
+fn probe_structured_counter_layouts_from_groups(
+    groups: &StreamArchiveGroups,
+) -> Vec<RawCounterStructuredLayout> {
     let mut layouts = Vec::new();
-    for (archive_index, bytes) in ns_data_array_from_root_key(objects, root, "APSCounterData")
-        .into_iter()
-        .enumerate()
-    {
-        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+    for (archive_index, bytes) in groups.aps_counter_data.iter().enumerate() {
+        let Some(keyed) = parse_keyed_archive_dictionary(bytes) else {
             continue;
         };
         let Some(samples) = keyed.get("Derived Counter Sample Data") else {
@@ -4106,6 +4240,18 @@ fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormaliz
     else {
         return Vec::new();
     };
+    probe_normalized_counter_metrics_from_parts(
+        &counter_schemas,
+        &fallback_counter_names,
+        &sample_blobs,
+    )
+}
+
+fn probe_normalized_counter_metrics_from_parts(
+    counter_schemas: &CounterSchemaByGroup,
+    fallback_counter_names: &[String],
+    sample_blobs: &[SampleBlob],
+) -> Vec<RawCounterNormalizedMetric> {
     if counter_schemas.is_empty() && fallback_counter_names.is_empty() {
         return Vec::new();
     }
@@ -4118,15 +4264,15 @@ fn probe_normalized_counter_metrics(trace_path: &Path) -> Vec<RawCounterNormaliz
         let Some((record_size, _)) = gprw_record_info(&data) else {
             continue;
         };
-        let records = gprw_u64_records(&data, record_size);
+        let records = gprw_u64_records(data, record_size);
         if records.is_empty() {
             continue;
         }
         let path_ids = parse_derived_counter_sample_path(&path);
         let Some(counter_names) = path_ids
             .sample_group
-            .and_then(|group| counter_schemas.get(&group))
-            .or((!fallback_counter_names.is_empty()).then_some(&fallback_counter_names))
+            .and_then(|group| counter_schemas.get(&group).map(Vec::as_slice))
+            .or((!fallback_counter_names.is_empty()).then_some(fallback_counter_names))
         else {
             continue;
         };
@@ -4312,19 +4458,18 @@ fn parse_derived_counter_sample_path(path: &str) -> DerivedCounterSamplePath {
 fn counter_schemas_and_sample_blobs(
     trace_path: &Path,
 ) -> Option<(CounterSchemaByGroup, Vec<String>, Vec<SampleBlob>)> {
-    let profiler_dir = profiler::find_profiler_directory(trace_path)?;
-    let stream_data_path = profiler_dir.join("streamData");
-    let plist = Value::from_file(stream_data_path).ok()?;
-    let archive = plist.as_dictionary()?;
-    let objects = archive.get("$objects").and_then(Value::as_array)?;
-    let root = objects.get(1).and_then(Value::as_dictionary)?;
-    let counter_archives = ns_data_array_from_root_key(objects, root, "APSCounterData");
+    let groups = load_stream_archive_groups(trace_path)?;
+    Some(counter_schemas_and_sample_blobs_from_groups(&groups))
+}
 
+fn counter_schemas_and_sample_blobs_from_groups(
+    groups: &StreamArchiveGroups,
+) -> (CounterSchemaByGroup, Vec<String>, Vec<SampleBlob>) {
     let mut counter_schemas = BTreeMap::new();
     let mut fallback_counter_names = Vec::new();
     let mut sample_blobs = Vec::new();
-    for (archive_index, bytes) in counter_archives.into_iter().enumerate() {
-        let Some(keyed) = parse_keyed_archive_dictionary(&bytes) else {
+    for (archive_index, bytes) in groups.aps_counter_data.iter().enumerate() {
+        let Some(keyed) = parse_keyed_archive_dictionary(bytes) else {
             continue;
         };
         if fallback_counter_names.is_empty()
@@ -4345,7 +4490,7 @@ fn counter_schemas_and_sample_blobs(
             );
         }
     }
-    Some((counter_schemas, fallback_counter_names, sample_blobs))
+    (counter_schemas, fallback_counter_names, sample_blobs)
 }
 
 fn counter_schemas_from_subdivided_dictionary(value: &StreamArchiveValue) -> CounterSchemaByGroup {
@@ -5628,6 +5773,7 @@ mod tests {
         let report = RawCountersReport {
             trace_source: PathBuf::from("trace.gputrace"),
             profiler_directory: PathBuf::from("trace.gputrace/raw"),
+            timings: Vec::new(),
             aggregate_metadata: Vec::new(),
             sample_trace_indices: Vec::new(),
             trace_maps: Vec::new(),
@@ -5738,6 +5884,7 @@ mod tests {
         let report = RawCountersReport {
             trace_source: PathBuf::from("trace.gputrace"),
             profiler_directory: PathBuf::from("trace.gputrace/raw"),
+            timings: Vec::new(),
             aggregate_metadata: Vec::new(),
             sample_trace_indices: Vec::new(),
             trace_maps: Vec::new(),
@@ -5766,6 +5913,7 @@ mod tests {
         let report = RawCountersReport {
             trace_source: PathBuf::from("trace.gputrace"),
             profiler_directory: PathBuf::from("trace.gputrace/raw"),
+            timings: Vec::new(),
             aggregate_metadata: Vec::new(),
             sample_trace_indices: Vec::new(),
             trace_maps: Vec::new(),

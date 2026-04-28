@@ -21,6 +21,9 @@ installer reports that Accessibility is not granted, enable
 ## Quick Start
 
 ```bash
+# One-shot agent-readable report directory.
+gputrace report trace-perfdata.gputrace --output trace-report
+
 # High-level trace structure.
 gputrace stats trace.gputrace
 gputrace analyze trace.gputrace
@@ -28,7 +31,8 @@ gputrace analyze trace.gputrace
 # Profiler and timing summaries when .gpuprofiler_raw data is present.
 gputrace profiler trace-perfdata.gputrace --format json
 gputrace profiler-coverage trace-perfdata.gputrace --format text
-gputrace xcode-mio trace-perfdata.gputrace --format json
+gputrace xcode-mio trace-perfdata.gputrace
+gputrace xcode-mio trace-perfdata.gputrace --format summary-json
 gputrace timing trace-perfdata.gputrace --format csv
 
 # Xcode-exported counter CSV analysis.
@@ -57,11 +61,19 @@ gputrace diff --bench-dir /path/to/bench-traces --quick --by-encoder
 
 # Xcode profile automation.
 gputrace xcode-check-permissions
-gputrace xcode-profile run trace.gputrace --output trace-perfdata.gputrace
+gputrace profile trace.gputrace --output trace-perfdata.gputrace
 ```
 
 `xcode-counters` auto-discovers only exact trace-name CSV matches. Pass `--csv`
 when a directory contains unrelated `*Counters.csv` files.
+
+`report` is the preferred entry point for agents. It writes a directory of
+Markdown files (`index.md`, `xcode-mio.md`, `analysis.md`, `insights.md`,
+`profiler.md`, `timing.md`, `shaders.md`, `counters.md`, and coverage notes)
+from one CLI invocation. It loads Xcode's private MIO decoder once and reuses
+that summary across analysis/insights. Legacy structural parser failures are
+listed in `index.md` as diagnostics instead of forcing agents to run those
+commands manually.
 
 `profiler` reports real `streamData` dispatch timing. Its
 `pipeline_id_scan_costs` field is a debug-only scan of `Profiling_f_*` bytes,
@@ -69,8 +81,10 @@ not Xcode's Performance/Cost percentage.
 `xcode-mio` is macOS-only and loads Xcode's private `GTShaderProfiler`
 framework to decode the same exported `streamData` topology Xcode uses:
 GPU command count, encoder count, pipeline list, pipeline object ids, pipeline
-addresses, and function names. It intentionally reports unresolved cost records
-as counts rather than presenting them as Xcode Cost percentages.
+addresses, function names, and shader-binary references. The default output is
+an LLM-friendly summary; `--format json` still dumps the full private object
+graph. It intentionally reports unresolved cost records as counts rather than
+presenting them as Xcode Cost percentages.
 `shaders` keeps duration/cost as the primary ranking, but adds `Addr Hits` /
 `profiling_address_hits` when `Profiling_f_*` address samples can be joined
 through APS program-address mappings.
@@ -108,13 +122,13 @@ the raw counter timestamps overlap `streamData` dispatch tick windows.
 
 | Area | Commands |
 | --- | --- |
-| Trace overview | `stats`, `analyze`, `dump`, `dump-records`, `api-calls` |
+| Trace overview | `report`, `stats`, `analyze`, `dump`, `dump-records`, `api-calls` |
 | Profiling and timing | `profiler`, `xcode-mio`, `timing`, `timeline`, `raw-counters`, `xcode-counters`, `export-counters`, `validate-counters` |
 | Diffing | `diff`, `markdown diff` |
 | Shader analysis | `shaders`, `shader-source`, `shader-hotspots`, `correlate` |
 | Command structure | `command-buffers`, `encoders`, `kernels`, `dependencies`, `tree`, `graph`, `fences` |
 | Buffer analysis | `buffers`, `buffer-access`, `buffer-timeline`, `clear-buffers` |
-| Xcode automation | `xcode-profile`, `xcode-status`, `xcode-wait`, `xcode-buttons`, `xcode-tabs`, `xcode-export-counters`, `xcode-export-memory` |
+| Xcode automation | `profile`, `xcode-profile`, `xcode-check-permissions` |
 | Metal libraries | `mtlb`, `mtlb-functions`, `mtlb-stats`, `mtlb-inventory` |
 | Markdown | `markdown render`, `markdown analyze`, `markdown diff`, `markdown buffers`, `markdown buffers-diff` |
 

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use serde::Serialize;
 
@@ -12,6 +13,7 @@ pub struct XcodeMioReport {
     pub profiler_directory: PathBuf,
     pub stream_data_path: PathBuf,
     pub framework_path: PathBuf,
+    pub timings: XcodeMioTimings,
     pub gpu_command_count: usize,
     pub encoder_count: usize,
     pub pipeline_state_count: usize,
@@ -31,6 +33,23 @@ pub struct XcodeMioReport {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct XcodeMioTimings {
+    pub total_ms: f64,
+    pub locate_profiler_ms: f64,
+    pub stream_data_summary_ms: f64,
+    pub framework_load_ms: f64,
+    pub stream_data_load_ms: f64,
+    pub processor_init_ms: f64,
+    pub process_stream_ms: f64,
+    pub extract_result_ms: f64,
+    pub decode_pipeline_commands_ms: f64,
+    pub shader_profiler_probe_ms: f64,
+    pub cost_timeline_request_ms: f64,
+    pub cost_timeline_decode_ms: f64,
+    pub final_metadata_ms: f64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct XcodeMioPipeline {
     pub index: usize,
@@ -46,13 +65,47 @@ pub struct XcodeMioPipeline {
     pub binary_keys: Vec<u64>,
     pub all_binary_keys: Vec<u64>,
     pub shader_stats: Vec<XcodeMioPipelineShaderStat>,
+    pub profiler_timings: Vec<XcodeMioPipelineProfilerTiming>,
     pub scope_costs: Vec<XcodeMioPipelineScopeCost>,
     pub shader_tracks: Vec<XcodeMioPipelineShaderTrack>,
     pub shader_binaries: Vec<XcodeMioPipelineShaderBinary>,
     pub shader_binary_costs: Vec<XcodeMioPipelineShaderBinaryCost>,
+    pub shader_profiler_costs: Vec<XcodeMioPipelineShaderProfilerCost>,
     pub execution_history: Vec<XcodeMioPipelineExecutionHistory>,
     pub shader_binary_references: Vec<XcodeMioPipelineShaderBinaryReference>,
     pub pipeline_counters: Vec<XcodeMioPipelineCounter>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioPipelineProfilerTiming {
+    pub source: &'static str,
+    pub cycle_average: f64,
+    pub cycle_min: f64,
+    pub cycle_max: f64,
+    pub time_average: f64,
+    pub time_min: f64,
+    pub time_max: f64,
+    pub percentage_average: f64,
+    pub percentage_min: f64,
+    pub percentage_max: f64,
+    pub surplus_cycles: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioPipelineShaderProfilerCost {
+    pub binary_key: String,
+    pub full_path: Option<String>,
+    pub type_name: Option<String>,
+    pub shader_type: u32,
+    pub addr_start: u32,
+    pub addr_end: u32,
+    pub total_binary_cost: f64,
+    pub total_binary_samples: u64,
+    pub pipeline_cost: f64,
+    pub pipeline_cost_percent_sum: f64,
+    pub nonzero_draw_count: usize,
+    pub first_draw_index: usize,
+    pub last_draw_index: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -259,23 +312,392 @@ pub struct XcodeMioCostTimeline {
     pub global_gpu_time_ns: u64,
     pub timeline_duration_ns: u64,
     pub total_clique_cost: u64,
+    pub gpu_cost: f64,
+    pub gpu_cost_instruction_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioAnalysisReport {
+    pub backend: &'static str,
+    pub trace_source: PathBuf,
+    pub timings: XcodeMioTimings,
+    pub gpu_time_ns: u64,
+    pub gpu_command_count: usize,
+    pub pipeline_state_count: usize,
+    pub cost_record_count: usize,
+    pub top_pipelines: Vec<XcodeMioPipelineAnalysis>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioPipelineAnalysis {
+    pub pipeline_index: usize,
+    pub object_id: u64,
+    pub pipeline_address: Option<u64>,
+    pub function_name: Option<String>,
+    pub command_count: usize,
+    pub command_percent: f64,
+    pub shader_binary_reference_count: usize,
+    pub executable_shader_binary_reference_count: usize,
+    pub unique_timeline_binary_count: usize,
+    pub referenced_instruction_info_count: u64,
+    pub xcode_time_percent: Option<f64>,
+    pub xcode_time_average: Option<f64>,
+    pub xcode_cycle_average: Option<f64>,
+    pub timeline_duration_ns: u64,
+    pub timeline_duration_percent: Option<f64>,
+    pub timeline_total_cost: f64,
+    pub timeline_cost_percent: Option<f64>,
+    pub shader_profiler_cost: f64,
+    pub shader_profiler_cost_percent: Option<f64>,
+    pub shader_binary_cost: f64,
+    pub shader_binary_cost_percent: Option<f64>,
+    pub execution_top_cost_percent: Option<f64>,
+    pub execution_duration_percent: Option<f64>,
+    pub execution_total_cost: Option<f64>,
+    pub execution_instruction_count: Option<u64>,
+    pub counters: Vec<XcodeMioPipelineCounter>,
+    pub metric_sources: Vec<String>,
 }
 
 pub fn report(trace: &TraceBundle) -> Result<XcodeMioReport> {
+    report_with_profiler_summary(trace, None)
+}
+
+pub fn report_with_profiler_summary(
+    trace: &TraceBundle,
+    precomputed_profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+) -> Result<XcodeMioReport> {
+    let total_start = Instant::now();
+    let locate_start = Instant::now();
     let profiler_directory = profiler::find_profiler_directory(&trace.path)
         .ok_or_else(|| Error::NotFound(trace.path.clone()))?;
+    let locate_profiler_ms = elapsed_ms(locate_start);
     let stream_data_path = profiler_directory.join("streamData");
     if !stream_data_path.is_file() {
         return Err(Error::NotFound(stream_data_path));
     }
 
-    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
-    platform::decode(
+    let summary_start = Instant::now();
+    let profiler_summary_owned;
+    let profiler_summary = if let Some(summary) = precomputed_profiler_summary {
+        Some(summary)
+    } else {
+        profiler_summary_owned = profiler::stream_data_summary(&trace.path).ok();
+        profiler_summary_owned.as_ref()
+    };
+    let mut timings = XcodeMioTimings {
+        locate_profiler_ms,
+        stream_data_summary_ms: elapsed_ms(summary_start),
+        ..XcodeMioTimings::default()
+    };
+    let mut report = platform::decode(
         trace.path.clone(),
         profiler_directory,
         stream_data_path,
-        profiler_summary.as_ref(),
-    )
+        profiler_summary,
+        timings.clone(),
+    )?;
+    timings = report.timings.clone();
+    timings.total_ms = elapsed_ms(total_start);
+    report.timings = timings;
+    Ok(report)
+}
+
+pub fn analysis_report(trace: &TraceBundle) -> Result<XcodeMioAnalysisReport> {
+    Ok(summarize_report(&report(trace)?))
+}
+
+pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
+    let command_denominator = report.gpu_command_count.max(1) as f64;
+    let timeline_duration_denominator = report
+        .cost_timeline
+        .as_ref()
+        .map(|timeline| timeline.global_gpu_time_ns)
+        .filter(|value| *value > 0)
+        .unwrap_or(report.gpu_time_ns);
+    let timeline_cost_denominator = report
+        .pipelines
+        .iter()
+        .map(|pipeline| pipeline.timeline_total_cost)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum::<f64>();
+    let shader_profiler_cost_denominator = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| pipeline.shader_profiler_costs.iter())
+        .map(|cost| cost.pipeline_cost)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum::<f64>();
+    let shader_binary_cost_denominator = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| pipeline.shader_binary_costs.iter())
+        .map(|cost| cost.total_cost)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum::<f64>();
+    let timeline_binaries_by_index = report
+        .timeline_binaries
+        .iter()
+        .map(|binary| (binary.index, binary))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut top_pipelines = report
+        .pipelines
+        .iter()
+        .map(|pipeline| {
+            let best_timing = pipeline.profiler_timings.iter().max_by(|left, right| {
+                left.percentage_average
+                    .partial_cmp(&right.percentage_average)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let shader_profiler_cost = pipeline
+                .shader_profiler_costs
+                .iter()
+                .map(|cost| cost.pipeline_cost)
+                .filter(|value| value.is_finite())
+                .sum::<f64>();
+            let shader_binary_cost = pipeline
+                .shader_binary_costs
+                .iter()
+                .map(|cost| cost.total_cost)
+                .filter(|value| value.is_finite())
+                .sum::<f64>();
+            let best_execution = pipeline.execution_history.iter().max_by(|left, right| {
+                left.top_cost_percentage
+                    .partial_cmp(&right.top_cost_percentage)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let shader_binary_reference_count = pipeline
+                .shader_binary_references
+                .iter()
+                .map(|reference| reference.record_count)
+                .sum::<usize>();
+            let executable_shader_binary_reference_count = pipeline
+                .shader_binary_references
+                .iter()
+                .filter(|reference| reference.raw6 == 28)
+                .map(|reference| reference.record_count)
+                .sum::<usize>();
+            let unique_timeline_binary_count = pipeline
+                .shader_binary_references
+                .iter()
+                .map(|reference| reference.timeline_binary_index.unwrap_or(reference.address))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let referenced_instruction_info_count = pipeline
+                .shader_binary_references
+                .iter()
+                .filter_map(|reference| {
+                    let binary =
+                        timeline_binaries_by_index.get(&reference.timeline_binary_index?)?;
+                    Some(
+                        binary
+                            .instruction_info_count
+                            .saturating_mul(reference.record_count as u64),
+                    )
+                })
+                .fold(0u64, |sum, count| sum.saturating_add(count));
+            let mut counters = pipeline.pipeline_counters.clone();
+            counters.sort_by(|left, right| {
+                right
+                    .value
+                    .abs()
+                    .partial_cmp(&left.value.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+            counters.truncate(8);
+
+            let mut metric_sources = Vec::new();
+            if best_timing
+                .is_some_and(|timing| timing.percentage_average > 0.0 || timing.time_average > 0.0)
+            {
+                metric_sources.push("xcode-profiler-timing".to_owned());
+            }
+            if pipeline.timeline_duration_ns > 0 || pipeline.timeline_total_cost > 0.0 {
+                metric_sources.push("xcode-cost-timeline".to_owned());
+            }
+            if shader_profiler_cost > 0.0 {
+                metric_sources.push("xcode-shader-profiler-cost".to_owned());
+            }
+            if shader_binary_cost > 0.0 {
+                metric_sources.push("xcode-shader-binary-cost".to_owned());
+            }
+            if best_execution.is_some_and(|history| {
+                history.top_cost_percentage > 0.0
+                    || history.duration_percentage > 0.0
+                    || history.total_cost > 0.0
+            }) {
+                metric_sources.push("xcode-execution-history".to_owned());
+            }
+            if !counters.is_empty() {
+                metric_sources.push("xcode-pipeline-counters".to_owned());
+            }
+            if pipeline.gpu_command_count > 0 {
+                metric_sources.push("xcode-gpu-command-topology".to_owned());
+            }
+            if shader_binary_reference_count > 0 {
+                metric_sources.push("xcode-shader-binary-references".to_owned());
+            }
+
+            XcodeMioPipelineAnalysis {
+                pipeline_index: pipeline.index,
+                object_id: pipeline.object_id,
+                pipeline_address: pipeline.pipeline_address,
+                function_name: pipeline.function_name.clone(),
+                command_count: pipeline.gpu_command_count,
+                command_percent: pipeline.gpu_command_count as f64 * 100.0 / command_denominator,
+                shader_binary_reference_count,
+                executable_shader_binary_reference_count,
+                unique_timeline_binary_count,
+                referenced_instruction_info_count,
+                xcode_time_percent: best_timing.map(|timing| timing.percentage_average),
+                xcode_time_average: best_timing.map(|timing| timing.time_average),
+                xcode_cycle_average: best_timing.map(|timing| timing.cycle_average),
+                timeline_duration_ns: pipeline.timeline_duration_ns,
+                timeline_duration_percent: (timeline_duration_denominator > 0
+                    && pipeline.timeline_duration_ns > 0)
+                    .then(|| {
+                        pipeline.timeline_duration_ns as f64 * 100.0
+                            / timeline_duration_denominator as f64
+                    }),
+                timeline_total_cost: pipeline.timeline_total_cost,
+                timeline_cost_percent: (timeline_cost_denominator > 0.0
+                    && pipeline.timeline_total_cost > 0.0)
+                    .then(|| pipeline.timeline_total_cost * 100.0 / timeline_cost_denominator),
+                shader_profiler_cost,
+                shader_profiler_cost_percent: (shader_profiler_cost_denominator > 0.0
+                    && shader_profiler_cost > 0.0)
+                    .then(|| shader_profiler_cost * 100.0 / shader_profiler_cost_denominator),
+                shader_binary_cost,
+                shader_binary_cost_percent: (shader_binary_cost_denominator > 0.0
+                    && shader_binary_cost > 0.0)
+                    .then(|| shader_binary_cost * 100.0 / shader_binary_cost_denominator),
+                execution_top_cost_percent: best_execution
+                    .map(|history| history.top_cost_percentage),
+                execution_duration_percent: best_execution
+                    .map(|history| history.duration_percentage),
+                execution_total_cost: best_execution.map(|history| history.total_cost),
+                execution_instruction_count: best_execution
+                    .map(|history| history.instruction_count),
+                counters,
+                metric_sources,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    top_pipelines.sort_by(|left, right| {
+        pipeline_rank_score(right)
+            .partial_cmp(&pipeline_rank_score(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.command_count.cmp(&left.command_count))
+            .then_with(|| left.pipeline_index.cmp(&right.pipeline_index))
+    });
+
+    XcodeMioAnalysisReport {
+        backend: "xcode-mio",
+        trace_source: report.trace_source.clone(),
+        timings: report.timings.clone(),
+        gpu_time_ns: report.gpu_time_ns,
+        gpu_command_count: report.gpu_command_count,
+        pipeline_state_count: report.pipeline_state_count,
+        cost_record_count: report.cost_record_count,
+        top_pipelines,
+        warnings: report.warnings.clone(),
+    }
+}
+
+pub fn format_analysis_report(report: &XcodeMioAnalysisReport) -> String {
+    let mut out = String::new();
+    out.push_str("Xcode MIO analysis\n");
+    out.push_str(&format!(
+        "backend={} gpu_time={:.3} ms commands={} pipelines={} cost_records={} wall={:.1} ms\n\n",
+        report.backend,
+        report.gpu_time_ns as f64 / 1_000_000.0,
+        report.gpu_command_count,
+        report.pipeline_state_count,
+        report.cost_record_count,
+        report.timings.total_ms,
+    ));
+    out.push_str(&format!(
+        "timings: locate={:.1} ms stream_summary={:.1} ms framework={:.1} ms stream_load={:.1} ms process={:.1} ms extract={:.1} ms topology={:.1} ms probes={:.1} ms cost_request={:.1} ms cost_decode={:.1} ms metadata={:.1} ms\n\n",
+        report.timings.locate_profiler_ms,
+        report.timings.stream_data_summary_ms,
+        report.timings.framework_load_ms,
+        report.timings.stream_data_load_ms,
+        report.timings.process_stream_ms,
+        report.timings.extract_result_ms,
+        report.timings.decode_pipeline_commands_ms,
+        report.timings.shader_profiler_probe_ms,
+        report.timings.cost_timeline_request_ms,
+        report.timings.cost_timeline_decode_ms,
+        report.timings.final_metadata_ms,
+    ));
+    out.push_str(&format!(
+        "{:<42} {:>5} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8}\n",
+        "Function", "Cmds", "Cmd %", "Bins", "ExecBin", "Time %", "TL Cost", "Exec %"
+    ));
+    for pipeline in report.top_pipelines.iter().take(25) {
+        out.push_str(&format!(
+            "{:<42} {:>5} {:>6.2}% {:>7} {:>7} {:>7} {:>7} {:>7}\n",
+            truncate(
+                pipeline
+                    .function_name
+                    .as_deref()
+                    .unwrap_or("<unknown function>"),
+                42,
+            ),
+            pipeline.command_count,
+            pipeline.command_percent,
+            pipeline.unique_timeline_binary_count,
+            pipeline.executable_shader_binary_reference_count,
+            format_optional_percent(pipeline.xcode_time_percent),
+            format_optional_percent(pipeline.timeline_cost_percent),
+            format_optional_percent(pipeline.execution_top_cost_percent),
+        ));
+    }
+    if !report.warnings.is_empty() {
+        out.push_str("\nWarnings:\n");
+        for warning in &report.warnings {
+            out.push_str(&format!("  - {warning}\n"));
+        }
+    }
+    out
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1_000.0
+}
+
+fn pipeline_rank_score(pipeline: &XcodeMioPipelineAnalysis) -> f64 {
+    [
+        pipeline.execution_top_cost_percent,
+        pipeline.shader_profiler_cost_percent,
+        pipeline.timeline_cost_percent,
+        pipeline.timeline_duration_percent,
+        pipeline.xcode_time_percent,
+        Some(pipeline.command_percent),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| value.is_finite())
+    .fold(0.0, f64::max)
+}
+
+fn format_optional_percent(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.2}%"))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.len() <= width {
+        return value.to_owned();
+    }
+    let keep = width.saturating_sub(3);
+    format!("{}...", &value[..keep])
 }
 
 pub fn format_report(report: &XcodeMioReport) -> String {
@@ -297,12 +719,14 @@ pub fn format_report(report: &XcodeMioReport) -> String {
     ));
     if let Some(timeline) = &report.cost_timeline {
         out.push_str(&format!(
-            "cost_timeline: draws={} pipelines={} cost_records={} global_gpu_time={:.3} ms total_clique_cost={}\n",
+            "cost_timeline: draws={} pipelines={} cost_records={} global_gpu_time={:.3} ms total_clique_cost={} gpu_cost={:.3} instr={}\n",
             timeline.draw_count,
             timeline.pipeline_state_count,
             timeline.cost_record_count,
             timeline.global_gpu_time_ns as f64 / 1_000_000.0,
-            timeline.total_clique_cost
+            timeline.total_clique_cost,
+            timeline.gpu_cost,
+            timeline.gpu_cost_instruction_count,
         ));
         out.push('\n');
     } else {
@@ -459,6 +883,110 @@ pub fn format_report(report: &XcodeMioReport) -> String {
                 cost.pipeline_id,
                 cost.binary_index,
                 cost.address,
+            ));
+        }
+        out.push('\n');
+    }
+    let mut profiler_timings = report
+        .pipelines
+        .iter()
+        .filter_map(|pipeline| {
+            let best = pipeline.profiler_timings.iter().max_by(|left, right| {
+                left.percentage_average
+                    .partial_cmp(&right.percentage_average)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+            (best.percentage_average > 0.0 || best.time_average > 0.0).then_some((pipeline, best))
+        })
+        .collect::<Vec<_>>();
+    profiler_timings.sort_by(|(left_pipeline, left), (right_pipeline, right)| {
+        right
+            .percentage_average
+            .partial_cmp(&left.percentage_average)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .time_average
+                    .partial_cmp(&left.time_average)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left_pipeline.index.cmp(&right_pipeline.index))
+    });
+    if !profiler_timings.is_empty() {
+        out.push_str("Pipelines by Xcode profiler timing:\n");
+        for (pipeline, timing) in profiler_timings.iter().take(20) {
+            let name = pipeline
+                .function_name
+                .as_deref()
+                .unwrap_or("<unknown function>");
+            out.push_str(&format!(
+                "  {:>6.2}% time={:>10.3} cycles={:>10.3} source={:<8} {:<56}\n",
+                timing.percentage_average,
+                timing.time_average,
+                timing.cycle_average,
+                timing.source,
+                name,
+            ));
+        }
+        out.push('\n');
+    }
+    let mut shader_profiler_costs = report
+        .pipelines
+        .iter()
+        .filter(|pipeline| !pipeline.shader_profiler_costs.is_empty())
+        .collect::<Vec<_>>();
+    shader_profiler_costs.sort_by(|left, right| {
+        let left_cost = left
+            .shader_profiler_costs
+            .iter()
+            .map(|cost| cost.pipeline_cost)
+            .sum::<f64>();
+        let right_cost = right
+            .shader_profiler_costs
+            .iter()
+            .map(|cost| cost.pipeline_cost)
+            .sum::<f64>();
+        right_cost
+            .partial_cmp(&left_cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    let shader_profiler_denominator = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| pipeline.shader_profiler_costs.iter())
+        .map(|cost| cost.pipeline_cost)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum::<f64>();
+    if shader_profiler_denominator > 0.0 {
+        out.push_str("Pipelines by Xcode shader-profiler per-draw cost:\n");
+        for pipeline in shader_profiler_costs.iter().take(20) {
+            let name = pipeline
+                .function_name
+                .as_deref()
+                .unwrap_or("<unknown function>");
+            let pipeline_cost = pipeline
+                .shader_profiler_costs
+                .iter()
+                .map(|cost| cost.pipeline_cost)
+                .sum::<f64>();
+            let draw_count = pipeline
+                .shader_profiler_costs
+                .iter()
+                .map(|cost| cost.nonzero_draw_count)
+                .sum::<usize>();
+            let pct = 100.0 * pipeline_cost / shader_profiler_denominator;
+            let top_binary = pipeline.shader_profiler_costs.iter().max_by(|left, right| {
+                left.pipeline_cost
+                    .partial_cmp(&right.pipeline_cost)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let key = top_binary
+                .map(|cost| cost.binary_key.as_str())
+                .unwrap_or("-");
+            out.push_str(&format!(
+                "  {:>6.2}% cost={:>10.3} draws={:>4} {:<56} key={}\n",
+                pct, pipeline_cost, draw_count, name, key,
             ));
         }
         out.push('\n');
@@ -628,6 +1156,44 @@ pub fn format_report(report: &XcodeMioReport) -> String {
         .collect::<Vec<_>>();
     draw_timeline.sort_by(|left, right| {
         right
+            .timeline_duration_ns
+            .cmp(&left.timeline_duration_ns)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    let draw_duration_denominator = report
+        .cost_timeline
+        .as_ref()
+        .map(|timeline| timeline.global_gpu_time_ns)
+        .filter(|value| *value > 0)
+        .unwrap_or(report.gpu_time_ns);
+    if !draw_timeline.is_empty()
+        && draw_timeline
+            .iter()
+            .any(|pipeline| pipeline.timeline_duration_ns > 0)
+    {
+        out.push_str("Pipelines by Xcode draw duration:\n");
+        for pipeline in draw_timeline.iter().take(20) {
+            let name = pipeline
+                .function_name
+                .as_deref()
+                .unwrap_or("<unknown function>");
+            let pct = if draw_duration_denominator > 0 {
+                100.0 * pipeline.timeline_duration_ns as f64 / draw_duration_denominator as f64
+            } else {
+                0.0
+            };
+            out.push_str(&format!(
+                "  {:>6.2}% {:>9.3} ms  {:>4} draws  {:<56}\n",
+                pct,
+                pipeline.timeline_duration_ns as f64 / 1_000_000.0,
+                pipeline.timeline_draw_count,
+                name,
+            ));
+        }
+        out.push('\n');
+    }
+    draw_timeline.sort_by(|left, right| {
+        right
             .timeline_total_cost
             .partial_cmp(&left.timeline_total_cost)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -700,10 +1266,11 @@ mod platform {
         XcodeMioBinaryTrace, XcodeMioCostTimeline, XcodeMioDecodedCostRecord,
         XcodeMioDrawMetadataRecord, XcodeMioDrawTimelineRecord, XcodeMioGpuCommand,
         XcodeMioPipeline, XcodeMioPipelineCounter, XcodeMioPipelineExecutionHistory,
-        XcodeMioPipelineScopeCost, XcodeMioPipelineShaderBinary, XcodeMioPipelineShaderBinaryCost,
-        XcodeMioPipelineShaderBinaryReference, XcodeMioPipelineShaderStat,
+        XcodeMioPipelineProfilerTiming, XcodeMioPipelineScopeCost, XcodeMioPipelineShaderBinary,
+        XcodeMioPipelineShaderBinaryCost, XcodeMioPipelineShaderBinaryReference,
+        XcodeMioPipelineShaderProfilerCost, XcodeMioPipelineShaderStat,
         XcodeMioPipelineShaderTrack, XcodeMioReport, XcodeMioShaderBinaryInfo,
-        XcodeMioTimelineBinary,
+        XcodeMioTimelineBinary, XcodeMioTimings, elapsed_ms,
     };
     use crate::error::{Error, Result};
     use crate::profiler;
@@ -749,16 +1316,32 @@ mod platform {
         profiler_directory: PathBuf,
         stream_data_path: PathBuf,
         profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+        mut timings: XcodeMioTimings,
     ) -> Result<XcodeMioReport> {
         let framework_path = PathBuf::from(GT_SHADER_PROFILER_FRAMEWORK);
         let silence = FdSilencer::new();
+        let framework_start = Instant::now();
         let mut runtime = unsafe { Runtime::load()? };
+        timings.framework_load_ms = elapsed_ms(framework_start);
+        let stream_start = Instant::now();
         let stream = runtime.stream_data(&stream_data_path)?;
+        timings.stream_data_load_ms = elapsed_ms(stream_start);
+        let processor_start = Instant::now();
         let processor = unsafe { runtime.processor(stream)? };
+        timings.processor_init_ms = elapsed_ms(processor_start);
+        let process_start = Instant::now();
         unsafe {
             runtime.send_void(processor, "processStreamData")?;
             runtime.send_void(processor, "waitUntilFinished")?;
+            if responds_to_selector(processor, "processShaderProfilerStreamData") {
+                runtime.send_void(processor, "processShaderProfilerStreamData")?;
+            }
+            if responds_to_selector(processor, "waitUntilShaderProfilerFinished") {
+                runtime.send_void(processor, "waitUntilShaderProfilerFinished")?;
+            }
         }
+        timings.process_stream_ms = elapsed_ms(process_start);
+        let extract_start = Instant::now();
         let mio = unsafe { runtime.send_id(processor, "mioData")? };
         let result = unsafe { runtime.send_id(processor, "result")? };
         let shader_result = unsafe { runtime.send_id(result, "shaderProfilerResult")? };
@@ -769,6 +1352,8 @@ mod platform {
         let pipeline_count = unsafe { runtime.array_count(pipelines)? };
         let command_count = unsafe { runtime.array_count(gpu_commands)? };
         let encoder_count = unsafe { runtime.array_count(encoders)? };
+        timings.extract_result_ms = elapsed_ms(extract_start);
+        let topology_start = Instant::now();
         let mut decoded_pipelines = Vec::with_capacity(pipeline_count);
         for index in 0..pipeline_count {
             let pipeline = unsafe { runtime.array_object(pipelines, index)? };
@@ -808,10 +1393,12 @@ mod platform {
                 binary_keys,
                 all_binary_keys,
                 shader_stats: Vec::new(),
+                profiler_timings: unsafe { decode_pipeline_profiler_timings(pipeline) },
                 scope_costs: Vec::new(),
                 shader_tracks: Vec::new(),
                 shader_binaries: Vec::new(),
                 shader_binary_costs: Vec::new(),
+                shader_profiler_costs: Vec::new(),
                 execution_history: Vec::new(),
                 shader_binary_references: Vec::new(),
                 pipeline_counters: Vec::new(),
@@ -839,8 +1426,66 @@ mod platform {
                 function_name,
             });
         }
+        timings.decode_pipeline_commands_ms = elapsed_ms(topology_start);
 
         let mut warnings = Vec::new();
+        let shader_probe_start = Instant::now();
+        if let Err(error) = unsafe {
+            runtime.decode_shader_profiler_costs(
+                shader_result,
+                &decoded_commands,
+                &mut decoded_pipelines,
+            )
+        } {
+            warnings.push(format!(
+                "private shader-profiler cost probe failed: {error}"
+            ));
+        }
+        if let Err(error) = unsafe {
+            runtime.decode_shader_profiler_timing_info(shader_result, &mut decoded_pipelines)
+        } {
+            warnings.push(format!(
+                "private shader-profiler timingInfo probe failed: {error}"
+            ));
+        }
+        match unsafe { runtime.direct_shader_profiler_result(stream) } {
+            Ok(direct_shader_result) => {
+                if let Err(error) = unsafe {
+                    runtime.merge_shader_profiler_pipeline_state_data(
+                        direct_shader_result,
+                        &mut decoded_pipelines,
+                    )
+                } {
+                    warnings.push(format!(
+                        "direct shader-profiler pipeline probe failed: {error}"
+                    ));
+                }
+                if let Err(error) = unsafe {
+                    runtime.decode_shader_profiler_timing_info(
+                        direct_shader_result,
+                        &mut decoded_pipelines,
+                    )
+                } {
+                    warnings.push(format!(
+                        "direct shader-profiler timingInfo probe failed: {error}"
+                    ));
+                }
+                if let Err(error) = unsafe {
+                    runtime.decode_shader_profiler_costs(
+                        direct_shader_result,
+                        &decoded_commands,
+                        &mut decoded_pipelines,
+                    )
+                } {
+                    warnings.push(format!("direct shader-profiler cost probe failed: {error}"));
+                }
+            }
+            Err(error) => {
+                warnings.push(format!("direct shader-profiler processor failed: {error}"));
+            }
+        }
+        timings.shader_profiler_probe_ms = elapsed_ms(shader_probe_start);
+        let cost_request_start = Instant::now();
         let (cost_timeline, cost_timeline_object) =
             match unsafe { runtime.request_cost_timeline(mio) } {
                 Ok(Some(timeline)) => {
@@ -853,6 +1498,7 @@ mod platform {
                     (None, None)
                 }
             };
+        timings.cost_timeline_request_ms = elapsed_ms(cost_request_start);
         let mut decoded_cost_records = Vec::new();
         let mut draw_timeline_records = Vec::new();
         let mut draw_metadata_records = Vec::new();
@@ -861,6 +1507,7 @@ mod platform {
         let mut timeline_pipeline_state_ids = Vec::new();
         let mut shader_binary_info = Vec::new();
         if let Some(timeline) = cost_timeline_object {
+            let cost_decode_start = Instant::now();
             timeline_binary_count = unsafe { runtime.timeline_binary_count(timeline) };
             timeline_binaries = unsafe { runtime.decode_timeline_binaries(timeline) };
             timeline_pipeline_state_ids =
@@ -877,6 +1524,7 @@ mod platform {
             draw_metadata_records = unsafe { runtime.decode_draw_metadata_records(timeline) };
             unsafe {
                 runtime.decode_pipeline_draw_timeline(
+                    mio,
                     timeline,
                     &draw_timeline_records,
                     &draw_metadata_records,
@@ -900,6 +1548,7 @@ mod platform {
             {
                 warnings.push(format!("private pipeline counter probe failed: {error}"));
             }
+            timings.cost_timeline_decode_ms = elapsed_ms(cost_decode_start);
         }
         if profiler_summary.is_some_and(|summary| summary.num_gpu_commands != command_count) {
             warnings.push("private MIO command count differs from streamData summary".to_owned());
@@ -911,17 +1560,24 @@ mod platform {
             warnings.push("one or more private MIO pipelines could not be named".to_owned());
         }
 
+        let final_metadata_start = Instant::now();
+        let draw_count = unsafe { runtime.send_u64(mio, "drawCount")? as usize };
+        let cost_record_count = unsafe { runtime.send_u64(mio, "costCount")? as usize };
+        let gpu_time_ns = unsafe { runtime.send_u64(mio, "gpuTime")? };
+        timings.final_metadata_ms = elapsed_ms(final_metadata_start);
+
         let report = XcodeMioReport {
             trace_source,
             profiler_directory,
             stream_data_path,
             framework_path,
+            timings,
             gpu_command_count: command_count,
             encoder_count,
             pipeline_state_count: pipeline_count,
-            draw_count: unsafe { runtime.send_u64(mio, "drawCount")? as usize },
-            cost_record_count: unsafe { runtime.send_u64(mio, "costCount")? as usize },
-            gpu_time_ns: unsafe { runtime.send_u64(mio, "gpuTime")? },
+            draw_count,
+            cost_record_count,
+            gpu_time_ns,
             cost_timeline,
             timeline_binary_count,
             timeline_binaries,
@@ -978,6 +1634,22 @@ mod platform {
                     stream,
                     std::ptr::null_mut(),
                 )
+            }
+        }
+
+        unsafe fn direct_shader_profiler_result(&mut self, stream: Id) -> Result<Id> {
+            unsafe {
+                let processor_class = lookup_class("GTAGX2StreamDataShaderProfilerProcessor")?;
+                let processor = send_id(processor_class, "alloc")?;
+                let processor = send_id_id(processor, "initWithStreamData:", stream)?;
+                send_void(processor, "processStreamData")?;
+                if responds_to_selector(processor, "waitUntilStreamDataFinished") {
+                    send_void(processor, "waitUntilStreamDataFinished")?;
+                }
+                if responds_to_selector(processor, "waitUntilBatchIDCounterFinished") {
+                    let _ = send_void(processor, "waitUntilBatchIDCounterFinished");
+                }
+                send_id(processor, "shaderProfilerResult")
             }
         }
 
@@ -1054,6 +1726,7 @@ mod platform {
                 return Ok(None);
             };
 
+            let (gpu_cost, gpu_cost_instruction_count) = unsafe { decode_gpu_cost(timeline) };
             Ok(Some(DecodedTimeline {
                 object: timeline,
                 summary: XcodeMioCostTimeline {
@@ -1066,6 +1739,8 @@ mod platform {
                     global_gpu_time_ns: unsafe { send_u64(timeline, "globalGPUTime")? },
                     timeline_duration_ns: unsafe { send_u64(timeline, "timelineDuration")? },
                     total_clique_cost: unsafe { send_u64(timeline, "totalCliqueCost")? },
+                    gpu_cost,
+                    gpu_cost_instruction_count,
                 },
             }))
         }
@@ -1107,6 +1782,264 @@ mod platform {
                     pipelines,
                     timeline_pipeline_state_ids,
                 )?;
+            }
+            Ok(())
+        }
+
+        unsafe fn decode_shader_profiler_costs(
+            &mut self,
+            shader_result: Id,
+            gpu_commands: &[XcodeMioGpuCommand],
+            pipelines: &mut [XcodeMioPipeline],
+        ) -> Result<()> {
+            unsafe {
+                let binaries = self.send_id_allow_nil(shader_result, "shaderBinaries")?;
+                if binaries.is_null() {
+                    return Ok(());
+                }
+                let keys = self.send_id_allow_nil(binaries, "allKeys")?;
+                let values = self.send_id_allow_nil(binaries, "allValues")?;
+                if keys.is_null() || values.is_null() {
+                    return Ok(());
+                }
+                let count = self.array_count(keys)?.min(self.array_count(values)?);
+                for index in 0..count {
+                    let key_object = self.array_object(keys, index)?;
+                    let binary = self.array_object(values, index)?;
+                    if !responds_to_selector(binary, "costForDrawAtIndex:")
+                        || !responds_to_selector(binary, "totalCost")
+                    {
+                        continue;
+                    }
+                    let key = if responds_to_selector(key_object, "UTF8String") {
+                        nsstring_to_string(key_object)
+                    } else {
+                        None
+                    }
+                    .unwrap_or_else(|| format!("shader_binary_{index}"));
+                    let full_path = if responds_to_selector(binary, "fullPath") {
+                        self.send_id_allow_nil(binary, "fullPath")
+                            .ok()
+                            .filter(|value| !value.is_null())
+                            .filter(|value| responds_to_selector(*value, "UTF8String"))
+                            .and_then(|value| nsstring_to_string(value))
+                    } else {
+                        None
+                    };
+                    let type_name = if responds_to_selector(binary, "typeName") {
+                        self.send_id_allow_nil(binary, "typeName")
+                            .ok()
+                            .filter(|value| !value.is_null())
+                            .filter(|value| responds_to_selector(*value, "UTF8String"))
+                            .and_then(|value| nsstring_to_string(value))
+                    } else {
+                        None
+                    };
+                    let shader_type = if responds_to_selector(binary, "type") {
+                        send_u32(binary, "type").unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let addr_start = if responds_to_selector(binary, "addrStart") {
+                        send_u32(binary, "addrStart").unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let addr_end = if responds_to_selector(binary, "addrEnd") {
+                        send_u32(binary, "addrEnd").unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let total_binary_cost = send_f64(binary, "totalCost").unwrap_or(0.0);
+                    let total_binary_samples = if responds_to_selector(binary, "numSamples") {
+                        send_u64(binary, "numSamples").unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if total_binary_cost <= 0.0 && total_binary_samples == 0 {
+                        continue;
+                    }
+                    let has_cost_percentage =
+                        responds_to_selector(binary, "costPercentageForDrawAtIndex:");
+                    let mut by_pipeline =
+                        BTreeMap::<usize, XcodeMioPipelineShaderProfilerCost>::new();
+                    for draw_index in 0..gpu_commands.len() {
+                        let cost = send_f64_u32(binary, "costForDrawAtIndex:", draw_index as u32)
+                            .unwrap_or(0.0);
+                        if !cost.is_finite() || cost <= 0.0 {
+                            continue;
+                        }
+                        let Some(command) = gpu_commands.get(draw_index) else {
+                            continue;
+                        };
+                        let percent = if has_cost_percentage {
+                            send_f64_u32(binary, "costPercentageForDrawAtIndex:", draw_index as u32)
+                                .unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+                        by_pipeline
+                            .entry(command.pipeline_index)
+                            .and_modify(|entry| {
+                                entry.pipeline_cost += cost;
+                                if percent.is_finite() && percent > 0.0 {
+                                    entry.pipeline_cost_percent_sum += percent;
+                                }
+                                entry.nonzero_draw_count += 1;
+                                entry.first_draw_index = entry.first_draw_index.min(draw_index);
+                                entry.last_draw_index = entry.last_draw_index.max(draw_index);
+                            })
+                            .or_insert_with(|| XcodeMioPipelineShaderProfilerCost {
+                                binary_key: key.clone(),
+                                full_path: full_path.clone(),
+                                type_name: type_name.clone(),
+                                shader_type,
+                                addr_start,
+                                addr_end,
+                                total_binary_cost,
+                                total_binary_samples,
+                                pipeline_cost: cost,
+                                pipeline_cost_percent_sum: if percent.is_finite() && percent > 0.0 {
+                                    percent
+                                } else {
+                                    0.0
+                                },
+                                nonzero_draw_count: 1,
+                                first_draw_index: draw_index,
+                                last_draw_index: draw_index,
+                            });
+                    }
+                    for (pipeline_index, cost) in by_pipeline {
+                        if let Some(pipeline) = pipelines.get_mut(pipeline_index) {
+                            pipeline.shader_profiler_costs.push(cost);
+                        }
+                    }
+                }
+                for pipeline in pipelines {
+                    pipeline.shader_profiler_costs.sort_by(|left, right| {
+                        right
+                            .pipeline_cost
+                            .partial_cmp(&left.pipeline_cost)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| left.binary_key.cmp(&right.binary_key))
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        unsafe fn merge_shader_profiler_pipeline_state_data(
+            &mut self,
+            shader_result: Id,
+            pipelines: &mut [XcodeMioPipeline],
+        ) -> Result<()> {
+            unsafe {
+                let pipeline_states = self.send_id_allow_nil(shader_result, "pipelineStates")?;
+                if pipeline_states.is_null() {
+                    return Ok(());
+                }
+                let count = self.array_count(pipeline_states)?;
+                for index in 0..count {
+                    let pipeline_state = self.array_object(pipeline_states, index)?;
+                    let object_id = if responds_to_selector(pipeline_state, "objectId") {
+                        send_u64(pipeline_state, "objectId").unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let pipeline_index = if responds_to_selector(pipeline_state, "index") {
+                        send_u32(pipeline_state, "index").unwrap_or(index as u32) as usize
+                    } else {
+                        index
+                    };
+                    let timings = decode_pipeline_profiler_timings(pipeline_state);
+                    if timings.is_empty() {
+                        continue;
+                    }
+                    let target_index = pipelines
+                        .iter()
+                        .position(|pipeline| pipeline.object_id == object_id && object_id != 0)
+                        .or_else(|| (pipeline_index < pipelines.len()).then_some(pipeline_index));
+                    let Some(target_index) = target_index else {
+                        continue;
+                    };
+                    let target = &mut pipelines[target_index];
+                    target.profiler_timings.extend(timings);
+                    dedup_profiler_timings(&mut target.profiler_timings);
+                }
+            }
+            Ok(())
+        }
+
+        unsafe fn decode_shader_profiler_timing_info(
+            &mut self,
+            shader_result: Id,
+            pipelines: &mut [XcodeMioPipeline],
+        ) -> Result<()> {
+            unsafe {
+                let result_timing = decode_timing_info(shader_result).unwrap_or_default();
+                let denominator = result_timing
+                    .compute_time
+                    .max(result_timing.time)
+                    .max(result_timing.vertex_time)
+                    .max(result_timing.fragment_time);
+                let pipeline_states = self.send_id_allow_nil(shader_result, "pipelineStates")?;
+                if pipeline_states.is_null() {
+                    return Ok(());
+                }
+                let count = self.array_count(pipeline_states)?;
+                for index in 0..count {
+                    let pipeline_state = self.array_object(pipeline_states, index)?;
+                    let Some(timing) = decode_timing_info(pipeline_state) else {
+                        continue;
+                    };
+                    let pipeline_time = timing
+                        .compute_time
+                        .max(timing.time)
+                        .max(timing.vertex_time)
+                        .max(timing.fragment_time);
+                    if pipeline_time == 0 {
+                        continue;
+                    }
+                    let object_id = if responds_to_selector(pipeline_state, "objectId") {
+                        send_u64(pipeline_state, "objectId").unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let pipeline_index = if responds_to_selector(pipeline_state, "index") {
+                        send_u32(pipeline_state, "index").unwrap_or(index as u32) as usize
+                    } else {
+                        index
+                    };
+                    let target_index = pipelines
+                        .iter()
+                        .position(|pipeline| pipeline.object_id == object_id && object_id != 0)
+                        .or_else(|| (pipeline_index < pipelines.len()).then_some(pipeline_index));
+                    let Some(target_index) = target_index else {
+                        continue;
+                    };
+                    let percentage = if denominator > 0 {
+                        100.0 * pipeline_time as f64 / denominator as f64
+                    } else {
+                        0.0
+                    };
+                    let target = &mut pipelines[target_index];
+                    target
+                        .profiler_timings
+                        .push(XcodeMioPipelineProfilerTiming {
+                            source: "timingInfo",
+                            cycle_average: 0.0,
+                            cycle_min: 0.0,
+                            cycle_max: 0.0,
+                            time_average: pipeline_time as f64 / 1_000_000.0,
+                            time_min: 0.0,
+                            time_max: 0.0,
+                            percentage_average: percentage,
+                            percentage_min: 0.0,
+                            percentage_max: 0.0,
+                            surplus_cycles: 0.0,
+                        });
+                    dedup_profiler_timings(&mut target.profiler_timings);
+                }
             }
             Ok(())
         }
@@ -1398,6 +2331,7 @@ mod platform {
 
         unsafe fn decode_pipeline_draw_timeline(
             &mut self,
+            trace_data: Id,
             timeline: Id,
             draw_records: &[XcodeMioDrawTimelineRecord],
             draw_metadata: &[XcodeMioDrawMetadataRecord],
@@ -1413,9 +2347,19 @@ mod platform {
                     continue;
                 };
                 pipeline.timeline_draw_count += 1;
+                let mut duration_ns = 0;
                 if let Some(trace) = draw_records.get(draw.index) {
-                    pipeline.timeline_duration_ns += trace.raw1.saturating_sub(trace.raw0);
+                    duration_ns = trace.raw1.saturating_sub(trace.raw0);
                 }
+                if duration_ns == 0 {
+                    duration_ns =
+                        unsafe { draw_duration(timeline, draw.index as u32, draw.raw7 as u16) };
+                }
+                if duration_ns == 0 {
+                    duration_ns =
+                        unsafe { draw_duration(trace_data, draw.index as u32, draw.raw7 as u16) };
+                }
+                pipeline.timeline_duration_ns += duration_ns;
                 pipeline.timeline_total_cost +=
                     unsafe { draw_scope_cost(timeline, draw.raw0 as u64, draw.raw7) };
             }
@@ -1762,6 +2706,23 @@ mod platform {
         active_thread_instruction_count: u64,
     }
 
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct RawGtStatistics {
+        average: f64,
+        minimum: f64,
+        maximum: f64,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct RawGtShaderProfilerTiming {
+        cycles: RawGtStatistics,
+        time: RawGtStatistics,
+        percentage: RawGtStatistics,
+        surplus_cycles: f64,
+    }
+
     #[derive(Clone, Copy)]
     #[repr(C)]
     struct RawGtmioBinaryTrace {
@@ -1797,6 +2758,25 @@ mod platform {
         }
     }
 
+    impl RawGtShaderProfilerTiming {
+        fn has_useful_values(&self) -> bool {
+            [
+                self.cycles.average,
+                self.cycles.minimum,
+                self.cycles.maximum,
+                self.time.average,
+                self.time.minimum,
+                self.time.maximum,
+                self.percentage.average,
+                self.percentage.minimum,
+                self.percentage.maximum,
+                self.surplus_cycles,
+            ]
+            .into_iter()
+            .any(|value| value.is_finite() && value != 0.0)
+        }
+    }
+
     #[derive(Clone, Copy, Default)]
     struct DecodedCostAggregate {
         record_count: u64,
@@ -1814,6 +2794,14 @@ mod platform {
         total_duration_ns: u64,
         total_cost: f64,
         instruction_count: u64,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct DecodedTimingInfo {
+        time: u64,
+        vertex_time: u64,
+        fragment_time: u64,
+        compute_time: u64,
     }
 
     unsafe fn decode_shader_track(
@@ -1844,6 +2832,78 @@ mod platform {
                 traces,
             }))
         }
+    }
+
+    unsafe fn decode_timing_info(receiver: Id) -> Option<DecodedTimingInfo> {
+        unsafe {
+            if !responds_to_selector(receiver, "timingInfo") {
+                return None;
+            }
+            let timing_info = send_id_allow_nil(receiver, "timingInfo").ok()?;
+            if timing_info.is_null() {
+                return None;
+            }
+            let decoded = DecodedTimingInfo {
+                time: send_u64(timing_info, "time").unwrap_or(0),
+                vertex_time: send_u64(timing_info, "vertexTime").unwrap_or(0),
+                fragment_time: send_u64(timing_info, "fragmentTime").unwrap_or(0),
+                compute_time: send_u64(timing_info, "computeTime").unwrap_or(0),
+            };
+            (decoded.time != 0
+                || decoded.vertex_time != 0
+                || decoded.fragment_time != 0
+                || decoded.compute_time != 0)
+                .then_some(decoded)
+        }
+    }
+
+    unsafe fn decode_pipeline_profiler_timings(
+        pipeline: Id,
+    ) -> Vec<XcodeMioPipelineProfilerTiming> {
+        let mut timings = Vec::new();
+        for (selector, source) in [
+            ("timing", "total"),
+            ("vertexTiming", "vertex"),
+            ("fragmentTiming", "fragment"),
+            ("computeTiming", "compute"),
+        ] {
+            if !unsafe { responds_to_selector(pipeline, selector) } {
+                continue;
+            }
+            let Ok(raw) = (unsafe { send_profiler_timing(pipeline, selector) }) else {
+                continue;
+            };
+            if !raw.has_useful_values() {
+                continue;
+            }
+            timings.push(XcodeMioPipelineProfilerTiming {
+                source,
+                cycle_average: raw.cycles.average,
+                cycle_min: raw.cycles.minimum,
+                cycle_max: raw.cycles.maximum,
+                time_average: raw.time.average,
+                time_min: raw.time.minimum,
+                time_max: raw.time.maximum,
+                percentage_average: raw.percentage.average,
+                percentage_min: raw.percentage.minimum,
+                percentage_max: raw.percentage.maximum,
+                surplus_cycles: raw.surplus_cycles,
+            });
+        }
+        timings
+    }
+
+    fn dedup_profiler_timings(timings: &mut Vec<XcodeMioPipelineProfilerTiming>) {
+        let mut seen = BTreeSet::new();
+        timings.retain(|timing| {
+            seen.insert((
+                timing.source,
+                timing.cycle_average.to_bits(),
+                timing.time_average.to_bits(),
+                timing.percentage_average.to_bits(),
+                timing.surplus_cycles.to_bits(),
+            ))
+        });
     }
 
     unsafe fn decode_binary_traces(
@@ -2085,6 +3145,19 @@ mod platform {
         }
     }
 
+    unsafe fn decode_gpu_cost(trace_data: Id) -> (f64, u64) {
+        unsafe {
+            let Ok(cost) = send_ptr(trace_data, "gpuCost") else {
+                return (0.0, 0);
+            };
+            if cost.is_null() {
+                return (0.0, 0);
+            }
+            let cost = *cost.cast::<RawGtmioCostInfo>();
+            (cost.alu_cost + cost.non_alu_cost, cost.instruction_count)
+        }
+    }
+
     unsafe fn decode_binary_instruction_costs(
         binary: Id,
         instruction_info_count: u64,
@@ -2246,8 +3319,29 @@ mod platform {
         best
     }
 
+    unsafe fn draw_duration(timeline: Id, draw_index: u32, metadata_data_master: u16) -> u64 {
+        let mut best = 0_u64;
+        let mut candidates = BTreeSet::from([metadata_data_master, 0, 1, 2, 8, 28]);
+        candidates.extend(0_u16..=16);
+        for data_master in candidates {
+            let duration = unsafe {
+                send_u64_u32_u16(
+                    timeline,
+                    "durationForDraw:dataMaster:",
+                    draw_index,
+                    data_master,
+                )
+            }
+            .unwrap_or(0);
+            best = best.max(duration);
+        }
+        best
+    }
+
     const _: () = assert!(std::mem::size_of::<RawGtmioCostContext>() == 16);
     const _: () = assert!(std::mem::size_of::<RawGtmioCostInfo>() == 304);
+    const _: () = assert!(std::mem::size_of::<RawGtStatistics>() == 24);
+    const _: () = assert!(std::mem::size_of::<RawGtShaderProfilerTiming>() == 80);
     const _: () = assert!(std::mem::size_of::<RawGtmioBinaryTrace>() == 40);
     const _: () = assert!(std::mem::size_of::<RawGtmioDrawTrace>() == 24);
 
@@ -2635,6 +3729,18 @@ mod platform {
         Ok(f(receiver, sel))
     }
 
+    unsafe fn send_u64_u32_u16(receiver: Id, sel: &str, first: u32, second: u16) -> Result<u64> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u32, u16) -> u64 =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, first, second))
+    }
+
     unsafe fn send_u32(receiver: Id, sel: &str) -> Result<u32> {
         if receiver.is_null() {
             return Err(Error::InvalidInput(format!(
@@ -2688,6 +3794,30 @@ mod platform {
         }
         let sel = unsafe { selector(sel)? };
         let f: extern "C" fn(Id, Sel) -> f64 = unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel))
+    }
+
+    unsafe fn send_f64_u32(receiver: Id, sel: &str, arg: u32) -> Result<f64> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u32) -> f64 =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, arg))
+    }
+
+    unsafe fn send_profiler_timing(receiver: Id, sel: &str) -> Result<RawGtShaderProfilerTiming> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel) -> RawGtShaderProfilerTiming =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
         Ok(f(receiver, sel))
     }
 
@@ -2830,7 +3960,7 @@ mod platform {
 mod platform {
     use std::path::PathBuf;
 
-    use super::XcodeMioReport;
+    use super::{XcodeMioReport, XcodeMioTimings};
     use crate::error::{Error, Result};
     use crate::profiler;
 
@@ -2839,6 +3969,7 @@ mod platform {
         _profiler_directory: PathBuf,
         _stream_data_path: PathBuf,
         _profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+        _timings: XcodeMioTimings,
     ) -> Result<XcodeMioReport> {
         Err(Error::Unsupported(
             "xcode-mio is only available on macOS with Xcode installed",

@@ -3,6 +3,7 @@ use serde::Serialize;
 use crate::buffers;
 use crate::timing;
 use crate::trace::{BufferAccessStat, BufferLifecycleStat, KernelStat, TraceBundle, TraceSummary};
+use crate::xcode_mio;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnalysisReport {
@@ -31,6 +32,7 @@ pub struct AnalysisReport {
     pub buffer_lifecycles: Vec<BufferLifecycle>,
     pub largest_buffers: Vec<InventoryBuffer>,
     pub unused_resource_groups: Vec<UnusedResourceGroupSummary>,
+    pub xcode_mio: Option<xcode_mio::XcodeMioAnalysisReport>,
     pub findings: Vec<String>,
 }
 
@@ -87,8 +89,23 @@ pub struct UnusedResourceGroupSummary {
 }
 
 pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
+    analyze_with_xcode_mio(trace, None)
+}
+
+pub fn analyze_with_xcode_mio(
+    trace: &TraceBundle,
+    precomputed_xcode_mio: Option<xcode_mio::XcodeMioAnalysisReport>,
+) -> AnalysisReport {
+    analyze_with_context(trace, precomputed_xcode_mio, None)
+}
+
+pub fn analyze_with_context(
+    trace: &TraceBundle,
+    precomputed_xcode_mio: Option<xcode_mio::XcodeMioAnalysisReport>,
+    precomputed_timing: Option<timing::TimingReport>,
+) -> AnalysisReport {
     let summary = trace.summary();
-    let timing = timing::report(trace).ok();
+    let timing = precomputed_timing.or_else(|| timing::report(trace).ok());
     let command_buffers = trace.command_buffers().unwrap_or_default();
     let command_buffer_regions = trace.command_buffer_regions().unwrap_or_default();
     let compute_encoders = trace.compute_encoders().unwrap_or_default();
@@ -161,6 +178,7 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
         })
         .count();
     let inventory = buffers::analyze(trace).ok();
+    let xcode_mio = precomputed_xcode_mio.or_else(|| xcode_mio::analysis_report(trace).ok());
     let timed_kernel_stats = timing
         .as_ref()
         .map(|report| {
@@ -240,6 +258,23 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
             },
             timing.total_duration_ns
         ));
+    }
+    if let Some(report) = &xcode_mio {
+        findings.push(format!(
+            "Xcode MIO backend: {} commands, {} pipelines, {} cost records, {:.3} ms GPU time.",
+            report.gpu_command_count,
+            report.pipeline_state_count,
+            report.cost_record_count,
+            report.gpu_time_ns as f64 / 1_000_000.0
+        ));
+        if let Some(top) = report.top_pipelines.first() {
+            findings.push(format!(
+                "Top Xcode MIO pipeline: {} ({} commands, {:.1}% command share).",
+                top.function_name.as_deref().unwrap_or("<unknown function>"),
+                top.command_count,
+                top.command_percent
+            ));
+        }
     }
     if !pipeline_function_map.is_empty() {
         findings.push(format!(
@@ -378,6 +413,7 @@ pub fn analyze(trace: &TraceBundle) -> AnalysisReport {
         buffer_lifecycles,
         largest_buffers,
         unused_resource_groups,
+        xcode_mio,
         findings,
     }
 }

@@ -153,12 +153,42 @@ struct ShaderThreadMetrics {
 }
 
 pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderReport> {
-    let index = ShaderSourceIndex::build_for_trace(&trace.path, search_paths)?;
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
-    let profiling_address_summary = counter::probe_profiling_addresses(trace).ok();
-    let limiter_metrics = counter::extract_limiters_for_trace(&trace.path);
+    report_with_profiler_summary(trace, search_paths, profiler_summary.as_ref())
+}
+
+pub fn report_with_profiler_summary(
+    trace: &TraceBundle,
+    search_paths: &[PathBuf],
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+) -> Result<ShaderReport> {
+    report_with_context(trace, search_paths, profiler_summary, None, None)
+}
+
+pub fn report_with_context(
+    trace: &TraceBundle,
+    search_paths: &[PathBuf],
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+    precomputed_profiling_address_summary: Option<&counter::ProfilingAddressProbeReport>,
+    precomputed_limiter_metrics: Option<&[counter::CounterLimiter]>,
+) -> Result<ShaderReport> {
+    let index = ShaderSourceIndex::build_for_trace(&trace.path, search_paths)?;
+    let profiling_address_summary_owned;
+    let profiling_address_summary = if let Some(summary) = precomputed_profiling_address_summary {
+        Some(summary)
+    } else {
+        profiling_address_summary_owned = counter::probe_profiling_addresses(trace).ok();
+        profiling_address_summary_owned.as_ref()
+    };
+    let limiter_metrics_owned;
+    let limiter_metrics = if let Some(metrics) = precomputed_limiter_metrics {
+        metrics
+    } else {
+        limiter_metrics_owned = counter::extract_limiters_for_trace(&trace.path);
+        &limiter_metrics_owned
+    };
     let xcode_counter_data = xcode_counters::parse(trace, None).ok();
-    let regions = trace.command_buffer_regions()?;
+    let regions = trace.command_buffer_regions().unwrap_or_default();
     let mut simd_groups_by_name = BTreeMap::<String, u64>::new();
     let mut thread_metrics_by_name = BTreeMap::<String, ShaderThreadMetrics>::new();
     let mut total_simd_groups = 0u64;
@@ -188,7 +218,7 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
     let mut pipeline_stats_by_addr = BTreeMap::<u64, profiler::ProfilerPipelineStats>::new();
     let mut pipeline_stats_by_name = BTreeMap::<String, profiler::ProfilerPipelineStats>::new();
     let mut total_duration_ns = 0u64;
-    if let Some(summary) = &profiler_summary {
+    if let Some(summary) = profiler_summary {
         total_duration_ns = summary.total_time_us.saturating_mul(1_000);
         for dispatch in &summary.dispatches {
             let name = dispatch
@@ -227,7 +257,7 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
                 entry.2 += 1;
             }
         }
-        for limiter in &limiter_metrics {
+        for limiter in limiter_metrics {
             for dispatch in summary
                 .dispatches
                 .iter()
@@ -257,17 +287,18 @@ pub fn report(trace: &TraceBundle, search_paths: &[PathBuf]) -> Result<ShaderRep
             }
         }
     }
-    if let Some(summary) = &profiling_address_summary {
+    total_duration_ns =
+        profiler_duration_percent_denominator_ns(&duration_by_name, total_duration_ns);
+    if let Some(summary) = profiling_address_summary {
         for hit in &summary.top_function_low32_hits {
             profiling_address_hits_by_name.insert(hit.function_name.clone(), hit.hit_count);
             total_profiling_address_hits += hit.hit_count;
         }
     }
 
-    let kernels = trace.analyze_kernels()?;
+    let kernels = trace.analyze_kernels().unwrap_or_default();
     let kernels = if kernels.is_empty() {
         profiler_summary
-            .as_ref()
             .map(profiler_kernel_stats)
             .unwrap_or_default()
     } else {
@@ -638,7 +669,7 @@ pub fn source(
 }
 
 fn shader_kernel_stats(trace: &TraceBundle) -> Result<BTreeMap<String, KernelStat>> {
-    let kernels = trace.analyze_kernels()?;
+    let kernels = trace.analyze_kernels().unwrap_or_default();
     if !kernels.is_empty() {
         return Ok(kernels);
     }
@@ -647,6 +678,16 @@ fn shader_kernel_stats(trace: &TraceBundle) -> Result<BTreeMap<String, KernelSta
         .as_ref()
         .map(profiler_kernel_stats)
         .unwrap_or_default())
+}
+
+fn profiler_duration_percent_denominator_ns(
+    duration_by_name: &BTreeMap<String, u64>,
+    total_duration_ns: u64,
+) -> u64 {
+    duration_by_name
+        .values()
+        .fold(0u64, |sum, duration| sum.saturating_add(*duration))
+        .max(total_duration_ns)
 }
 
 fn profiler_kernel_stats(
@@ -1600,8 +1641,13 @@ fn identify_shader_bottlenecks(shader: &mut ShaderEntry) {
         && percent > 20.0
     {
         shader.bottlenecks.push("hot_shader".to_owned());
+        let signal = if shader.metric_source == "profiler-duration" {
+            "summed profiler dispatch time"
+        } else {
+            "GPU cost signal"
+        };
         shader.optimization_hints.push(format!(
-            "This shader consumes {percent:.1}% of GPU time - prime optimization target"
+            "This shader consumes {percent:.1}% of {signal} - prime optimization target"
         ));
     }
 }

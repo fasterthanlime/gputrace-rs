@@ -395,6 +395,7 @@ fn empty_analysis_report(path: &Path) -> AnalysisReport {
         buffer_lifecycles: Vec::new(),
         largest_buffers: Vec::new(),
         unused_resource_groups: Vec::new(),
+        xcode_mio: None,
         findings: Vec::new(),
     }
 }
@@ -3252,6 +3253,7 @@ mod tests {
             buffer_lifecycles: vec![],
             largest_buffers: vec![],
             unused_resource_groups: vec![],
+            xcode_mio: None,
             findings: vec![],
         };
         let right = AnalysisReport {
@@ -3383,6 +3385,7 @@ mod tests {
             ],
             largest_buffers: vec![],
             unused_resource_groups: vec![],
+            xcode_mio: None,
             findings: vec![],
         };
         let right = AnalysisReport {

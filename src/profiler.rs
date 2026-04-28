@@ -205,6 +205,13 @@ pub struct ProfilerCoverageDecodedSummary {
 }
 
 pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
+    report_with_stream_data_summary(path, None)
+}
+
+pub fn report_with_stream_data_summary<P: AsRef<Path>>(
+    path: P,
+    precomputed_stream_data_summary: Option<ProfilerStreamDataSummary>,
+) -> Result<ProfilerReport> {
     let input_path = path.as_ref().to_path_buf();
     let profiler_directory =
         find_profiler_directory(&input_path).ok_or_else(|| Error::NotFound(input_path.clone()))?;
@@ -246,7 +253,9 @@ pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
 
     files.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let stream_data_summary = if stream_data_present {
+    let stream_data_summary = if let Some(summary) = precomputed_stream_data_summary {
+        Some(summary)
+    } else if stream_data_present {
         let stream_data_path = profiler_directory.join("streamData");
         Some(parse_stream_data(
             &stream_data_path,
@@ -293,6 +302,14 @@ pub fn report<P: AsRef<Path>>(path: P) -> Result<ProfilerReport> {
 }
 
 pub fn coverage_report(trace: &TraceBundle) -> Result<ProfilerCoverageReport> {
+    coverage_report_with_decoded(trace, None, None)
+}
+
+pub fn coverage_report_with_decoded(
+    trace: &TraceBundle,
+    precomputed_raw_counters: Option<&counter::RawCountersReport>,
+    precomputed_probe: Option<&counter::RawCounterProbeReport>,
+) -> Result<ProfilerCoverageReport> {
     let input_path = trace.path.clone();
     let profiler_directory =
         find_profiler_directory(&input_path).ok_or_else(|| Error::NotFound(input_path.clone()))?;
@@ -300,19 +317,31 @@ pub fn coverage_report(trace: &TraceBundle) -> Result<ProfilerCoverageReport> {
     let total_bytes = files.iter().map(|file| file.size).sum::<u64>();
     let mut warnings = Vec::new();
 
-    let raw_counters = match counter::raw_counters_report(trace) {
-        Ok(report) => Some(report),
-        Err(error) => {
-            warnings.push(format!("raw-counters decoder failed: {error}"));
-            None
-        }
+    let raw_counters_owned;
+    let raw_counters = if let Some(report) = precomputed_raw_counters {
+        Some(report)
+    } else {
+        raw_counters_owned = match counter::raw_counters_report(trace) {
+            Ok(report) => Some(report),
+            Err(error) => {
+                warnings.push(format!("raw-counters decoder failed: {error}"));
+                None
+            }
+        };
+        raw_counters_owned.as_ref()
     };
-    let probe = match counter::probe_raw_counters(trace, None, None, false) {
-        Ok(report) => Some(report),
-        Err(error) => {
-            warnings.push(format!("streamData archive probe failed: {error}"));
-            None
-        }
+    let probe_owned;
+    let probe = if let Some(report) = precomputed_probe {
+        Some(report)
+    } else {
+        probe_owned = match counter::probe_raw_counters(trace, None, None, false) {
+            Ok(report) => Some(report),
+            Err(error) => {
+                warnings.push(format!("streamData archive probe failed: {error}"));
+                None
+            }
+        };
+        probe_owned.as_ref()
     };
 
     let stream_data_present = files.iter().any(|file| file.name == "streamData");
@@ -342,13 +371,11 @@ pub fn coverage_report(trace: &TraceBundle) -> Result<ProfilerCoverageReport> {
         trace_map_entries: raw_counters
             .as_ref()
             .map_or(0, |report| report.trace_maps.len()),
-        stream_archives: probe
-            .as_ref()
-            .map_or(0, |report| report.stream_archives.len()),
-        aps_data_archives: archive_count(probe.as_ref(), "APSData"),
-        aps_counter_data_archives: archive_count(probe.as_ref(), "APSCounterData"),
-        aps_timeline_data_archives: archive_count(probe.as_ref(), "APSTimelineData"),
-        data_file_references: data_file_references(probe.as_ref()),
+        stream_archives: probe.map_or(0, |report| report.stream_archives.len()),
+        aps_data_archives: archive_count(probe, "APSData"),
+        aps_counter_data_archives: archive_count(probe, "APSCounterData"),
+        aps_timeline_data_archives: archive_count(probe, "APSTimelineData"),
+        data_file_references: data_file_references(probe),
     };
 
     let mut groups = Vec::new();
@@ -1923,6 +1950,13 @@ fn ticks_to_ns(ticks: u64, numer: u64, denom: u64) -> u64 {
 }
 
 pub(crate) fn find_profiler_directory(path: &Path) -> Option<PathBuf> {
+    if let Some(override_path) = std::env::var_os("GPUTRACE_PROFILER_DIR") {
+        let override_path = PathBuf::from(override_path);
+        if override_path.is_dir() {
+            return Some(override_path);
+        }
+    }
+
     if path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -1934,6 +1968,12 @@ pub(crate) fn find_profiler_directory(path: &Path) -> Option<PathBuf> {
     let adjacent = PathBuf::from(format!("{}.gpuprofiler_raw", path.display()));
     if adjacent.is_dir() {
         return Some(adjacent);
+    }
+
+    if let Some(landing) = system_landing_zone_for(path)
+        && landing.is_dir()
+    {
+        return Some(landing);
     }
 
     let metadata = fs::metadata(path).ok()?;
@@ -1952,6 +1992,15 @@ pub(crate) fn find_profiler_directory(path: &Path) -> Option<PathBuf> {
                     .and_then(|ext| ext.to_str())
                     .is_some_and(|ext| ext == "gpuprofiler_raw")
         })
+}
+
+/// Xcode 26.x writes profile output to `/private/tmp/com.apple.gputools.profiling/`
+/// when the user clicks Profile in Xcode.
+fn system_landing_zone_for(trace_path: &Path) -> Option<PathBuf> {
+    let stem = trace_path.file_stem()?.to_str()?;
+    Some(PathBuf::from(format!(
+        "/private/tmp/com.apple.gputools.profiling/{stem}_stream.gpuprofiler_raw"
+    )))
 }
 
 fn classify_file(name: &str) -> String {

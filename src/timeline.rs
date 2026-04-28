@@ -160,12 +160,20 @@ struct DispatchSpan {
 }
 
 pub fn report(trace: &TraceBundle) -> Result<TimelineReport> {
+    let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+    report_with_profiler_summary(trace, profiler_summary.as_ref())
+}
+
+pub fn report_with_profiler_summary(
+    trace: &TraceBundle,
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+) -> Result<TimelineReport> {
     let regions = trace.command_buffer_regions()?;
-    if let Ok(profiler_summary) = profiler::stream_data_summary(&trace.path) {
+    if let Some(profiler_summary) = profiler_summary {
         let counter_limiters = counter::extract_limiters_for_trace(&trace.path);
         return Ok(build(
             &regions,
-            Some(&profiler_summary),
+            Some(profiler_summary),
             None,
             Some(&counter_limiters),
         ));

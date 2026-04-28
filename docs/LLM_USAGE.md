@@ -1,15 +1,16 @@
 # LLM Usage Guide
 
 This guide is for coding agents or analysis agents using `gputrace` as a local
-tool. Prefer machine-readable formats first, then render Markdown for human
-handoff.
+tool. Prefer the one-shot Markdown report first; use individual JSON commands
+only for narrow drill-downs.
 
 ## Basic Rules
 
 - Use absolute trace paths when possible.
-- Prefer `--format json` for structured inspection.
+- Prefer `gputrace report --output DIR` for single-trace triage.
+- Prefer `--format json` only when a follow-up needs one specific structured
+  object.
 - Prefer `--csv` for tabular diff slices that will be post-processed.
-- Prefer `--markdown` or `--md-out` only for human-facing summaries.
 - Do not use missing Go-era features: pprof, Perfetto export, live capture, or
   web serving.
 - Xcode automation requires macOS Accessibility permission for the installed
@@ -34,7 +35,21 @@ Accessibility.
 
 ## Triage A Single Trace
 
-Run these first:
+Run this first:
+
+```bash
+gputrace report /abs/path/trace-perfdata.gputrace --output /abs/path/trace-report
+```
+
+Read `/abs/path/trace-report/index.md`, then follow links to the focused
+Markdown files. The report command writes `xcode-mio.md`, `analysis.md`,
+`insights.md`, `profiler.md`, `profiler-coverage.md`, `timing.md`,
+`shaders.md`, and `counters.md` when those sections are available. It reuses
+the Xcode MIO private-framework summary across analysis and insights, and it
+records legacy structural parser failures in `index.md` instead of requiring
+agents to run those commands by hand.
+
+Use these only for targeted follow-up:
 
 ```bash
 gputrace stats /abs/path/trace.gputrace
@@ -43,9 +58,10 @@ gputrace profiler /abs/path/trace.gputrace --format json
 gputrace timing /abs/path/trace.gputrace --format json
 ```
 
-For exported Xcode profile bundles, `analyze` and `buffers list` should both
-surface unused-resource sidecars when Xcode recorded them. Check these fields
-before concluding that buffer/resource analysis is empty:
+For exported Xcode profile bundles, `report` and `analyze` should surface
+unused-resource sidecars when Xcode recorded them. If the report says buffer
+inventory is empty, check this specific command before concluding resource
+analysis is empty:
 
 ```bash
 gputrace analyze /abs/path/trace-perfdata.gputrace
@@ -68,7 +84,7 @@ data through Xcode:
 
 ```bash
 gputrace xcode-check-permissions
-gputrace xcode-profile run /abs/path/input.gputrace --output /abs/path/input-perfdata.gputrace --timeout-seconds 300
+gputrace profile /abs/path/input.gputrace --output /abs/path/input-perfdata.gputrace --timeout-seconds 300
 gputrace profiler /abs/path/input-perfdata.gputrace --format json
 ```
 
@@ -124,11 +140,20 @@ gputrace diff --bench-dir /abs/path/bench-traces --json
 
 ## Shader And Counter Workflow
 
+For normal agent workflows, start with:
+
+```bash
+gputrace report trace-perfdata.gputrace --output trace-report
+```
+
+Then use individual commands below only to drill into a section.
+
 ```bash
 gputrace xcode-counters trace-perfdata.gputrace --format summary
 gputrace xcode-counters trace-perfdata.gputrace --format json
 gputrace export-counters trace-perfdata.gputrace --format json
-gputrace xcode-mio trace-perfdata.gputrace --format json
+gputrace xcode-mio trace-perfdata.gputrace
+gputrace xcode-mio trace-perfdata.gputrace --format summary-json
 gputrace shaders trace-perfdata.gputrace --format json
 gputrace shader-hotspots trace-perfdata.gputrace kernel_name --search-path /abs/path/src --format json
 gputrace shader-source trace-perfdata.gputrace kernel_name --search-path /abs/path/src --format text
@@ -161,12 +186,15 @@ exports. For ranking without a counter CSV, use profiler duration fields. For
 Xcode counter parity, use an exported Xcode counter CSV with `xcode-counters`
 or `validate-counters`.
 
-On macOS with Xcode installed, `xcode-mio --format json` loads Xcode's private
+On macOS with Xcode installed, `xcode-mio` loads Xcode's private
 `GTShaderProfiler` framework and decodes the exported `streamData` into the
 same structured GPU command, encoder, and pipeline topology Xcode builds
 internally. Use it to confirm command counts, pipeline object ids, pipeline
-addresses, and function-name mapping. Do not treat `cost_record_count` as
-decoded Xcode Cost; it is only the number of private cost records observed.
+addresses, function-name mapping, and shader-binary references. The default
+format is the LLM-friendly summary; `--format summary-json` is the compact
+machine-readable form, and `--format json` is the full private object graph.
+Do not treat `cost_record_count` as decoded Xcode Cost; it is only the number
+of private cost records observed.
 
 For a single machine-readable offline feed, prefer `export-counters --format
 json`. It combines profiler/timeline rows with decoded APS counter sample rows
@@ -219,14 +247,15 @@ When you need to know whether a profiler export is fully understood, run:
 gputrace profiler-coverage trace-perfdata.gputrace --format json
 ```
 
-Treat this as the source of truth for reversal coverage. It reports byte share
-by profiler-bundle family and explicitly labels `streamData`, `Profiling_f_*`,
-`Counters_f_*`, `Timeline_f_*`, and other raw files as semantic, partial,
-heuristic, or opaque. Do not infer that missing values are unavailable from
-Xcode unless this report shows the relevant bytes have been accounted for.
+Treat this as the source of truth for decode coverage. It reports byte
+share by profiler-bundle family and explicitly labels `streamData`,
+`Profiling_f_*`, `Counters_f_*`, `Timeline_f_*`, and other raw files as
+semantic, partial, heuristic, or opaque. Do not infer that missing values
+are unavailable unless this report shows the relevant bytes have been
+accounted for.
 
-For raw counter reverse-engineering and CSV correlation, use the hidden
-structured `APSCounterData` probe instead of old `Counters_f_N` assumptions:
+For raw counter inspection and CSV correlation, use the hidden structured
+`APSCounterData` probe instead of old `Counters_f_N` assumptions:
 
 ```bash
 gputrace raw-counter-probe trace-perfdata.gputrace --format text
@@ -235,7 +264,7 @@ gputrace raw-counter-probe trace-perfdata.gputrace --metric "ALU Utilization" --
 ```
 
 `raw-counter-probe` is hidden from top-level help because it is a
-format-reversal/debugging command, not the user-facing report. Its normal path decodes
+diagnostic command, not the user-facing report. Its normal path decodes
 `.gpuprofiler_raw/streamData` aggregate metadata, `GPRWCNTR` record sizes,
 per-sample-group counter schemas from `Subdivided Dictionary/passList`, and
 normalized `raw_counter / GRC_GPU_CYCLES * 100` candidates. It reports

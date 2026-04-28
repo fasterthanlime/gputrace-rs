@@ -665,7 +665,12 @@ pub fn get_window_status(trace_path: Option<&Path>) -> Result<XcodeWindowStatus>
         .filter(|name| {
             matches!(
                 name.as_str(),
-                "Replay" | "Profile" | "Capture GPU workload" | "Show Performance" | "Export"
+                "Replay"
+                    | "Profile"
+                    | "Capture GPU workload"
+                    | "Show Performance"
+                    | "Open Performance"
+                    | "Export"
             )
         })
         .collect::<Vec<_>>();
@@ -702,15 +707,7 @@ pub fn running_profile_window() -> Result<Option<String>> {
     };
     for window in windows(&app) {
         let elements = descendants(&window, 2_000);
-        let has_show_performance = elements
-            .iter()
-            .any(|el| el.role() == "AXButton" && el.label() == "Show Performance");
-        let running_stop = elements.iter().any(|el| {
-            el.role() == "AXButton"
-                && el.enabled()
-                && (el.label() == "Stop GPU workload" || el.label().starts_with("Stop GPU"))
-        });
-        if running_stop && !has_show_performance {
+        if status_from_elements(&elements) == XcodeAutomationStatus::Running {
             return Ok(Some(window.title()));
         }
     }
@@ -1011,7 +1008,7 @@ fn preferred_trace_window(candidates: Vec<AxElement>) -> Option<AxElement> {
     if candidates.is_empty() {
         return None;
     }
-    for name in ["Replay", "Export", "Show Performance"] {
+    for name in ["Replay", "Export", "Show Performance", "Open Performance"] {
         if let Some(window) = candidates
             .iter()
             .find(|window| find_button(window, name, 1_500).is_some())
@@ -1023,9 +1020,15 @@ fn preferred_trace_window(candidates: Vec<AxElement>) -> Option<AxElement> {
 }
 
 fn has_trace_landmark(window: &AxElement) -> bool {
-    ["Replay", "Profile", "Export", "Show Performance"]
-        .iter()
-        .any(|name| find_button(window, name, 1_000).is_some())
+    [
+        "Replay",
+        "Profile",
+        "Export",
+        "Show Performance",
+        "Open Performance",
+    ]
+    .iter()
+    .any(|name| find_button(window, name, 1_000).is_some())
 }
 
 fn trace_patterns(trace_path: Option<&Path>) -> Vec<String> {
@@ -1512,7 +1515,11 @@ fn clickable_navigation_ancestor(el: &AxElement) -> Option<AxElement> {
 fn status_from_elements(elements: &[AxElement]) -> XcodeAutomationStatus {
     let has_complete_landmark = elements.iter().any(|el| {
         let text = el.label();
-        (el.role() == "AXButton" && matches!(text.as_str(), "Show Performance" | "Export"))
+        (el.role() == "AXButton"
+            && matches!(
+                text.as_str(),
+                "Show Performance" | "Open Performance" | "Export"
+            ))
             || matches!(
                 text.as_str(),
                 "Effective GPU Time"
@@ -1686,6 +1693,12 @@ fn press(el: &AxElement, window: Option<&AxElement>) -> Result<()> {
         }
         if click_element(el) {
             info!("AX press: click fallback succeeded");
+            return Ok(());
+        }
+        if let Some(parent) = el.parent()
+            && click_element(&parent)
+        {
+            info!("AX press: parent click fallback succeeded");
             return Ok(());
         }
         warn!("AX press: click fallback failed");

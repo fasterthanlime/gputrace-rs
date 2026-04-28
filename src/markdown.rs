@@ -675,6 +675,7 @@ mod tests {
                 logical_bytes: 2048,
                 sample_buffers: vec!["MTLBuffer-1-0".into()],
             }],
+            xcode_mio: None,
             findings: vec!["top level summary".into()],
         };
 
@@ -726,6 +727,7 @@ mod tests {
             buffer_lifecycles: vec![],
             largest_buffers: vec![],
             unused_resource_groups: vec![],
+            xcode_mio: None,
             findings: vec![],
         };
         let report = DiffReport {

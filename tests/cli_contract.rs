@@ -21,6 +21,7 @@ fn top_level_help_lists_current_analysis_commands() {
 
     for subcommand in [
         "analyze-usage",
+        "report",
         "clear-buffers",
         "timeline",
         "fences",
@@ -34,7 +35,9 @@ fn top_level_help_lists_current_analysis_commands() {
         "profiler-coverage",
         "mtlb-functions",
         "xcode-counters",
-        "xcode-windows",
+        "xcode-check-permissions",
+        "xcode-profile",
+        "profile",
         "buffers",
     ] {
         assert!(
@@ -42,6 +45,21 @@ fn top_level_help_lists_current_analysis_commands() {
             "top-level help should mention {subcommand}\n{help}"
         );
     }
+    assert!(
+        !help.contains("xcode-windows"),
+        "top-level help should hide AX debug probes\n{help}"
+    );
+}
+
+#[test]
+fn report_help_mentions_markdown_output_directory() {
+    let help = render_help(&["report"]);
+
+    assert!(help.contains("report"));
+    assert!(help.contains("<TRACE>"));
+    assert!(help.contains("--output <OUTPUT>"));
+    assert!(help.contains("Markdown"));
+    assert!(help.contains("Xcode MIO"));
 }
 
 #[test]
@@ -330,17 +348,28 @@ fn xcode_profile_help_mentions_no_prompt() {
         "run-profile",
         "wait-profile",
         "export",
-        "xcode-export-counters",
-        "xcode-export-memory",
-        "list-windows",
-        "list-buttons",
-        "show-performance",
     ] {
         assert!(
             help.contains(subcommand),
             "xcode-profile help should mention {subcommand}\n{help}"
         );
     }
+    assert!(
+        !help.contains("list-buttons"),
+        "xcode-profile help should hide low-level AX probes\n{help}"
+    );
+}
+
+#[test]
+fn profile_help_mentions_capture_profile_contract() {
+    let help = render_help(&["profile"]);
+    assert!(help.contains("<TRACE>"));
+    assert!(help.contains("--output <OUTPUT>"));
+    assert!(help.contains("--timeout-seconds"));
+    assert!(help.contains("--wait-seconds"));
+    assert!(help.contains("--force"));
+    assert!(help.contains("--no-prompt"));
+    assert!(help.contains(".gpuprofiler_raw/streamData"));
 }
 
 #[test]
@@ -529,6 +558,16 @@ fn important_top_level_commands_parse_their_existing_contracts() {
         ],
         vec!["gputrace", "fences", "trace.gputrace", "--format", "json"],
         vec!["gputrace", "profiler", "trace.gputrace", "--format", "json"],
+        vec![
+            "gputrace",
+            "profile",
+            "trace.gputrace",
+            "--output",
+            "trace-perfdata.gputrace",
+            "--timeout-seconds",
+            "1",
+            "--no-prompt",
+        ],
         vec![
             "gputrace",
             "diff",

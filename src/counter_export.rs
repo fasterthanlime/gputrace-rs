@@ -91,19 +91,37 @@ pub struct CounterExportMetricMetadata {
 }
 
 pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
-    let timeline = timeline::report(trace)?;
-    let limiters = counter::extract_limiters_for_trace(&trace.path);
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
-    let raw_counter_report = counter::raw_counters_report(trace).ok();
+    report_with_context(trace, profiler_summary.as_ref(), None)
+}
+
+pub fn report_with_context(
+    trace: &TraceBundle,
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+    precomputed_raw_counter_report: Option<&counter::RawCountersReport>,
+) -> Result<CounterExportReport> {
+    let timeline = match timeline::report_with_profiler_summary(trace, profiler_summary) {
+        Ok(timeline) => timeline,
+        Err(_) => empty_timeline_report(
+            trace,
+            if profiler_summary.is_some() {
+                "streamData"
+            } else {
+                "timeline-unavailable"
+            },
+        ),
+    };
+    let limiters = counter::extract_limiters_for_trace(&trace.path);
+    let raw_counter_report_owned;
+    let raw_counter_report = if let Some(report) = precomputed_raw_counter_report {
+        Some(report)
+    } else {
+        raw_counter_report_owned = counter::raw_counters_report(trace).ok();
+        raw_counter_report_owned.as_ref()
+    };
     let mut aps_rows = raw_counter_report
-        .as_ref()
         .and_then(|raw_counter_report| {
-            aps_counter_rows(
-                trace,
-                &timeline,
-                profiler_summary.as_ref(),
-                raw_counter_report,
-            )
+            aps_counter_rows(trace, &timeline, profiler_summary, raw_counter_report)
         })
         .unwrap_or_default();
     let has_profiler_dispatches = profiler_summary
@@ -122,7 +140,7 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
     let mut profiler_dispatches_by_name =
         BTreeMap::<String, Vec<&profiler::ProfilerDispatch>>::new();
     let mut occupancy_by_encoder = BTreeMap::<usize, (f64, f64)>::new();
-    if let Some(summary) = &profiler_summary {
+    if let Some(summary) = profiler_summary {
         for cost in &summary.execution_costs {
             let name = cost
                 .function_name
@@ -371,6 +389,38 @@ pub fn report(trace: &TraceBundle) -> Result<CounterExportReport> {
         total_rows: rows.len(),
         rows,
     })
+}
+
+fn empty_timeline_report(trace: &TraceBundle, source: &str) -> timeline::TimelineReport {
+    timeline::TimelineReport {
+        synthetic: true,
+        source: source.to_owned(),
+        command_buffers_profiler_backed: false,
+        start_time_ns: 0,
+        end_time_ns: 0,
+        duration_ns: 0,
+        command_buffer_count: 0,
+        encoder_count: 0,
+        dispatch_count: 0,
+        counter_track_count: 0,
+        command_buffers: Vec::new(),
+        encoders: Vec::new(),
+        dispatches: Vec::new(),
+        counter_tracks: Vec::new(),
+        events: vec![timeline::TimelineEvent {
+            name: "structural timeline unavailable".to_owned(),
+            category: Some("counter-export".to_owned()),
+            phase: "i".to_owned(),
+            timestamp_us: 0,
+            duration_us: None,
+            process_id: 0,
+            thread_id: 0,
+            args: BTreeMap::from([(
+                "trace".to_owned(),
+                serde_json::Value::String(trace.path.display().to_string()),
+            )]),
+        }],
+    }
 }
 
 fn append_profiler_rows(
