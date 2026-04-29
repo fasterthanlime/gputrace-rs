@@ -107,10 +107,27 @@ includes per-pass counter, timeline, and profiling streams in addition to
 
 ## 5. Analyze the Profiled Trace
 
-Run the high-signal reports first:
+Run `report`. It is the only analysis command you should need; the
+per-section drill-down commands (`profiler`, `analyze`, `xcode-mio`,
+`insights`, `shaders`, `raw-counters`, `profiler-coverage`,
+`export-counters`, `xcode-counters`, `raw-counter-probe`,
+`shader-source`/`shader-hotspots`, etc.) all write into the same markdown
+files that `report` already produces in one shot. They exist for plumbing
+and parity tests, not for end users.
+
+`report` takes the **original** `.gputrace` bundle (the one with the
+`metadata` file), not the `-perfdata.gputrace` bundle that `profile` wrote.
+The perfdata bundle is just a wrapper around `<stem>.gpuprofiler_raw/` and
+has no trace metadata; pointing `report` at it fails with
+`missing required trace file: .../metadata`.
+
+When the profiler raw directory is not adjacent to the trace as
+`<trace>.gpuprofiler_raw/`, point at it with `--profiler`:
 
 ```bash
-gputrace report /abs/path/input-perfdata.gputrace --output /abs/path/input-report
+gputrace report /abs/path/input.gputrace \
+  --profiler /abs/path/input-perfdata.gputrace/input.gpuprofiler_raw \
+  --output /abs/path/input-report
 ```
 
 The report directory is the preferred LLM handoff artifact. Start at
@@ -118,151 +135,12 @@ The report directory is the preferred LLM handoff artifact. Start at
 `profiler.md`, `timing.md`, `shaders.md`, `counters.md`, and
 `profiler-coverage.md`.
 
-Then use individual commands only for targeted drill-down:
-
-```bash
-gputrace analyze /abs/path/input-perfdata.gputrace
-gputrace profiler /abs/path/input-perfdata.gputrace --format text
-gputrace xcode-mio /abs/path/input-perfdata.gputrace
-gputrace insights /abs/path/input-perfdata.gputrace --min-level high
-gputrace buffers list /abs/path/input-perfdata.gputrace --format json
-gputrace command-buffers /abs/path/input-perfdata.gputrace
-gputrace encoders /abs/path/input-perfdata.gputrace
-gputrace kernels /abs/path/input-perfdata.gputrace
-gputrace api-calls /abs/path/input-perfdata.gputrace
-gputrace shaders /abs/path/input-perfdata.gputrace --format json
-```
-
-On profile bundles, structural parser data can be sparse while
-`.gpuprofiler_raw/streamData` has the useful dispatch list. The `report`
-command records structural-parser failures in `index.md` and keeps the
-useful profiler/MIO-backed sections available. The default `xcode-mio`
-format is the LLM-friendly summary; `--format summary-json` is the compact
-machine-readable form. `shaders` includes `Addr Hits` / `Addr %` in text
-output and `profiling_address_hits` / `profiling_address_percent` in
-JSON/CSV when address samples can be joined through APS program-address
-mappings — treat those as an additional shader-local signal; real
-duration/cost ranking remains primary.
-
-If a trace reports large unused resources, check `analyze` and
-`buffers list` for `unused_resource_groups`; those come from
-`unused-device-resources-*` sidecars and report logical resource bytes.
-
-For source mapping, search the source tree by the hot kernel names reported by
-`profiler` or `insights`:
+For source mapping, search the source tree by the hot kernel names that the
+report calls out:
 
 ```bash
 rg -n 'hot_kernel_name|another_hot_kernel' /abs/path/source/root
 ```
-
-If source extraction is available for the shader:
-
-```bash
-gputrace shader-source /abs/path/input-perfdata.gputrace hot_kernel_name \
-  --search-path /abs/path/source/root
-gputrace shader-hotspots /abs/path/input-perfdata.gputrace hot_kernel_name \
-  --search-path /abs/path/source/root \
-  --format json
-```
-
-## 7. Interpret the Reports
-
-Prefer profiler-backed `streamData` when it is present. A raw capture may show
-one wrapper dispatch while `streamData` expands the same workload into many
-inner profiler dispatches with real names and durations.
-
-Use this priority order:
-
-1. `gputrace report`: one markdown directory containing the retained
-   high-signal profiler, MIO, timing, shader, counter, and coverage views.
-2. `gputrace profiler`: profiler directory inventory, dispatch durations,
-   occupancy samples, pipeline compilation stats, and the debug-only
-   `pipeline_id_scan_costs` field.
-3. `gputrace analyze`: compact JSON summary and top timed kernels.
-4. `gputrace insights`: heuristic optimization hints from profiler-backed
-   timing/counter data.
-5. `gputrace api-calls`, `command-buffers`, `encoders`, `kernels`:
-   structural trace interpretation.
-6. `gputrace timeline`: useful for visualization, but some spans can remain
-   synthetic when profiler data does not expose every timestamp directly.
-
-Watch for disagreements between views. Xcode's Performance/Cost view is
-not the same thing as dispatch-duration ranking. If you need Xcode's
-counter view, export the counter CSV from Xcode and pass it to
-`xcode-counters`/`validate-counters` explicitly.
-
-For Xcode-exported counter CSVs, pass the CSV explicitly unless the filename is
-an exact trace-name match:
-
-```bash
-gputrace xcode-counters /abs/path/input-perfdata.gputrace \
-  --csv '/abs/path/input-perfdata Counters.csv' \
-  --format summary
-```
-
-The summary view highlights top invocations, memory bandwidth, low occupancy,
-buffer L1 misses, and limiter signals. Use `--metric <name> --top <n>` for a
-focused ranked table.
-
-For offline analysis without an exported Xcode counter CSV, use
-`export-counters` as the structured feed:
-
-```bash
-gputrace export-counters /abs/path/input-perfdata.gputrace --format json
-gputrace export-counters /abs/path/input-perfdata.gputrace --format csv
-```
-
-The JSON output combines profiler/timeline rows and decoded APS counter sample
-rows when present. Use `metric_source` to distinguish `profile-dispatch-time`,
-`profile-execution-cost`, `aps-counter-samples`, and fallback `raw-counter`
-rows. Fallback raw-counter rows are suppressed when profiler/APS rows are
-available, because the fallback path is heuristic. APS rows include `metrics`
-and `metric_metadata`; metadata is populated
-from local Apple/Xcode counter catalogs with counter keys, units, groups,
-timeline groups, visibility flags, and descriptions where available.
-
-For end-user raw counter inspection without a counter CSV, use `raw-counters`.
-It reports the decoded `.gpuprofiler_raw/streamData` metadata, schemas,
-`GPRWCNTR` streams, raw counter ids, and any matching derived counter
-names from installed AGX Metal statistics/perf counter catalogs. It also
-exposes embedded APS trace-id maps and `program_address_mappings` for
-joining samples to shader code. `profiling_address_summary` uses those
-ranges to scan `Profiling_f_*` payloads and rank shader/function low32
-address hits. In JSON, `derived_metrics` contains finite values from
-running the locally available AGX `*-derived.js` formulas against decoded
-raw variables; `grouped_derived_metrics` splits those values by raw
-sample group/source and includes counter graph metadata plus
-profiler-dispatch join fields only when the bundle exposes overlapping
-raw counter and `streamData` tick windows:
-
-```bash
-gputrace raw-counters /abs/path/input-perfdata.gputrace --format text
-gputrace raw-counters /abs/path/input-perfdata.gputrace --format json
-```
-
-To see what parts of the profiler bundle are decoded versus still opaque,
-use the coverage report:
-
-```bash
-gputrace profiler-coverage /abs/path/input-perfdata.gputrace --format text
-gputrace profiler-coverage /abs/path/input-perfdata.gputrace --format json
-```
-
-It reports byte share for `streamData`, `Profiling_f_*`, `Counters_f_*`,
-`Timeline_f_*`, and other raw families, plus decoded APS archive counts
-and the largest opaque files.
-
-If you are debugging counter parity or correlating against an exported
-counter CSV, use the structured probe:
-
-```bash
-gputrace raw-counter-probe /abs/path/input-perfdata.gputrace --metric "Instruction Throughput Limiter"
-gputrace raw-counter-probe /abs/path/input-perfdata.gputrace --metric "ALU Utilization" --format json
-```
-
-The raw probe decodes aggregate metadata such as timebase, encoder sample
-indices, encoder trace-id rows, `GPRWCNTR` record sizes, and per-pass
-counter schemas.
 
 ## 6. Common Failure Modes
 
@@ -273,10 +151,8 @@ counter schemas.
 - GPU command-buffer timeout: usually means the trace is too large or
   you're running on a paravirt-GPU VM. Capture a smaller pulse/step, or
   run profile on real Apple Silicon hardware.
-- `profiler` says no `.gpuprofiler_raw`: rerun `gputrace profile` to
-  produce one, or pass `gputrace report --profiler <DIR>` to point at an
-  existing one.
-- Raw trace shows one dispatch but profiler shows many: use the profiler
-  report for timing and optimization ranking.
-- `xcode-counters` refuses nearby CSVs: pass `--csv` with the exact CSV;
-  this avoids accidentally analyzing counters from a different trace.
+- `report` exits with `missing required trace file: .../metadata`: you
+  pointed it at the `-perfdata.gputrace` bundle. Pass the original
+  `.gputrace` and use `--profiler` for the raw directory.
+- `report` says no `.gpuprofiler_raw`: rerun `gputrace profile` to produce
+  one, or pass `--profiler <DIR>` to point at an existing one.

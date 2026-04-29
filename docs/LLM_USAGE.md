@@ -1,20 +1,25 @@
 # LLM Usage Guide
 
 This guide is for coding agents or analysis agents using `gputrace` as a local
-tool. Prefer the one-shot Markdown report first; use individual JSON commands
-only for narrow drill-downs.
+tool. Single-trace work is always: profile, then report, then read the
+markdown directory.
 
 ## Basic Rules
 
-- Use absolute trace paths when possible.
-- Prefer `gputrace report --output DIR` for single-trace triage.
-- Prefer `--format json` only when a follow-up needs one specific structured
-  object.
-- Prefer `--csv` for tabular diff slices that will be post-processed.
-- Do not use missing Go-era features: pprof, Perfetto export, live capture, or
-  web serving.
-- Xcode automation requires macOS Accessibility permission for the installed
-  `gputrace` binary.
+- Use absolute trace paths.
+- For single-trace triage, use `gputrace report --output DIR` and read the
+  markdown files it writes. Do not invoke per-section commands like
+  `profiler`, `analyze`, `xcode-mio`, `insights`, `shaders`,
+  `raw-counters`, `profiler-coverage`, `export-counters`,
+  `xcode-counters`, `raw-counter-probe`, `command-buffers`, `encoders`,
+  `kernels`, `api-calls`, `timeline`, or `buffers list` — `report` already
+  writes those sections into the report directory in one shot. The
+  individual commands exist for plumbing/parity tests, not for users.
+- Use `diff` (not `report`) when comparing two profiled traces.
+- Do not use missing Go-era features: pprof, Perfetto export, live capture,
+  or web serving.
+- Xcode automation requires macOS Accessibility permission for the
+  installed `gputrace` binary.
 
 ## Installation Check
 
@@ -24,84 +29,41 @@ gputrace --version
 gputrace xcode-check-permissions --no-prompt
 ```
 
-If Accessibility is not granted, run:
-
-```bash
-gputrace xcode-check-permissions
-```
-
-Then approve `gputrace` in System Settings > Privacy & Security >
-Accessibility.
+If Accessibility is not granted, run `gputrace xcode-check-permissions` and
+approve `gputrace` in System Settings > Privacy & Security > Accessibility.
 
 ## Triage A Single Trace
 
-Run this first:
+Profile the original `.gputrace`, then run `report` against it. The perfdata
+bundle is just a wrapper around `<stem>.gpuprofiler_raw/`; pass that
+directory to `--profiler`. Pointing `report` at the perfdata bundle directly
+fails with `missing required trace file: .../metadata`.
 
 ```bash
-gputrace report /abs/path/trace-perfdata.gputrace --output /abs/path/trace-report
+gputrace profile /abs/path/trace.gputrace \
+  --output /abs/path/trace-perfdata.gputrace
+gputrace report /abs/path/trace.gputrace \
+  --profiler /abs/path/trace-perfdata.gputrace/trace.gpuprofiler_raw \
+  --output /abs/path/trace-report
 ```
 
-Read `/abs/path/trace-report/index.md`, then follow links to the focused
-Markdown files. The report command writes `xcode-mio.md`, `analysis.md`,
-`insights.md`, `profiler.md`, `profiler-coverage.md`, `timing.md`,
-`shaders.md`, and `counters.md` when those sections are available. It reuses
-the Xcode MIO private-framework summary across analysis and insights, and it
-records legacy structural parser failures in `index.md` instead of requiring
-agents to run those commands by hand.
+Read `/abs/path/trace-report/index.md`, then follow links into
+`xcode-mio.md`, `analysis.md`, `insights.md`, `profiler.md`, `timing.md`,
+`shaders.md`, `counters.md`, and `profiler-coverage.md`. The report reuses
+the Xcode MIO private-framework summary across analysis/insights and
+records structural-parser failures in `index.md` rather than expecting an
+agent to run individual commands.
 
-Use these only for targeted follow-up:
-
-```bash
-gputrace stats /abs/path/trace.gputrace
-gputrace analyze /abs/path/trace.gputrace
-gputrace profiler /abs/path/trace.gputrace --format json
-gputrace timing /abs/path/trace.gputrace --format json
-```
-
-For exported Xcode profile bundles, `report` and `analyze` should surface
-unused-resource sidecars when Xcode recorded them. If the report says buffer
-inventory is empty, check this specific command before concluding resource
-analysis is empty:
+For source mapping, search the source tree by the hot kernel names the
+report calls out:
 
 ```bash
-gputrace analyze /abs/path/trace-perfdata.gputrace
-gputrace buffers list /abs/path/trace-perfdata.gputrace --format json
-```
-
-If profiler data is missing, the trace may still support structural commands:
-
-```bash
-gputrace command-buffers /abs/path/trace.gputrace --format json
-gputrace encoders /abs/path/trace.gputrace --format json
-gputrace kernels /abs/path/trace.gputrace --format json
-gputrace buffers list /abs/path/trace.gputrace --format json
-```
-
-## Xcode Profile Workflow
-
-Use this when given an unprofiled `.gputrace` and asked to collect performance
-data through Xcode:
-
-```bash
-gputrace xcode-check-permissions
-gputrace profile /abs/path/input.gputrace --output /abs/path/input-perfdata.gputrace --timeout-seconds 300
-gputrace profiler /abs/path/input-perfdata.gputrace --format json
-```
-
-For the complete operational runbook, including split recovery commands,
-export verification, and interpretation caveats, see
-[`docs/PROFILE_WORKFLOW.md`](PROFILE_WORKFLOW.md).
-
-Useful debugging commands:
-
-```bash
-gputrace xcode-windows --format json
-gputrace xcode-status /abs/path/input.gputrace --format json
-gputrace xcode-profile list-buttons /abs/path/input.gputrace --format json
-gputrace xcode-profile list-tabs /abs/path/input.gputrace --format json
+rg -n 'hot_kernel_name|another_hot_kernel' /abs/path/source/root
 ```
 
 ## Diff Workflow
+
+`diff` is the one workflow `report` does not cover.
 
 For a quick human triage:
 
@@ -115,7 +77,7 @@ For structured output:
 gputrace diff /abs/path/left-perfdata.gputrace /abs/path/right-perfdata.gputrace --json
 ```
 
-For focused CSV views:
+For focused CSV slices:
 
 ```bash
 gputrace diff left.gputrace right.gputrace --csv --by function --limit 50
@@ -138,181 +100,16 @@ gputrace diff --bench-dir /abs/path/bench-traces --quick --by-encoder
 gputrace diff --bench-dir /abs/path/bench-traces --json
 ```
 
-## Shader And Counter Workflow
-
-For normal agent workflows, start with:
-
-```bash
-gputrace report trace-perfdata.gputrace --output trace-report
-```
-
-Then use individual commands below only to drill into a section.
-
-```bash
-gputrace xcode-counters trace-perfdata.gputrace --format summary
-gputrace xcode-counters trace-perfdata.gputrace --format json
-gputrace export-counters trace-perfdata.gputrace --format json
-gputrace xcode-mio trace-perfdata.gputrace
-gputrace xcode-mio trace-perfdata.gputrace --format summary-json
-gputrace shaders trace-perfdata.gputrace --format json
-gputrace shader-hotspots trace-perfdata.gputrace kernel_name --search-path /abs/path/src --format json
-gputrace shader-source trace-perfdata.gputrace kernel_name --search-path /abs/path/src --format text
-```
-
-If an Xcode counter CSV was exported separately:
-
-```bash
-gputrace xcode-counters trace-perfdata.gputrace --csv /abs/path/Counters.csv --format json
-gputrace xcode-counters trace-perfdata.gputrace --csv /abs/path/Counters.csv --metric "Kernel Invocations" --top 20
-gputrace validate-counters trace-perfdata.gputrace --csv /abs/path/Counters.csv --format json
-```
-
-`xcode-counters` only auto-discovers exact trace-name CSV matches. If there are
-nearby unrelated `*Counters.csv` files, pass `--csv` explicitly.
-
-Profiler-backed exports may have little structural dispatch data while
-`streamData` contains the useful kernel list. In that case, `command-buffers`,
-`encoders`, `shaders`, `shader-source`, `shader-hotspots`, and
-`mtlb functions --used-only` use profiler timing/name fallbacks where possible.
-`shaders` also includes `profiling_address_hits` and
-`profiling_address_percent` when `Profiling_f_*` address samples can be joined
-through APS program-address mappings; keep duration/cost as the primary ranking
-signal and use address hits as an additional per-shader signal.
-
-Do not interpret `profiler.stream_data_summary.pipeline_id_scan_costs` as
-Xcode Cost. It is a retained debug signal from scanning `Profiling_f_*` bytes
-for known pipeline IDs and is known to disagree with Xcode's Cost view on real
-exports. For ranking without a counter CSV, use profiler duration fields. For
-Xcode counter parity, use an exported Xcode counter CSV with `xcode-counters`
-or `validate-counters`.
-
-On macOS with Xcode installed, `xcode-mio` loads Xcode's private
-`GTShaderProfiler` framework and decodes the exported `streamData` into the
-same structured GPU command, encoder, and pipeline topology Xcode builds
-internally. Use it to confirm command counts, pipeline object ids, pipeline
-addresses, function-name mapping, and shader-binary references. The default
-format is the LLM-friendly summary; `--format summary-json` is the compact
-machine-readable form, and `--format json` is the full private object graph.
-Do not treat `cost_record_count` as decoded Xcode Cost; it is only the number
-of private cost records observed.
-
-For a single machine-readable offline feed, prefer `export-counters --format
-json`. It combines profiler/timeline rows with decoded APS counter sample rows
-when present. Inspect each row's `metric_source`:
-
-- `profile-dispatch-time`: per-kernel rows synthesized from real `streamData`
-  dispatch durations when Xcode Cost rows are not separately decoded.
-- `profile-execution-cost`: per-kernel rows from decoded execution-cost data
-  when present.
-- `aps-counter-samples`: rows from decoded `APSCounterData` sample windows.
-- `raw-counter` or timeline-derived sources: fallback timeline/counter rows,
-  emitted only when richer profiler/APS rows are unavailable.
-
-For `aps-counter-samples`, JSON rows include `metrics` and `metric_metadata`.
-`metric_metadata` contains the Apple counter key, type, description, unit,
-counter graph groups, timeline groups, and visibility flags from local
-Xcode/AGX catalogs when available. Do not require or look for a
-`Counters.csv` file for this path; CSV exports are only for `xcode-counters`
-parity/validation.
-
-For end-user raw counter inspection without a counter CSV, use `raw-counters`.
-It reads `.gpuprofiler_raw/streamData` and reports aggregate metadata,
-per-sample-group schemas, decoded `GPRWCNTR` streams, raw counter ids, and
-trace-id maps from embedded APS metadata such as `TraceId to BatchId` and
-`TraceId to SampleIndex`. It also exposes APS `program_address_mappings`: the
-encoder trace id, draw/function index, shader index, binary id, mapped address,
-and mapped size records that bridge USC/MIO samples back to shader address
-ranges. `profiling_address_summary` scans `Profiling_f_*` payloads against
-those ranges and reports low32 address-derived shader/function hit counts. When
-available, it enriches raw hashes from installed AGX Metal statistics/perf
-counter plists under `/System/Library/Extensions`. The JSON report includes
-`derived_metrics` when local AGX `*-derived.js` files can be evaluated from
-decoded raw variables. Treat these as offline Apple-formula counter values; they
-do not depend on, or require, an exported Xcode counter CSV.
-`grouped_derived_metrics` contains the same formula output split by raw counter
-sample group/source and includes counter graph metadata where local Xcode/AGX
-catalogs expose it. It also carries profiler dispatch metadata when a trace's
-raw counter timestamps overlap `streamData` dispatch tick windows; if they do
-not, the report warns rather than fabricating a dispatch join:
-
-```bash
-gputrace raw-counters trace-perfdata.gputrace --format text
-gputrace raw-counters trace-perfdata.gputrace --format json
-gputrace raw-counters trace-perfdata.gputrace --format csv
-```
-
-When you need to know whether a profiler export is fully understood, run:
-
-```bash
-gputrace profiler-coverage trace-perfdata.gputrace --format json
-```
-
-Treat this as the source of truth for decode coverage. It reports byte
-share by profiler-bundle family and explicitly labels `streamData`,
-`Profiling_f_*`, `Counters_f_*`, `Timeline_f_*`, and other raw files as
-semantic, partial, heuristic, or opaque. Do not infer that missing values
-are unavailable unless this report shows the relevant bytes have been
-accounted for.
-
-For raw counter inspection and CSV correlation, use the hidden structured
-`APSCounterData` probe instead of old `Counters_f_N` assumptions:
-
-```bash
-gputrace raw-counter-probe trace-perfdata.gputrace --format text
-gputrace raw-counter-probe trace-perfdata.gputrace --metric "Instruction Throughput Limiter" --format json
-gputrace raw-counter-probe trace-perfdata.gputrace --metric "ALU Utilization" --format json
-```
-
-`raw-counter-probe` is hidden from top-level help because it is a
-diagnostic command, not the user-facing report. Its normal path decodes
-`.gpuprofiler_raw/streamData` aggregate metadata, `GPRWCNTR` record sizes,
-per-sample-group counter schemas from `Subdivided Dictionary/passList`, and
-normalized `raw_counter / GRC_GPU_CYCLES * 100` candidates. It reports
-candidate matches against an exported Xcode counter CSV when one is discoverable
-or passed with `--csv`.
-
-Only use `--scan-files` when intentionally investigating raw `Counters_f_*.raw`
-record shapes; it scans large files and is not needed for the structured
-aggregate decoder.
-
-## Markdown Rendering
-
-Use built-in Markdown commands when producing human-readable summaries:
-
-```bash
-gputrace markdown analyze trace.gputrace > analysis.md
-gputrace markdown diff left.gputrace right.gputrace > diff.md
-gputrace markdown buffers trace.gputrace > buffers.md
-gputrace markdown buffers-diff left.gputrace right.gputrace > buffers-diff.md
-```
-
-`markdown render` converts Markdown text to HTML:
-
-```bash
-gputrace markdown render '# Title'
-```
-
-## Output Selection
-
-Use this decision table:
-
-| Need | Command style |
-| --- | --- |
-| Parse in an agent | `--format json` or `--json` |
-| Sort/filter in shell | `--csv --by ...` |
-| Send to a human | `--markdown --md-out ...` |
-| Fast performance answer | `diff --quick --by-encoder` |
-| Xcode automation state | `xcode-status`, `xcode-windows`, `xcode-profile list-*` with `--format json` |
-
 ## Common Failure Modes
 
-- `Accessibility permission is required`: run `gputrace xcode-check-permissions`
-  and approve the installed binary in System Settings.
-- Empty profiler/timing output: the trace may not contain `.gpuprofiler_raw`;
-  use structural analysis or run `xcode-profile run`.
-- `xcode-counters` refuses a nearby CSV: pass the exact Xcode-exported CSV with
-  `--csv`; do not let an agent pick a same-directory CSV by guesswork.
+- `Accessibility permission is required`: run
+  `gputrace xcode-check-permissions` and approve the installed binary in
+  System Settings.
+- `report` exits with `missing required trace file: .../metadata`: you
+  pointed it at the `-perfdata.gputrace` bundle. Pass the original
+  `.gputrace` and use `--profiler` for the raw directory.
+- `report` says no `.gpuprofiler_raw`: the trace was never profiled. Run
+  `gputrace profile` first, or pass `--profiler <DIR>` to point at an
+  existing raw directory.
 - Diff has many unmatched dispatches: compare the same workload and prefer
-  profiled `-perfdata.gputrace` bundles.
-- Shader source not found: pass all relevant source roots with repeated
-  `--search-path`.
+  profiled `-perfdata.gputrace` bundles on both sides.
