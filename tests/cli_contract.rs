@@ -35,8 +35,6 @@ fn top_level_help_lists_current_analysis_commands() {
         "profiler-coverage",
         "mtlb-functions",
         "xcode-counters",
-        "xcode-check-permissions",
-        "xcode-profile",
         "profile",
         "buffers",
     ] {
@@ -45,10 +43,6 @@ fn top_level_help_lists_current_analysis_commands() {
             "top-level help should mention {subcommand}\n{help}"
         );
     }
-    assert!(
-        !help.contains("xcode-windows"),
-        "top-level help should hide AX debug probes\n{help}"
-    );
 }
 
 #[test]
@@ -224,13 +218,6 @@ fn timing_profiler_alias_parses() {
 }
 
 #[test]
-fn xcode_status_help_keeps_trace_and_format_flags() {
-    let help = render_help(&["xcode-status"]);
-    assert!(help.contains("xcode-status"));
-    assert!(help.contains("--format"));
-}
-
-#[test]
 fn xcode_counters_help_mentions_metric_and_top() {
     let help = render_help(&["xcode-counters"]);
     assert!(help.contains("<TRACE>"));
@@ -240,171 +227,14 @@ fn xcode_counters_help_mentions_metric_and_top() {
 }
 
 #[test]
-fn xcode_wait_help_mentions_status_and_timeout() {
-    let help = render_help(&["xcode-wait"]);
-    assert!(help.contains("--status"));
-    assert!(help.contains("--timeout-seconds"));
-}
-
-#[test]
-fn xcode_check_permissions_help_mentions_no_prompt() {
-    let help = render_help(&["xcode-check-permissions"]);
-    assert!(help.contains("--no-prompt"));
-    assert!(help.contains("--format"));
-}
-
-#[test]
-fn xcode_click_button_help_mentions_target() {
-    let help = render_help(&["xcode-click-button"]);
-    assert!(help.contains("<TARGET>"));
-}
-
-#[test]
-fn xcode_checkboxes_help_mentions_format() {
-    let help = render_help(&["xcode-checkboxes"]);
-    assert!(help.contains("--format"));
-}
-
-#[test]
-fn xcode_close_help_mentions_format() {
-    let help = render_help(&["xcode-close"]);
-    assert!(help.contains("--format"));
-}
-
-#[test]
-fn xcode_ensure_checked_help_mentions_target() {
-    let help = render_help(&["xcode-ensure-checked"]);
-    assert!(help.contains("<TARGET>"));
-}
-
-#[test]
-fn xcode_select_tab_help_mentions_target() {
-    let help = render_help(&["xcode-select-tab"]);
-    assert!(help.contains("<TARGET>"));
-}
-
-#[test]
-fn xcode_toggle_checkbox_help_mentions_target() {
-    let help = render_help(&["xcode-toggle-checkbox"]);
-    assert!(help.contains("<TARGET>"));
-}
-
-#[test]
-fn xcode_show_performance_help_mentions_format() {
-    let help = render_help(&["xcode-show-performance"]);
-    assert!(help.contains("--format"));
-}
-
-#[test]
-fn xcode_show_summary_help_mentions_format() {
-    let help = render_help(&["xcode-show-summary"]);
-    assert!(help.contains("--format"));
-}
-
-#[test]
-fn xcode_show_counters_help_mentions_format() {
-    let help = render_help(&["xcode-show-counters"]);
-    assert!(help.contains("--format"));
-}
-
-#[test]
-fn xcode_show_memory_help_mentions_format() {
-    let help = render_help(&["xcode-show-memory"]);
-    assert!(help.contains("--format"));
-}
-
-#[test]
-fn xcode_show_dependencies_help_mentions_format() {
-    let help = render_help(&["xcode-show-dependencies"]);
-    assert!(help.contains("--format"));
-}
-
-#[test]
-fn xcode_export_counters_help_mentions_output() {
-    let help = render_help(&["xcode-export-counters"]);
-    assert!(help.contains("<OUTPUT>"));
-    assert!(help.contains("--format"));
-}
-
-#[test]
-fn xcode_export_memory_help_mentions_output() {
-    let help = render_help(&["xcode-export-memory"]);
-    assert!(help.contains("<OUTPUT>"));
-    assert!(help.contains("--format"));
-}
-
-#[test]
-fn xcode_profile_help_mentions_no_prompt() {
-    let help = render_help(&["xcode-profile"]);
-    assert!(help.contains("--no-prompt"));
-    assert!(help.contains("--timeout-seconds"));
-    assert!(help.contains("--wait-seconds"));
-    assert!(help.contains("--force"));
-    for subcommand in [
-        "open",
-        "check-status",
-        "check-permissions",
-        "run",
-        "run-profile",
-        "wait-profile",
-        "export",
-    ] {
-        assert!(
-            help.contains(subcommand),
-            "xcode-profile help should mention {subcommand}\n{help}"
-        );
-    }
-    assert!(
-        !help.contains("list-buttons"),
-        "xcode-profile help should hide low-level AX probes\n{help}"
-    );
-}
-
-#[test]
 fn profile_help_mentions_capture_profile_contract() {
     let help = render_help(&["profile"]);
     assert!(help.contains("<TRACE>"));
     assert!(help.contains("--output <OUTPUT>"));
-    assert!(help.contains("--timeout-seconds"));
-    assert!(help.contains("--wait-seconds"));
-    assert!(help.contains("--force"));
-    assert!(help.contains("--no-prompt"));
-    assert!(help.contains(".gpuprofiler_raw/streamData"));
-}
-
-#[test]
-fn xcode_profile_aliases_and_nested_workflow_parse() {
-    for args in [
-        vec!["gputrace", "xp", "run", "trace.gputrace", "--no-prompt"],
-        vec![
-            "gputrace",
-            "collect-xcode-profile",
-            "check-status",
-            "trace.gputrace",
-            "--format",
-            "json",
-        ],
-        vec!["gputrace", "xcode-profile", "run-profile", "trace.gputrace"],
-        vec![
-            "gputrace",
-            "xcode-profile",
-            "wait-profile",
-            "trace.gputrace",
-            "--timeout-seconds",
-            "1",
-        ],
-        vec![
-            "gputrace",
-            "xcode-profile",
-            "xcode-export-counters",
-            "Counters.csv",
-            "--trace",
-            "trace.gputrace",
-        ],
-    ] {
-        let cli = Cli::try_parse_from(args.clone());
-        assert!(cli.is_ok(), "failed to parse {args:?}: {cli:?}");
-    }
+    assert!(help.contains("--stdout-log <STDOUT_LOG>"));
+    assert!(help.contains("--stderr-log <STDERR_LOG>"));
+    assert!(help.contains("[default: text]"));
+    assert!(help.contains(".gpuprofiler_raw"));
 }
 
 #[test]
@@ -564,9 +394,6 @@ fn important_top_level_commands_parse_their_existing_contracts() {
             "trace.gputrace",
             "--output",
             "trace-perfdata.gputrace",
-            "--timeout-seconds",
-            "1",
-            "--no-prompt",
         ],
         vec![
             "gputrace",
@@ -666,37 +493,6 @@ fn important_top_level_commands_parse_their_existing_contracts() {
             "right.gputrace",
             "--format",
             "markdown",
-        ],
-        vec!["gputrace", "xcode-windows", "--format", "json"],
-        vec![
-            "gputrace",
-            "xcode-inspect",
-            "trace.gputrace",
-            "--format",
-            "json",
-        ],
-        vec![
-            "gputrace",
-            "xcode-buttons",
-            "trace.gputrace",
-            "--format",
-            "json",
-        ],
-        vec!["gputrace", "xcode-tabs", "--format", "json"],
-        vec![
-            "gputrace",
-            "xcode-ui-elements",
-            "trace.gputrace",
-            "--format",
-            "json",
-        ],
-        vec![
-            "gputrace",
-            "xcode-menu-items",
-            "File",
-            "Export",
-            "--format",
-            "json",
         ],
     ] {
         Cli::try_parse_from(argv).unwrap();

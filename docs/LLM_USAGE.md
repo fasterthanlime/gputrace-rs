@@ -18,19 +18,14 @@ markdown directory.
 - Use `diff` (not `report`) when comparing two profiled traces.
 - Do not use missing Go-era features: pprof, Perfetto export, live capture,
   or web serving.
-- Xcode automation requires macOS Accessibility permission for the
-  installed `gputrace` binary.
 
 ## Installation Check
 
 ```bash
 cargo xtask install
 gputrace --version
-gputrace xcode-check-permissions --no-prompt
 ```
 
-If Accessibility is not granted, run `gputrace xcode-check-permissions` and
-approve `gputrace` in System Settings > Privacy & Security > Accessibility.
 
 ## Triage A Single Trace
 
@@ -102,9 +97,6 @@ gputrace diff --bench-dir /abs/path/bench-traces --json
 
 ## Common Failure Modes
 
-- `Accessibility permission is required`: run
-  `gputrace xcode-check-permissions` and approve the installed binary in
-  System Settings.
 - `report` exits with `missing required trace file: .../metadata`: you
   pointed it at the `-perfdata.gputrace` bundle. Pass the original
   `.gputrace` and use `--profiler` for the raw directory.

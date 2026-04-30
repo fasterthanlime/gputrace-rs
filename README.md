@@ -11,12 +11,7 @@ cargo xtask install
 
 The installer builds the `gputrace` release binary, copies it to
 `~/.cargo/bin/gputrace`, signs the installed copy in place for stable macOS TCC
-identity, verifies `gputrace --version`, and checks/requests Accessibility
-permission for Xcode automation.
-
-Accessibility is a macOS privacy permission, not a codesign entitlement. If the
-installer reports that Accessibility is not granted, enable
-`~/.cargo/bin/gputrace` in System Settings > Privacy & Security > Accessibility.
+identity, and verifies `gputrace --version`.
 
 ## Quick Start
 
@@ -40,8 +35,6 @@ gputrace report trace.gputrace \
 gputrace diff left-perfdata.gputrace right-perfdata.gputrace --quick
 gputrace diff left-perfdata.gputrace right-perfdata.gputrace --markdown --md-out report.md
 
-# Xcode profile automation.
-gputrace xcode-check-permissions
 ```
 
 `report` is the only analysis command end users should need. It loads Xcode's
@@ -65,7 +58,7 @@ Included in this Rust port:
 
 - Trace parsing and structural analysis.
 - Profiler streamData/raw timing analysis.
-- Xcode UI automation for profiling and exports.
+- Headless MTLReplayer profiling.
 - Xcode counter CSV import/validation.
 - Shader, buffer, command-buffer, timing, diff, and markdown reporting.
 - Benchmark pair discovery for diffing Go/Python trace outputs.

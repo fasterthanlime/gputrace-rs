@@ -72,7 +72,6 @@ fn install() {
     if !verify_installed_binary(&installed_binary) {
         std::process::exit(1);
     }
-    check_accessibility_permission(&installed_binary);
 }
 
 fn workspace_root() -> PathBuf {
@@ -153,33 +152,6 @@ fn codesign_identity() -> Option<String> {
         })
         .map(|(identity, _)| identity.to_owned())
 }
-
-#[cfg(target_os = "macos")]
-fn check_accessibility_permission(binary: &Path) {
-    println!("checking/requesting Accessibility permission...");
-    let output = Command::new(binary)
-        .arg("xcode-check-permissions")
-        .output()
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to run {} xcode-check-permissions: {error}",
-                binary.display()
-            )
-        });
-    if output.status.success() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-        return;
-    }
-
-    eprintln!("Accessibility is not granted for {}.", binary.display());
-    eprintln!(
-        "Grant it in System Settings > Privacy & Security > Accessibility, then rerun: {} xcode-check-permissions --no-prompt",
-        binary.display()
-    );
-}
-
-#[cfg(not(target_os = "macos"))]
-fn check_accessibility_permission(_binary: &Path) {}
 
 fn run(command: &mut Command, description: &str) {
     let status = command
