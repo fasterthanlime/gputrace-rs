@@ -681,36 +681,63 @@ fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
     // format the encoder labels typically live as *nested* sub-records inside
     // bulk CtU/Unknown records, not as top-level CS records. We walk both:
     // first the top-level MTSP records, then the nested sub-record streams
-    // inside each top-level record's payload. Every CS sub-record we find is
-    // a labeled-resource candidate — `commands::encoders` filters out the
-    // ones that aren't referenced by any dispatch or command-buffer region.
+    // inside each top-level record's payload.
+    //
+    // To discriminate compute encoders from MTLBuffers, look for a CtU
+    // sibling: every MTLBuffer in this format is announced by a CtU record
+    // (with a name like `MTLBuffer-1681-0`) at the same address as its CS
+    // label. Compute encoders and command buffers don't get that
+    // announcement. So `CS without matching CtU == compute infrastructure`.
     let Ok(records) = MTSPRecord::parse_stream(data) else {
         return Vec::new();
     };
-    let mut encoders = Vec::new();
-    for record in records {
-        if record.record_type == RecordType::CS
-            && let (Some(address), Some(label)) = (record.address, record.label.clone())
-            && !label.is_empty()
+
+    let mut buffer_addresses: BTreeSet<u64> = BTreeSet::new();
+    let visit_ctu = |record: &MTSPRecord, dst: &mut BTreeSet<u64>| {
+        if record.record_type == RecordType::CtU
+            && let Ok(ctu) = record.parse_ctu_record()
         {
+            dst.insert(ctu.address);
+        }
+    };
+    for record in &records {
+        visit_ctu(record, &mut buffer_addresses);
+        for nested in MTSPRecord::parse_subrecords(&record.data) {
+            visit_ctu(&nested, &mut buffer_addresses);
+        }
+    }
+
+    let mut encoders = Vec::new();
+    let push_if_encoder =
+        |address: u64, label: Option<String>, offset: usize, encoders: &mut Vec<ComputeEncoder>| {
+            let Some(label) = label else { return };
+            if label.is_empty() || buffer_addresses.contains(&address) {
+                return;
+            }
             encoders.push(ComputeEncoder {
                 index: encoders.len(),
                 address,
                 label,
-                offset: record.offset,
+                offset,
             });
+        };
+
+    for record in records {
+        if record.record_type == RecordType::CS
+            && let Some(address) = record.address
+        {
+            push_if_encoder(address, record.label.clone(), record.offset, &mut encoders);
         }
         for nested in MTSPRecord::parse_subrecords(&record.data) {
             if nested.record_type == RecordType::CS
-                && let (Some(address), Some(label)) = (nested.address, nested.label)
-                && !label.is_empty()
+                && let Some(address) = nested.address
             {
-                encoders.push(ComputeEncoder {
-                    index: encoders.len(),
+                push_if_encoder(
                     address,
-                    label,
-                    offset: record.offset + nested.offset,
-                });
+                    nested.label,
+                    record.offset + nested.offset,
+                    &mut encoders,
+                );
             }
         }
     }
