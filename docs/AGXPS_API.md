@@ -246,6 +246,61 @@ Decoding requires either the vtable for `get_counter_values_by_index`
 RE on the host's richer
 `agxps_aps_kick_time_stats_create_sampled` build.
 
+### `kick_start`, `kick_end`, `synchronized_timestamps` are packed
+
+The u64 values returned by `agxps_aps_profile_data_get_kick_start`,
+`get_kick_end`, and `get_synchronized_timestamps` are NOT plain
+timestamps — they're packed as:
+
+```
+high 32 bits = profile-clock tick count
+low  32 bits = usc_sample_index
+```
+
+Cross-check from `synchronized_timestamps`:
+
+| index | raw value           | high32 (time) | low32 (sample) |
+| ----- | ------------------- | ------------- | -------------- |
+| 0     | `0x0000000e_00000000` | 14          | 0              |
+| 1     | `0x00000024_00000001` | 36          | 1              |
+| 5373  | `0x0001c2b3_000014fd` | 115 379     | 5 373          |
+
+The low32 of `synchronized_timestamps[i]` is exactly `i`, confirming
+it's the sample index. For `kick_start` / `kick_end`, the low32 is
+the index into the `usc_timestamps` array of the sample that bracketed
+the kick boundary.
+
+**Profile-clock period (M4 Pro):** ~3.89 ns/tick, derived empirically
+by mapping the trace's tick span (108 285 ticks for the qa-decode
+sample) against Xcode's reported wall total of 421.08 µs:
+
+```
+108 285 ticks × 3.89 ns/tick ≈ 421.23 µs   (vs Xcode 421.08, 0.04% off)
+```
+
+That clock corresponds to ~257 MHz, consistent with an Apple GPU PMU
+sampler clock.
+
+### Why `(kick_end_time - kick_start_time)` is NOT compute time
+
+Even with the packing fixed, summing `(end_time - start_time)` per
+kick gives ~10× too much for small kernels (e.g. light_add yields
+9.3 % of summed lifetime vs Xcode's 0.10 % of compute). That's
+because the kick *lifetime* (event start → event end) includes wait
+windows, cross-kick synchronization, and any overlap with parallel
+kicks on other cores.
+
+To match Xcode's per-pipeline numbers we still need either:
+
+- A per-kick **counter value** (e.g. ALU active cycles) via
+  `get_counter_values_by_index` — currently bound but not yet
+  invoked.
+- Or `agxps_aps_kick_time_stats_create_sampled`, which is what Xcode
+  itself uses. Disassembly shows it allocates Apple closure-blocks
+  on the stack and calls a generic `agxps_stats_create` engine —
+  callable from Rust but requires synthesizing a block-literal
+  with an invoke pointer (non-trivial).
+
 ## Open questions / next steps
 
 1. **No `kick_end` or `kick_duration` in the VM build.** Per-kick

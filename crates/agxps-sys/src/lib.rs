@@ -353,7 +353,46 @@ pub struct DecodedProfile {
     pub counter_num: u32,
 }
 
+/// Decompose a packed timestamp/index value: `kick_start`, `kick_end`,
+/// and `synchronized_timestamps` entries are stored as
+/// `(time << 32) | usc_sample_index`. The `time` is in GPU profile-clock
+/// ticks (~3.89 ns/tick on M4 Pro, derived empirically by mapping the
+/// trace's tick span against Xcode's wall-clock total). The
+/// `usc_sample_index` cross-references into the `usc_timestamps` /
+/// `synchronized_timestamps` arrays.
+#[inline]
+pub fn unpack_time_sample(value: u64) -> (u32, u32) {
+    ((value >> 32) as u32, (value & 0xffff_ffff) as u32)
+}
+
 impl DecodedProfile {
+    /// Kick start time in profile-clock ticks (high 32 bits of the
+    /// raw value). Use `kick_start_sample(i)` to get the sample index
+    /// (low 32 bits), useful for cross-referencing usc/sync timestamps.
+    #[inline]
+    pub fn kick_start_time(&self, i: usize) -> u32 {
+        unpack_time_sample(self.kick_starts[i]).0
+    }
+
+    /// Kick start sample index (low 32 bits of the raw value).
+    #[inline]
+    pub fn kick_start_sample(&self, i: usize) -> u32 {
+        unpack_time_sample(self.kick_starts[i]).1
+    }
+
+    /// Kick end time in profile-clock ticks (high 32 bits of the raw
+    /// value).
+    #[inline]
+    pub fn kick_end_time(&self, i: usize) -> u32 {
+        unpack_time_sample(self.kick_ends[i]).0
+    }
+
+    /// Kick end sample index (low 32 bits of the raw value).
+    #[inline]
+    pub fn kick_end_sample(&self, i: usize) -> u32 {
+        unpack_time_sample(self.kick_ends[i]).1
+    }
+
     /// Kick count grouped by `software_id` high 16 bits (= kernel/clique).
     pub fn group_by_clique(&self) -> std::collections::BTreeMap<u16, usize> {
         let mut counts = std::collections::BTreeMap::new();
@@ -363,16 +402,27 @@ impl DecodedProfile {
         counts
     }
 
-    /// Sum of `kick_end - kick_start` (in raw GPU ticks) grouped by
-    /// `software_id` high 16 bits. Kicks with `missing_end=true` are
-    /// skipped.
+    /// Sum of `kick_end_time - kick_start_time` (in profile-clock
+    /// ticks) grouped by `software_id` high 16 bits. Kicks with
+    /// `missing_end=true` are skipped.
+    ///
+    /// **Caveat:** this is *kick lifetime* (event start to event end),
+    /// not active GPU compute time. A kick can be "alive" while the
+    /// GPU is doing other work; the duration reported here will
+    /// over-count by any wait/synchronization windows. Use this only
+    /// for relative ordering or rough scaling. To match Xcode's
+    /// per-pipeline cost numbers, you'll need to sum a counter (e.g.
+    /// "ALU active cycles") via the un-bound vtable getters, or call
+    /// `agxps_aps_kick_time_stats_create_sampled` (which takes Apple
+    /// closure blocks).
     pub fn duration_by_clique(&self) -> std::collections::BTreeMap<u16, u64> {
         let mut sums = std::collections::BTreeMap::new();
         for i in 0..self.kick_starts.len() {
             if self.kick_missing_ends[i] {
                 continue;
             }
-            let dur = self.kick_ends[i].saturating_sub(self.kick_starts[i]);
+            let dur =
+                self.kick_end_time(i).saturating_sub(self.kick_start_time(i)) as u64;
             let prefix = (self.kick_software_ids[i] >> 48) as u16;
             *sums.entry(prefix).or_insert(0u64) += dur;
         }

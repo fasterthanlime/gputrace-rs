@@ -80,16 +80,45 @@ fn main() {
         );
     }
 
-    println!("\nfirst 16 kicks:");
+    // The trace's full tick span vs Xcode's wall gives us the
+    // profile-clock period. Empirically ~3.89 ns/tick (≈257 MHz) on
+    // M4 Pro.
+    let min_start_t = (0..decoded.kick_starts.len())
+        .map(|i| decoded.kick_start_time(i))
+        .min()
+        .unwrap_or(0);
+    let max_end_t = (0..decoded.kick_ends.len())
+        .map(|i| decoded.kick_end_time(i))
+        .max()
+        .unwrap_or(0);
+    let span_ticks = max_end_t.saturating_sub(min_start_t);
+    println!(
+        "\ntick span (this bank): {min_start_t} .. {max_end_t}  ({span_ticks} ticks ≈ {:.2} µs at 3.89 ns/tick)",
+        span_ticks as f64 * 3.89 / 1000.0,
+    );
+
+    println!("\nfirst 16 kicks (high32=time-ticks, low32=usc_sample_idx):");
     for i in 0..decoded.kick_starts.len().min(16) {
-        let dur = decoded.kick_ends[i].saturating_sub(decoded.kick_starts[i]);
+        let st = decoded.kick_start_time(i);
+        let ss = decoded.kick_start_sample(i);
+        let et = decoded.kick_end_time(i);
+        let es = decoded.kick_end_sample(i);
+        let dur_ticks = et.saturating_sub(st);
+        let prefix = (decoded.kick_software_ids[i] >> 48) as u16;
+        let sub = (decoded.kick_software_ids[i] & 0xffff) as u16;
         println!(
-            "  [{i:>3}] start={:>15}  end={:>15}  dur={:>12}  slot={:>3}  swid=0x{:016x}",
-            decoded.kick_starts[i],
-            decoded.kick_ends[i],
-            dur,
-            decoded.kick_kick_slots[i],
-            decoded.kick_software_ids[i],
+            "  [{i:>3}] start=({st:>6}t,{ss:>5}s)  end=({et:>6}t,{es:>5}s)  lifetime={dur_ticks:>6}t  prefix=0x{prefix:04x}  sub=0x{sub:04x}",
+        );
+    }
+
+    if !decoded.synchronized_timestamps.is_empty() {
+        let first = decoded.synchronized_timestamps.first().unwrap();
+        let last = decoded.synchronized_timestamps.last().unwrap();
+        let (ft, fs) = agxps_sys::unpack_time_sample(*first);
+        let (lt, ls) = agxps_sys::unpack_time_sample(*last);
+        println!(
+            "\nsynchronized_timestamps: count={}  first=(time={ft}, sample={fs})  last=(time={lt}, sample={ls})",
+            decoded.synchronized_timestamps.len(),
         );
     }
 }
