@@ -1451,7 +1451,6 @@ mod tests {
         profiler::ProfilerStreamDataSummary {
             function_names: vec![],
             pipelines: vec![],
-            pipeline_id_scan_costs: vec![],
             execution_costs: vec![],
             occupancies: vec![],
             dispatches,
@@ -1946,7 +1945,6 @@ mod tests {
                     line_instruction_counts: BTreeMap::new(),
                 }),
             }],
-            pipeline_id_scan_costs: vec![],
             execution_costs: vec![],
             occupancies: vec![],
             dispatches: vec![],

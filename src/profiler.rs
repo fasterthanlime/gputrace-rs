@@ -126,7 +126,6 @@ pub struct GprwcntrTimestamp {
 pub struct ProfilerStreamDataSummary {
     pub function_names: Vec<String>,
     pub pipelines: Vec<ProfilerPipeline>,
-    pub pipeline_id_scan_costs: Vec<ProfilerExecutionCost>,
     pub execution_costs: Vec<ProfilerExecutionCost>,
     pub occupancies: Vec<ProfilerOccupancy>,
     pub dispatches: Vec<ProfilerDispatch>,
@@ -855,19 +854,6 @@ pub fn format_report(report: &ProfilerReport) -> String {
                 ));
             }
         }
-        if !summary.pipeline_id_scan_costs.is_empty() {
-            out.push_str("pipeline-id scan costs (debug only, not Xcode Cost)\n");
-            for cost in summary.pipeline_id_scan_costs.iter().take(5) {
-                let name = cost
-                    .function_name
-                    .clone()
-                    .unwrap_or_else(|| format!("pipeline_{}", cost.pipeline_id));
-                out.push_str(&format!(
-                    "  - {name}: {:.2}% ({} matches)\n",
-                    cost.cost_percent, cost.sample_count
-                ));
-            }
-        }
         if !summary.occupancies.is_empty() {
             out.push_str("top encoder occupancies\n");
             for occupancy in summary.occupancies.iter().take(5) {
@@ -1068,9 +1054,6 @@ fn parse_stream_data(
     let (pipeline_addresses, pipeline_functions) =
         extract_pipeline_info(objects, root, &function_names);
     let pipelines = extract_pipelines(objects, root, &pipeline_addresses, &pipeline_functions);
-    let pipeline_id_scan_costs = profiler_dir
-        .map(|dir| extract_pipeline_id_scan_costs(dir, &pipelines))
-        .unwrap_or_default();
     let occupancies = profiler_dir.map(extract_occupancies).unwrap_or_default();
     let encoder_timings = extract_encoder_timings(objects, root);
     let mut dispatches = extract_dispatches(objects, root, &pipelines);
@@ -1089,76 +1072,12 @@ fn parse_stream_data(
             .map(|encoder| encoder.duration_micros)
             .sum(),
         pipelines,
-        pipeline_id_scan_costs,
         execution_costs: Vec::new(),
         occupancies,
         dispatches,
         encoder_timings,
         timeline,
     })
-}
-
-fn extract_pipeline_id_scan_costs(
-    profiler_dir: &Path,
-    pipelines: &[ProfilerPipeline],
-) -> Vec<ProfilerExecutionCost> {
-    let pipeline_map = pipelines
-        .iter()
-        .map(|pipeline| (pipeline.pipeline_id as u32, pipeline))
-        .collect::<BTreeMap<_, _>>();
-    if pipeline_map.is_empty() {
-        return Vec::new();
-    }
-
-    let Ok(entries) = fs::read_dir(profiler_dir) else {
-        return Vec::new();
-    };
-
-    let mut counts = BTreeMap::<u32, usize>::new();
-    let mut total_samples = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !path.is_file() || !name.starts_with("Profiling_f_") || !name.ends_with(".raw") {
-            continue;
-        }
-        let Ok(data) = fs::read(&path) else {
-            continue;
-        };
-        for chunk in data.chunks_exact(4) {
-            let value = u32::from_le_bytes(chunk.try_into().unwrap());
-            if pipeline_map.contains_key(&value) {
-                *counts.entry(value).or_default() += 1;
-                total_samples += 1;
-            }
-        }
-    }
-
-    if total_samples == 0 {
-        return Vec::new();
-    }
-
-    let mut costs = counts
-        .into_iter()
-        .filter_map(|(pipeline_id, sample_count)| {
-            pipeline_map
-                .get(&pipeline_id)
-                .map(|pipeline| ProfilerExecutionCost {
-                    pipeline_id: pipeline.pipeline_id,
-                    function_name: pipeline.function_name.clone(),
-                    sample_count,
-                    cost_percent: sample_count as f64 / total_samples as f64 * 100.0,
-                })
-        })
-        .collect::<Vec<_>>();
-    costs.sort_by(|left, right| {
-        right
-            .cost_percent
-            .partial_cmp(&left.cost_percent)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.pipeline_id.cmp(&right.pipeline_id))
-    });
-    costs
 }
 
 fn extract_occupancies(profiler_dir: &Path) -> Vec<ProfilerOccupancy> {
@@ -1928,8 +1847,14 @@ fn correlate_dispatch_samples(
     let scale = command_buffer_duration_ticks as f64 / total_dispatch_us as f64 / ticks_per_us;
 
     for index in 0..dispatches.len() {
+        // The first dispatch's `cumulative_us` is the offset from CB start to
+        // dispatch-0-end (it includes leading idle), not its duration. Using
+        // [0, cumulative_us[0]) as a sample window would attribute every
+        // pre-first-dispatch sample to whichever kernel happens to land first.
+        // Match the convention from `extract_dispatches` and give dispatch 0 a
+        // zero-width window so those samples stay unattributed.
         let start_us = if index == 0 {
-            0
+            dispatches[index].cumulative_us
         } else {
             dispatches[index - 1].cumulative_us
         };
@@ -2256,10 +2181,15 @@ mod tests {
         encoder_info[8..16].copy_from_slice(&100_u64.to_le_bytes());
         encoder_info[16..24].copy_from_slice(&250_u64.to_le_bytes());
 
-        let mut gpu_command = vec![0u8; 32];
+        // Two GPU command records so we can exercise both the first-dispatch
+        // (zero-width window) path and the per-dispatch diff path.
+        let mut gpu_command = vec![0u8; 64];
         gpu_command[8..16].copy_from_slice(&(0_u64 << 32).to_le_bytes());
         gpu_command[16..24].copy_from_slice(&90_u64.to_le_bytes());
         gpu_command[24..28].copy_from_slice(&0_u32.to_le_bytes());
+        gpu_command[40..48].copy_from_slice(&(0_u64 << 32).to_le_bytes());
+        gpu_command[48..56].copy_from_slice(&130_u64.to_le_bytes());
+        gpu_command[56..60].copy_from_slice(&0_u32.to_le_bytes());
 
         let objects = vec![
             string("$null"),
@@ -2331,7 +2261,10 @@ mod tests {
     fn encoder_blob() -> Vec<u8> {
         let mut shader_profiler_data = b"GPRWCNTR".to_vec();
         let mut record = vec![0u8; 168];
-        record[0..8].copy_from_slice(&120_u64.to_le_bytes());
+        // Sample timestamp lands inside dispatch[1]'s tick window
+        // (start_us=90, end_us=130, scaled to ticks ~141..160 in the test
+        // fixture's CB coordinate system).
+        record[0..8].copy_from_slice(&150_u64.to_le_bytes());
         record[8..16].copy_from_slice(&4096_u64.to_le_bytes());
         record[16..24].copy_from_slice(&6_u64.to_le_bytes());
         record[24..28].copy_from_slice(&0xffff_ffff_u32.to_le_bytes());
@@ -2463,7 +2396,7 @@ mod tests {
         assert_eq!(summary.function_names, vec!["kernel_main".to_owned()]);
         assert_eq!(summary.num_pipelines, 1);
         assert_eq!(summary.num_encoders, 1);
-        assert_eq!(summary.num_gpu_commands, 1);
+        assert_eq!(summary.num_gpu_commands, 2);
         assert_eq!(summary.total_time_us, 250);
         assert_eq!(summary.pipelines[0].pipeline_id, 27);
         assert_eq!(summary.pipelines[0].pipeline_address, 0x1111);
@@ -2480,6 +2413,9 @@ mod tests {
         assert_eq!(summary.dispatches[0].cumulative_us, 90);
         assert_eq!(summary.dispatches[0].duration_us, 0);
         assert_eq!(summary.dispatches[0].sample_count, 0);
+        // Subsequent dispatches recover their duration from the cumulative diff.
+        assert_eq!(summary.dispatches[1].cumulative_us, 130);
+        assert_eq!(summary.dispatches[1].duration_us, 40);
         assert!(summary.execution_costs.is_empty());
         assert!(summary.timeline.is_none());
     }
@@ -2500,17 +2436,20 @@ mod tests {
         assert_eq!(timeline.command_buffer_timestamps.len(), 2);
         assert_eq!(timeline.encoder_profiles.len(), 1);
         assert_eq!(timeline.encoder_profiles[0].sample_count, 1);
-        assert_eq!(timeline.encoder_profiles[0].start_ticks, 120);
+        assert_eq!(timeline.encoder_profiles[0].start_ticks, 150);
         assert_eq!(timeline.command_buffer_timestamps[0].start_ticks, 100);
         assert_eq!(timeline.command_buffer_timestamps[0].end_ticks, 160);
         assert_eq!(timeline.command_buffer_timestamps[1].start_ticks, 200);
         assert_eq!(timeline.command_buffer_timestamps[1].end_ticks, 320);
-        assert_eq!(summary.dispatches[0].sample_count, 1);
-        // dispatches[0].duration_us is intentionally 0 (leading idle gap), so the
-        // sampling density stays 0 too. Sample correlation still tags it.
+        // dispatch[0]'s sample window is zero-width (its cumulative_us is the
+        // pre-first-dispatch idle gap, not a real time range), so the sample
+        // at timestamp 120 stays unattributed and dispatch[1] picks up the
+        // GPU-active samples within [start_us(=90), end_us(=130)].
+        assert_eq!(summary.dispatches[0].sample_count, 0);
         assert_eq!(summary.dispatches[0].sampling_density, 0.0);
-        assert_eq!(summary.dispatches[0].start_ticks, 100);
-        assert_eq!(summary.dispatches[0].end_ticks, 160);
+        assert_eq!(summary.dispatches[0].start_ticks, summary.dispatches[0].end_ticks);
+        assert!(summary.dispatches[1].sample_count >= 1);
+        assert!(summary.dispatches[1].sampling_density > 0.0);
     }
 
     #[test]
@@ -2544,22 +2483,14 @@ mod tests {
             .to_file_binary(profiler_dir.join("streamData"))
             .unwrap();
         fs::write(profiler_dir.join("Timeline_f_0.raw"), [0u8; 16]).unwrap();
-        fs::write(
-            profiler_dir.join("Profiling_f_0.raw"),
-            [27u32.to_le_bytes(), 27u32.to_le_bytes()].concat(),
-        )
-        .unwrap();
 
         let report = report(&trace_path).unwrap();
         assert!(report.stream_data_present);
         let summary = report.stream_data_summary.as_ref().unwrap();
         assert!(summary.execution_costs.is_empty());
-        assert_eq!(summary.pipeline_id_scan_costs.len(), 1);
-        assert_eq!(summary.pipeline_id_scan_costs[0].sample_count, 2);
         let text = format_report(&report);
         assert!(text.contains("streamData summary"));
         assert!(text.contains("kernel_main"));
-        assert!(text.contains("pipeline-id scan costs (debug only, not Xcode Cost)"));
     }
 
     #[test]
@@ -2601,12 +2532,6 @@ mod tests {
                         compilation_time_ms: 2.5,
                         line_instruction_counts: BTreeMap::new(),
                     }),
-                }],
-                pipeline_id_scan_costs: vec![ProfilerExecutionCost {
-                    pipeline_id: 27,
-                    function_name: Some("kernel_main".to_owned()),
-                    sample_count: 5,
-                    cost_percent: 62.5,
                 }],
                 execution_costs: vec![ProfilerExecutionCost {
                     pipeline_id: 27,

@@ -550,7 +550,10 @@ pub fn format_report(report: &TimingReport) -> String {
     } else if report.source == "streamData" {
         out.push_str("Profiler-backed timing report\n");
         out.push_str(
-            "Kernel, dispatch, and encoder timing come from streamData; command-buffer rows prefer APSTimelineData spans when present.\n\n",
+            "Kernel, dispatch, and encoder timing come from streamData; command-buffer rows prefer APSTimelineData spans when present.\n",
+        );
+        out.push_str(
+            "Caveat: streamData's `cumulative_us` is rounded to whole microseconds, so sub-microsecond dispatches all read as 1+ us each. This inflates the share attributed to short kernels and deflates the share attributed to heavy ones — Xcode's GPU profiler uses sub-microsecond sample data and will report a different (typically more skewed) breakdown.\n\n",
         );
         if kernel_percent_denominator_ns(&report.kernels, report.total_duration_ns)
             > report.total_duration_ns

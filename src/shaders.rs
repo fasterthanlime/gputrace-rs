@@ -2109,7 +2109,6 @@ mod tests {
                 function_name: Some("kernel_a".into()),
                 stats: None,
             }],
-            pipeline_id_scan_costs: vec![],
             execution_costs: vec![],
             occupancies: vec![],
             dispatches: vec![
