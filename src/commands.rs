@@ -572,7 +572,18 @@ pub fn command_buffers(trace: &TraceBundle) -> Result<CommandBuffersReport> {
         entries.push(CommandBufferEntry {
             index: region.command_buffer.index,
             offset: cb.offset,
-            timestamp_ns: cb.timestamp,
+            // Prefer the boot-relative absolute timestamp from APSTimelineData
+            // when the profiler decoded one — it's meaningful even for
+            // single-CB traces where the capture-relative `timestamp_ns` is
+            // always 0. Fall back to the capture-relative value, then to the
+            // raw `cb.timestamp` for synthetic timing without profiler data.
+            timestamp_ns: timing
+                .and_then(|timing_cb| {
+                    (timing_cb.absolute_timestamp_ns != 0)
+                        .then_some(timing_cb.absolute_timestamp_ns)
+                        .or_else(|| (timing_cb.timestamp_ns != 0).then_some(timing_cb.timestamp_ns))
+                })
+                .unwrap_or(cb.timestamp),
             duration_ns: timing.and_then(|cb| cb.duration_ns),
             encoder_count: region.encoders.len(),
             dispatch_count: region.dispatches.len(),

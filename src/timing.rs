@@ -22,7 +22,14 @@ pub struct TimingReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandBufferTiming {
     pub index: usize,
+    /// Capture-relative start time (zero-anchored at the first CB's start so
+    /// dispatch-spacing math stays simple). Always 0 for the first CB.
     pub timestamp_ns: u64,
+    /// Boot-relative start time in nanoseconds, derived from the GPU monotonic
+    /// tick counter (APSTimelineData `start_ticks` × `timebase_numer` /
+    /// `timebase_denom`). `0` when the trace doesn't carry a profiler
+    /// timeline. Useful for single-CB traces where `timestamp_ns` is always 0.
+    pub absolute_timestamp_ns: u64,
     pub duration_ns: Option<u64>,
     pub encoder_count: usize,
     pub dispatch_count: usize,
@@ -165,6 +172,7 @@ pub fn report_with_profiler_summary(
         command_buffer_timings.push(CommandBufferTiming {
             index: region.command_buffer.index,
             timestamp_ns,
+            absolute_timestamp_ns: 0,
             duration_ns,
             encoder_count: region.encoders.len(),
             dispatch_count: region.dispatches.len(),
@@ -284,6 +292,10 @@ fn report_from_profiler(
                 .get(index)
                 .map(|profiler| profiler.timestamp_ns)
                 .unwrap_or(cb.timestamp),
+            absolute_timestamp_ns: profiler_command_buffers
+                .get(index)
+                .map(|profiler| profiler.absolute_timestamp_ns)
+                .unwrap_or(0),
             duration_ns: profiler_command_buffers
                 .get(index)
                 .and_then(|profiler| profiler.duration_ns)
@@ -451,6 +463,7 @@ fn report_from_raw_profiler(
         .map(|(index, cb)| CommandBufferTiming {
             index: cb.index,
             timestamp_ns: cb.timestamp,
+            absolute_timestamp_ns: 0,
             duration_ns: command_buffers
                 .get(index + 1)
                 .and_then(|next| next.timestamp.checked_sub(cb.timestamp)),
@@ -501,6 +514,11 @@ fn command_buffer_timings_from_timeline(
             index: entry.index,
             timestamp_ns: ticks_to_ns(
                 entry.start_ticks.saturating_sub(first_start),
+                timeline.timebase_numer,
+                timeline.timebase_denom,
+            ),
+            absolute_timestamp_ns: ticks_to_ns(
+                entry.start_ticks,
                 timeline.timebase_numer,
                 timeline.timebase_denom,
             ),
@@ -756,6 +774,7 @@ mod tests {
             command_buffers: vec![CommandBufferTiming {
                 index: 0,
                 timestamp_ns: 0,
+                absolute_timestamp_ns: 0,
                 duration_ns: Some(1_500),
                 encoder_count: 1,
                 dispatch_count: 2,
@@ -799,6 +818,7 @@ mod tests {
             command_buffers: vec![CommandBufferTiming {
                 index: 0,
                 timestamp_ns: 0,
+                absolute_timestamp_ns: 0,
                 duration_ns: Some(900),
                 encoder_count: 1,
                 dispatch_count: 2,
