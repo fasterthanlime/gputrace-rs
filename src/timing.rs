@@ -553,7 +553,7 @@ pub fn format_report(report: &TimingReport) -> String {
             "Kernel, dispatch, and encoder timing come from streamData; command-buffer rows prefer APSTimelineData spans when present.\n",
         );
         out.push_str(
-            "Caveat: streamData's `cumulative_us` is rounded to whole microseconds, so sub-microsecond dispatches all read as 1+ us each. This inflates the share attributed to short kernels and deflates the share attributed to heavy ones — Xcode's GPU profiler uses sub-microsecond sample data and will report a different (typically more skewed) breakdown.\n\n",
+            "Caveat: streamData's `cumulative_us` is the *dispatch-issue cadence* (the CPU-side clock that ticks each time a dispatch is enqueued), not actual GPU compute time. Apple's profiler advances it by a fixed ~µs per dispatch regardless of how long the dispatch actually runs on the GPU. Empirically a 4096-thread × 4096-iter ALU loop and a 32-thread element-wise add are both reported at the same ~6µs per dispatch. So the kernel %% column reflects dispatch *count* weighted by issue cadence, not real cost. Xcode's GPU profiler computes cost from `Profiling_f_*.raw` USC sample streams (compressed nibble-packed sample data — a separate decode that gputrace-rs doesn't yet implement); use Xcode's Performance tab if you need actual per-kernel cost.\n\n",
         );
         if kernel_percent_denominator_ns(&report.kernels, report.total_duration_ns)
             > report.total_duration_ns
