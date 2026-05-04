@@ -344,6 +344,25 @@ impl LoadedApi {
             }
         }
 
+        // Probe the usc_timestamps vector size by binary-searching the
+        // get_usc_timestamps return value (1=success, 0=oob). The vector size
+        // for our qa-decode-sample Profiling_f_0 was ~115k entries.
+        let usc_count = probe_usc_timestamps_count(api, profile_data);
+        let mut usc_timestamps = vec![0u64; usc_count];
+        if usc_count > 0 {
+            let ok = unsafe {
+                (api.get_usc_timestamps)(
+                    profile_data,
+                    usc_timestamps.as_mut_ptr(),
+                    0,
+                    usc_count as u64,
+                )
+            };
+            if ok == 0 {
+                usc_timestamps.clear();
+            }
+        }
+
         let counter_num = unsafe { (api.get_counter_num)(profile_data) };
 
         // Intentional leak: `agxps_gpu_destroy` appears to call `delete[]`
@@ -356,9 +375,48 @@ impl LoadedApi {
         Ok(DecodedProfile {
             kick_starts: starts,
             kick_software_ids: swids,
+            usc_timestamps,
             counter_num,
         })
     }
+}
+
+/// Find the size of the `profile_data`'s usc_timestamps vector by probing
+/// `get_usc_timestamps` with `count=1` at increasing offsets. The function
+/// returns 1 on success (index in range) or 0 on out-of-bounds, so the size
+/// is the smallest `i` for which probing index `i` fails.
+fn probe_usc_timestamps_count(api: &AgxpsApi, pd: AgxpsApsProfileData) -> usize {
+    let scratch = [0u64; 1];
+    let probe = |idx: u64| -> bool {
+        let r = unsafe {
+            (api.get_usc_timestamps)(pd, scratch.as_ptr() as *mut u64, idx, 1)
+        };
+        r != 0
+    };
+
+    if !probe(0) {
+        return 0;
+    }
+    // Exponential climb to find an upper bound that fails.
+    let mut hi = 1u64;
+    while probe(hi) {
+        hi = hi.saturating_mul(2);
+        if hi > (1u64 << 32) {
+            return hi as usize;
+        }
+    }
+    // Binary search for the boundary in [lo, hi) where lo passes and hi fails.
+    let mut lo = hi / 2;
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if probe(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // lo is the largest passing index, so the vector size is lo + 1.
+    (lo + 1) as usize
 }
 
 /// Per-kick decoded data from one `Profiling_f_*.raw` stream.
@@ -371,6 +429,15 @@ pub struct DecodedProfile {
     /// Per-kick `software_id`. The high 16 bits appear to encode a
     /// pipeline/clique hash that's stable across kicks of the same kernel.
     pub kick_software_ids: Vec<u64>,
+    /// Raw `usc_timestamps` vector, as exposed by
+    /// `agxps_aps_profile_data_get_usc_timestamps`.
+    ///
+    /// Empirically these are NOT comparable to `kick_starts` (much smaller
+    /// magnitude, leading run of zeros, stride-of-256 pattern). The encoding
+    /// is unclear — likely packed indices or per-kick relative offsets — so
+    /// we expose them as raw u64s without interpretation. See
+    /// `docs/AGXPS_API.md` for what we've observed.
+    pub usc_timestamps: Vec<u64>,
     /// Number of counters available on this profile_data.
     pub counter_num: u32,
 }

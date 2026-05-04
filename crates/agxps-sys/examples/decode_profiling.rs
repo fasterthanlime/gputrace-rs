@@ -49,12 +49,22 @@ fn main() {
     };
 
     println!("\ndecoded:");
-    println!("  kicks:    {}", decoded.kick_starts.len());
-    println!("  counters: {}", decoded.counter_num);
+    println!("  kicks:           {}", decoded.kick_starts.len());
+    println!("  usc_timestamps:  {}", decoded.usc_timestamps.len());
+    println!("  counters:        {}", decoded.counter_num);
+
+    let kick_groups = decoded.group_by_clique();
+    let total_kicks: usize = kick_groups.values().sum();
 
     println!("\ngrouped by software-id high16 (= kernel/clique):");
-    for (prefix, count) in decoded.group_by_clique() {
-        println!("  0x{prefix:04x}: {count} kicks");
+    println!("  prefix    kicks  share");
+    for (prefix, kicks) in &kick_groups {
+        let share = if total_kicks == 0 {
+            0.0
+        } else {
+            100.0 * *kicks as f64 / total_kicks as f64
+        };
+        println!("  0x{prefix:04x}  {kicks:>5}  {share:>6.2}%");
     }
 
     println!("\nfirst 16 kicks:");

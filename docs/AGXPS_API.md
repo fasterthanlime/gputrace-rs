@@ -198,6 +198,54 @@ For the qa-decode trace's Profiling_f_0:
 - `get_counter_num` = 12
 - `usc_timestamps` vector length = 115 394 (per-USC sample timestamps)
 
+### Each `Profiling_f_N.raw` is one USC bank's view
+
+The `.gpuprofiler_raw` directory contains one `Profiling_f_N.raw` per
+USC bank (20 of them in our trace). Each file decodes to its own kick
+list — kick counts vary across files (48, 35, 44, 36, 27, 39, 21, …)
+because dispatches fan out to different cores/banks. To get the full
+GPU-side view of a trace, the consumer has to decode every file and
+union/aggregate.
+
+### Kick `software_id` → pipeline (= dispatch source)
+
+Empirical mapping from a 5× light_add + 5× heavy_alu sample, decoded
+across all 20 banks:
+
+| swid high16 | per-bank kicks | inferred mapping                          |
+| ----------- | -------------- | ----------------------------------------- |
+| `0x0e84`    | always 5       | light_add (5 dispatches × 1 kick/bank)    |
+| `0x3392`    | always 1       | driver-inserted setup/cleanup kick        |
+| `0x19e4`    | 3..18 / bank   | heavy_alu fanout                          |
+| `0x3761`    | 12..24 / bank  | heavy_alu fanout                          |
+
+`0x0e84` is identifiable on its own: 5 kicks per bank, every bank,
+totalling exactly the user's 5 light_add dispatches. heavy_alu kicks
+are spread across multiple high16 prefixes per bank; the prefix is
+*not* uniquely a pipeline ID — it likely encodes a (pipeline,
+shader-core-cluster) tuple. The low 48 bits of swid look like a
+combination of dispatch sub-ID + a per-kick monotonic counter
+(visible as `0x...160X` suffixes that march by 1 per kick within a
+group).
+
+Bottom line: `swid >> 48` is a *coarse* clique-key that's stable for
+small dispatches (light_add) but ambiguous for big fanned-out ones
+(heavy_alu). Fully resolving "which dispatch did this kick come from"
+needs another field — likely the streamData side of the bridge
+(`pipeline_id` or kernel address).
+
+### `usc_timestamps` encoding is unclear
+
+The vector probed at 115 394 entries on Profiling_f_0. Raw values
+are tiny (0..29 M) compared to `kick_starts` (1.7 T..463 T) and start
+with 8 zeros, then a stride-of-256 pattern (`0xff, 0x1ff, 0x2ff, ...,
+0x6ff, 0x700`). This is *not* a parallel sequence of GPU ticks. Best
+guess: packed indices, sample-counts, or per-kick-relative offsets.
+Decoding requires either the vtable for `get_counter_values_by_index`
+(which probably exposes the same data with proper structure) or more
+RE on the host's richer
+`agxps_aps_kick_time_stats_create_sampled` build.
+
 ## Open questions / next steps
 
 1. **No `kick_end` or `kick_duration` in the VM build.** Per-kick
