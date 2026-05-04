@@ -145,7 +145,7 @@ fn main() {
     );
     println!(
         "  (counter names below are still obfuscated SHA-256 hashes; the \
-         agxps obfuscation map needs further RE to load)",
+         default agxps RawCountersMapping resource is not present on macOS)",
     );
     for (idx, name) in decoded.counter_names.iter().enumerate() {
         let short: String = name.chars().take(16).collect();

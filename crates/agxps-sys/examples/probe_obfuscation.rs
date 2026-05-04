@@ -7,6 +7,8 @@
 //!
 //! The map format accepted by `agxps_load_counter_obfuscation_map` is a
 //! two-column CSV-like text file with rows `readable_name,obfuscated_name`.
+//! Passing NULL makes Xcode look for the missing
+//! `com.apple.gpusw.AGXProfilingSupport` bundle resource `RawCountersMapping.csv`.
 
 use std::env;
 use std::path::PathBuf;

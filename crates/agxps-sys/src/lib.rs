@@ -142,10 +142,29 @@ pub type FnGetCounterValuesByIndex =
 pub type FnGetCounterValuesNumByIndex =
     unsafe extern "C" fn(pd: AgxpsApsProfileData, out: *mut u64, idx: u32) -> c_int;
 
+/// `get_counter_values(pd, uint64_t** out, agxps_counter_ident_t ident, uint32_t count) -> int`
+/// — the variant used by Xcode's `XRGPUAPSDataProcessor::loadAPSCounters`.
+pub type FnGetCounterValues = unsafe extern "C" fn(
+    pd: AgxpsApsProfileData,
+    out_ptr: *mut *const u64,
+    ident: c_uint,
+    count: u32,
+) -> c_int;
+
+/// `get_counter_values_num(pd, uint64_t* out, agxps_counter_ident_t ident, uint32_t count) -> int`
+pub type FnGetCounterValuesNum = unsafe extern "C" fn(
+    pd: AgxpsApsProfileData,
+    out: *mut u64,
+    ident: c_uint,
+    count: u32,
+) -> c_int;
+
 /// `agxps_load_counter_obfuscation_map(const char* path) -> int` — load
 /// a two-column CSV counter-name map. Rows are `readable,obfuscated`.
-/// Passing `NULL` asks the framework for its default path; current Xcode
-/// builds return 0 there, so callers should prefer an explicit path.
+/// Passing `NULL` asks the framework for
+/// `com.apple.gpusw.AGXProfilingSupport`'s `RawCountersMapping.csv` resource.
+/// Current Xcode builds return 0 there on macOS because that bundle/resource
+/// is not present, so callers should prefer an explicit path.
 pub type FnLoadObfuscationMap = unsafe extern "C" fn(path: *const c_char) -> c_int;
 
 /// `agxps_unload_counter_obfuscation_map()`.
@@ -160,6 +179,9 @@ pub type FnDeobfuscateName = unsafe extern "C" fn(obfuscated: *const c_char) -> 
 /// — returns a pointer to the obfuscated name, or the input string
 /// unchanged if no mapping exists / map not loaded.
 pub type FnObfuscatedName = unsafe extern "C" fn(readable: *const c_char) -> *const c_char;
+
+/// `agxps_counter_get_ident(const char* obfuscated_or_readable) -> agxps_counter_ident_t`.
+pub type FnCounterGetIdent = unsafe extern "C" fn(name: *const c_char) -> c_uint;
 
 /// Resolved function-pointer table. All fields are non-null on success
 /// (we treat any missing symbol as a hard load error).
@@ -185,12 +207,15 @@ pub struct AgxpsApi {
     pub get_synchronized_timestamps_num: FnGetCount,
     pub get_operating_frequencies: FnGetU64Range,
     pub get_counter_names: FnGetCounterNames,
+    pub get_counter_values: FnGetCounterValues,
+    pub get_counter_values_num: FnGetCounterValuesNum,
     pub get_counter_values_by_index: FnGetCounterValuesByIndex,
     pub get_counter_values_num_by_index: FnGetCounterValuesNumByIndex,
     pub load_obfuscation_map: FnLoadObfuscationMap,
     pub unload_obfuscation_map: FnUnloadObfuscationMap,
     pub deobfuscate_name: FnDeobfuscateName,
     pub obfuscated_name: FnObfuscatedName,
+    pub counter_get_ident: FnCounterGetIdent,
     pub parse_error_string: FnParseErrorString,
 }
 
@@ -249,6 +274,8 @@ pub fn load() -> Result<LoadedApi> {
             "agxps_aps_profile_data_get_operating_frequencies",
         )?,
         get_counter_names: load_sym(handle, "agxps_aps_profile_data_get_counter_names")?,
+        get_counter_values: load_sym(handle, "agxps_aps_profile_data_get_counter_values")?,
+        get_counter_values_num: load_sym(handle, "agxps_aps_profile_data_get_counter_values_num")?,
         get_counter_values_by_index: load_sym(
             handle,
             "agxps_aps_profile_data_get_counter_values_by_index",
@@ -267,6 +294,7 @@ pub fn load() -> Result<LoadedApi> {
         )?,
         deobfuscate_name: load_sym(handle, "agxps_counter_deobfuscate_name")?,
         obfuscated_name: load_sym(handle, "agxps_counter_obfuscated_name")?,
+        counter_get_ident: load_sym(handle, "agxps_counter_get_ident")?,
         parse_error_string: load_sym(handle, "agxps_aps_parse_error_type_to_string")?,
     };
 
@@ -484,7 +512,24 @@ impl LoadedApi {
             let mut start_ptr: *const u64 = std::ptr::null();
             let ok_n = unsafe { (api.get_counter_values_num_by_index)(pd, &mut n, idx) };
             let ok_v = unsafe { (api.get_counter_values_by_index)(pd, &mut start_ptr, idx) };
-            if ok_n != 0 && ok_v != 0 && !start_ptr.is_null() && n > 0 {
+            let mut values_ok = ok_n != 0 && ok_v != 0;
+            if (!values_ok || start_ptr.is_null() || n == 0)
+                && let Some(name_ptr) = name_ptrs.get(idx as usize).copied()
+                && !name_ptr.is_null()
+            {
+                let ident = unsafe { (api.counter_get_ident)(name_ptr) };
+                let ok_n_by_ident = unsafe { (api.get_counter_values_num)(pd, &mut n, ident, 1) };
+                let ok_v_by_ident =
+                    unsafe { (api.get_counter_values)(pd, &mut start_ptr, ident, 1) };
+                if ok_n_by_ident == 0 || ok_v_by_ident == 0 {
+                    n = 0;
+                    start_ptr = std::ptr::null();
+                    values_ok = false;
+                } else {
+                    values_ok = true;
+                }
+            }
+            if values_ok && !start_ptr.is_null() && n > 0 {
                 let slice = unsafe { std::slice::from_raw_parts(start_ptr, n as usize) };
                 counter_values.push(slice.to_vec());
             } else {

@@ -284,9 +284,12 @@ sampler clock.
 ### Counters in USC profile data are metadata-only
 
 `agxps_aps_profile_data_get_counter_num` returns 12 on our trace —
-but every counter's values vector is empty. `get_counter_values_by_index`
-(returns the start pointer) and `get_counter_values_num_by_index`
-(returns the element count) both report length 0.
+but every counter's values vector is empty. Both value APIs report
+length 0:
+
+- `get_counter_values_by_index` / `get_counter_values_num_by_index`
+- `get_counter_values` / `get_counter_values_num` after resolving the
+  counter's ident with `agxps_counter_get_ident`
 
 Conclusion: USC profile data (parsed with `profile_type=0x21` from
 `Profiling_f_*.raw`) ships counter *metadata* (12 named counter
@@ -327,11 +330,19 @@ and `agxps_counter_obfuscated_name(name)` returns the hash. Rows with
 anything other than two fields are skipped with the internal warning
 `Skipping invalid raw counter mapping`.
 
-Calling `load_counter_obfuscation_map(NULL)` returns 0 on the tested
-Xcode build and doesn't populate the default map. Passing the bundled
-`GPUCounterGraph.plist` returns success but does not create useful
-entries; that plist is the *display-name* graph, not the agxps
-obfuscation map.
+Calling `load_counter_obfuscation_map(NULL)` asks
+`[NSBundle bundleWithIdentifier:@"com.apple.gpusw.AGXProfilingSupport"]`
+for `pathForResource:@"RawCountersMapping" ofType:@"csv"`, then reads
+the result as UTF-8 text. It returns 0 on the tested Xcode build
+because that bundle/resource is not present on macOS. Nearby binary
+strings also name `/Apple/Internal/Library/AGX/`,
+`AGXRawCounterMapping.csv`, `RawCountersMapping.csv`, and
+`AGXCounterMapping.csv`, but those files do not ship in this Xcode
+bundle.
+
+Passing the bundled `GPUCounterGraph.plist` returns success but does
+not create useful entries; that plist is the *display-name* graph, not
+the agxps obfuscation map.
 
 ### Why `(kick_end_time - kick_start_time)` is NOT compute time
 
@@ -344,14 +355,14 @@ kicks on other cores.
 
 To match Xcode's per-pipeline numbers we still need either:
 
-- A per-kick **counter value** (e.g. ALU active cycles) via
-  `get_counter_values_by_index` — currently bound but not yet
-  invoked.
+- A per-kick **counter value** (e.g. ALU active cycles). Both the
+  index-based and counter-ident-based value getters are bound, but
+  USC profile data still returns empty vectors.
 - Or `agxps_aps_kick_time_stats_create_sampled`, which is what Xcode
-  itself uses. Disassembly shows it allocates Apple closure-blocks
-  on the stack and calls a generic `agxps_stats_create` engine —
-  callable from Rust but requires synthesizing a block-literal
-  with an invoke pointer (non-trivial).
+  itself uses. Disassembly shows it builds a stack descriptor with
+  vtable/function-pointer callbacks and calls a generic
+  `agxps_stats_create` engine — callable from Rust only after the
+  descriptor layout and internal vtable constants are mapped.
 
 ## Open questions / next steps
 
