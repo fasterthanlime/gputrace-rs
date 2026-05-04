@@ -658,7 +658,11 @@ fn parse_command_buffers(data: &[u8]) -> Vec<CommandBuffer> {
         return Vec::new();
     };
     let mut command_buffers = Vec::new();
-    let push = |cuuu: &MTSPRecord, offset: usize, dst: &mut Vec<CommandBuffer>| {
+    let mut seen_offsets: BTreeSet<usize> = BTreeSet::new();
+    let mut push = |cuuu: &MTSPRecord, offset: usize, dst: &mut Vec<CommandBuffer>| {
+        if !seen_offsets.insert(offset) {
+            return;
+        }
         dst.push(CommandBuffer {
             index: dst.len(),
             timestamp: 0,
@@ -674,6 +678,15 @@ fn parse_command_buffers(data: &[u8]) -> Vec<CommandBuffer> {
             if nested.record_type == RecordType::CUUU {
                 push(&nested, record.offset + nested.offset, &mut command_buffers);
             }
+        }
+    }
+    for top_level_subrecord in MTSPRecord::parse_subrecords(data) {
+        if top_level_subrecord.record_type == RecordType::CUUU {
+            push(
+                &top_level_subrecord,
+                top_level_subrecord.offset,
+                &mut command_buffers,
+            );
         }
     }
     command_buffers
@@ -715,11 +728,13 @@ fn parse_cuuu_hashes(data: &[u8]) -> Vec<String> {
 
 fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
     // CS is the labeled-resource record family — compute encoders, command
-    // buffers, and MTLBuffers all share the `CS\0\0` tag. In this capture
-    // format the encoder labels typically live as *nested* sub-records inside
-    // bulk CtU/Unknown records, not as top-level CS records. We walk both:
-    // first the top-level MTSP records, then the nested sub-record streams
-    // inside each top-level record's payload.
+    // buffers, and MTLBuffers all share the `CS\0\0` tag. The capture format
+    // varies: the offline-driver bee traces wrap CS sub-records inside bulk
+    // CtU/Unknown records, while programmatic `MTLCaptureManager` traces
+    // surface the sub-records at top level with the same nested framing. We
+    // walk both: top-level MTSP records first, then the nested sub-record
+    // streams inside each record's payload, then a top-level sub-record scan
+    // to pick up captures that don't use the bulk-record wrapper.
     //
     // To discriminate compute encoders from MTLBuffers, look for a CtU
     // sibling: every MTLBuffer in this format is announced by a CtU record
@@ -744,12 +759,22 @@ fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
             visit_ctu(&nested, &mut buffer_addresses);
         }
     }
+    for top_level_subrecord in MTSPRecord::parse_subrecords(data) {
+        visit_ctu(&top_level_subrecord, &mut buffer_addresses);
+    }
 
     let mut encoders = Vec::new();
-    let push_if_encoder =
-        |address: u64, label: Option<String>, offset: usize, encoders: &mut Vec<ComputeEncoder>| {
+    let mut seen_offsets: BTreeSet<usize> = BTreeSet::new();
+    let mut push_if_encoder =
+        |address: u64,
+         label: Option<String>,
+         offset: usize,
+         encoders: &mut Vec<ComputeEncoder>| {
             let Some(label) = label else { return };
             if label.is_empty() || buffer_addresses.contains(&address) {
+                return;
+            }
+            if !seen_offsets.insert(offset) {
                 return;
             }
             encoders.push(ComputeEncoder {
@@ -777,6 +802,18 @@ fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
                     &mut encoders,
                 );
             }
+        }
+    }
+    for top_level_subrecord in MTSPRecord::parse_subrecords(data) {
+        if top_level_subrecord.record_type == RecordType::CS
+            && let Some(address) = top_level_subrecord.address
+        {
+            push_if_encoder(
+                address,
+                top_level_subrecord.label,
+                top_level_subrecord.offset,
+                &mut encoders,
+            );
         }
     }
     encoders
