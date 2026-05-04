@@ -642,18 +642,35 @@ fn collect_buffer_names_from_data(data: &[u8], names: &mut BTreeMap<u64, String>
 }
 
 fn parse_command_buffers(data: &[u8]) -> Vec<CommandBuffer> {
-    let marker = b"CUUU";
+    // CUUU is a labeled-resource sub-record (same nested framing as CS) carried
+    // inside a top-level bulk record's payload. The previous byte-scan read a
+    // u64 at marker+4 and called it the timestamp, but on this trace those
+    // bytes are actually the 4-byte alignment pad after the tag plus the low
+    // half of the following u64 address — i.e., the value was always bogus.
+    // Real per-CB timestamps come from APSTimelineData (see
+    // `command_buffer_timings_from_timeline` in `timing.rs`); we leave
+    // `timestamp` as 0 here and let the profiler-backed paths fill it in.
+    let Ok(records) = MTSPRecord::parse_stream(data) else {
+        return Vec::new();
+    };
     let mut command_buffers = Vec::new();
-    let mut offset = 0usize;
-    while let Some(pos) = find_bytes_from(data, marker, offset) {
-        if pos + 12 <= data.len() {
+    for record in records {
+        if record.record_type == RecordType::CUUU {
             command_buffers.push(CommandBuffer {
                 index: command_buffers.len(),
-                timestamp: u64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap()),
-                offset: pos,
+                timestamp: 0,
+                offset: record.offset,
             });
         }
-        offset = pos + 4;
+        for nested in MTSPRecord::parse_subrecords(&record.data) {
+            if nested.record_type == RecordType::CUUU {
+                command_buffers.push(CommandBuffer {
+                    index: command_buffers.len(),
+                    timestamp: 0,
+                    offset: record.offset + nested.offset,
+                });
+            }
+        }
     }
     command_buffers
 }
@@ -891,13 +908,6 @@ fn analyze_buffer_lifecycles_from_regions(
     stats
 }
 
-fn find_bytes_from(data: &[u8], needle: &[u8], offset: usize) -> Option<usize> {
-    data.get(offset..)?
-        .windows(needle.len())
-        .position(|window| window == needle)
-        .map(|relative| offset + relative)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,16 +951,31 @@ mod tests {
 
     #[test]
     fn parses_command_buffer_markers() {
-        let mut data = vec![0u8; 64];
-        data[8..12].copy_from_slice(b"CUUU");
-        data[12..20].copy_from_slice(&42u64.to_le_bytes());
-        data[24..28].copy_from_slice(b"CUUU");
-        data[28..36].copy_from_slice(&99u64.to_le_bytes());
+        // CUUU sub-records are nested inside a bulk top-level record. Build a
+        // 0x140-byte top-level record whose payload contains two nested CUUU
+        // sub-records (each 0x68 bytes) at relative offsets 0x40 and 0xb0.
+        let bulk_size = 0x140usize;
+        let mut bulk = vec![0u8; bulk_size];
+        bulk[0..4].copy_from_slice(&(bulk_size as u32).to_le_bytes());
+        bulk[8..12].copy_from_slice(b"Ctt\0");
 
-        let buffers = parse_command_buffers(&data);
+        for (sub_off, seq) in [(0x40usize, 0x07u8), (0xb0usize, 0x0bu8)] {
+            let sub_size = 0x68usize;
+            bulk[sub_off..sub_off + 4].copy_from_slice(&(sub_size as u32).to_le_bytes());
+            bulk[sub_off + 4..sub_off + 8].copy_from_slice(&[seq, 0xd8, 0xff, 0xff]);
+            // bytes [sub_off + 8 .. sub_off + 32] stay zero
+            bulk[sub_off + 32..sub_off + 36].copy_from_slice(&4u32.to_le_bytes());
+            bulk[sub_off + 36..sub_off + 40].copy_from_slice(b"CUUU");
+        }
+
+        let buffers = parse_command_buffers(&bulk);
         assert_eq!(buffers.len(), 2);
-        assert_eq!(buffers[0].timestamp, 42);
-        assert_eq!(buffers[1].timestamp, 99);
+        assert_eq!(buffers[0].index, 0);
+        assert_eq!(buffers[1].index, 1);
+        // timestamps come from APSTimelineData, not CUUU bytes.
+        assert_eq!(buffers[0].timestamp, 0);
+        assert_eq!(buffers[1].timestamp, 0);
+        assert!(buffers[0].offset < buffers[1].offset);
     }
 
     #[test]

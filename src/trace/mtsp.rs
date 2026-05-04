@@ -47,6 +47,7 @@ pub enum RecordType {
     Culul,
     Cut,
     Cuw,
+    CUUU,
     Ci,
     CiulSl,
     Ciulul,
@@ -70,6 +71,7 @@ impl fmt::Display for RecordType {
             Self::Culul => "Culul",
             Self::Cut => "Cut",
             Self::Cuw => "Cuw",
+            Self::CUUU => "CUUU",
             Self::Ci => "Ci",
             Self::CiulSl => "CiulSl",
             Self::Ciulul => "Ciulul",
@@ -841,6 +843,9 @@ fn detect_record_type(data: &[u8]) -> RecordType {
         }
         if starts_with_at(data, i, b"Cul") {
             return RecordType::Cul;
+        }
+        if starts_with_at(data, i, b"CUUU") {
+            return RecordType::CUUU;
         }
         if starts_with_at(data, i, b"CU") && data.get(i + 2) == Some(&0) {
             return RecordType::CU;
