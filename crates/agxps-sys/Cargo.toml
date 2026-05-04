@@ -1,0 +1,15 @@
+[package]
+name = "agxps-sys"
+version = "0.1.0"
+edition = "2024"
+description = "FFI bindings to Apple's private agxps_aps_* sample-decoder API in GPUToolsReplay.framework"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2.0"
+
+[[example]]
+name = "decode_profiling"
+path = "examples/decode_profiling.rs"
