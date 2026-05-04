@@ -273,6 +273,11 @@ pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
                 .map_or(0, BTreeSet::len),
         })
         .collect();
+    // Drop byte-scan false positives: real compute encoders surface in at least
+    // one command-buffer region. The MTLB stream contains buffer-label bytes that
+    // sometimes match the `CS\0\0` marker, producing ghost rows with
+    // dispatches=0/command_buffers=0.
+    entries.retain(|encoder| encoder.dispatch_count > 0 || encoder.command_buffer_count > 0);
     if entries.is_empty()
         && let Some(timing) = &timing
         && timing.dispatch_count > 0
@@ -300,11 +305,12 @@ pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
             })
             .collect();
     }
-    if command_buffers
+    let summed_region_dispatches: usize = command_buffers
         .iter()
-        .all(|command_buffer| command_buffer.dispatch_count == 0)
-        && let Some(timing) = &timing
-        && timing.dispatch_count > 0
+        .map(|command_buffer| command_buffer.dispatch_count)
+        .sum();
+    if let Some(timing) = &timing
+        && timing.dispatch_count > summed_region_dispatches
         && let Some(timing_cb) = timing
             .command_buffers
             .iter()
@@ -584,7 +590,11 @@ pub fn command_buffers(trace: &TraceBundle) -> Result<CommandBuffersReport> {
     }
 
     let total_command_buffers = entries.len();
-    if total_dispatches == 0 && timing_dispatch_count > 0 {
+    // streamData typically attributes far more dispatches than the MTLB byte-scan
+    // surfaces (the capture stream only records a sparse subset of dispatch records).
+    // Prefer the profiler's count whenever it's larger so the per-CB row matches the
+    // kernel timing report.
+    if timing_dispatch_count > total_dispatches {
         total_dispatches = timing_dispatch_count;
         if let Some(entry) = entries
             .iter_mut()

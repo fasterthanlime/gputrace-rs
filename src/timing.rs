@@ -259,6 +259,22 @@ fn report_from_profiler(
         .map(command_buffer_timings_from_timeline)
         .unwrap_or_default();
 
+    // streamData typically attributes far more dispatches than the MTLB byte-scan
+    // surfaces. With only one CB we can confidently distribute streamData's count
+    // to it; with multiple CBs we fall back to the per-region count to avoid
+    // double-counting.
+    let region_dispatches: usize = command_buffer_regions
+        .iter()
+        .map(|region| region.dispatches.len())
+        .sum();
+    let single_cb_streamdata_total = if command_buffers.len() == 1
+        && summary.dispatches.len() > region_dispatches
+    {
+        Some(summary.dispatches.len())
+    } else {
+        None
+    };
+
     let command_buffer_timings = command_buffers
         .iter()
         .enumerate()
@@ -280,10 +296,12 @@ fn report_from_profiler(
                 .get(index)
                 .map(|region| region.encoders.len())
                 .unwrap_or(0),
-            dispatch_count: command_buffer_regions
-                .get(index)
-                .map(|region| region.dispatches.len())
-                .unwrap_or(0),
+            dispatch_count: single_cb_streamdata_total.unwrap_or_else(|| {
+                command_buffer_regions
+                    .get(index)
+                    .map(|region| region.dispatches.len())
+                    .unwrap_or(0)
+            }),
         })
         .collect::<Vec<_>>();
 

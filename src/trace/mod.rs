@@ -659,6 +659,15 @@ fn parse_command_buffers(data: &[u8]) -> Vec<CommandBuffer> {
 }
 
 fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
+    // The compute-encoder labels for this capture format live as nested
+    // labeled-resource entries inside bulk CtU/Unknown records (in this trace,
+    // a 256 KiB CtU at 0x1257a and a 0x2000-byte unknown at 0x3d), not as
+    // standalone CS records at the top level of the MTSP stream. The structured
+    // `MTSPRecord` parser respects record framing so it can't see those nested
+    // labels — it would return zero candidates here. Until those bulk records
+    // are reverse-engineered (e.g., a sub-record decoder for CtU payloads),
+    // we keep the byte-scan and rely on `commands::encoders` to drop entries
+    // that aren't referenced by any dispatch or command-buffer region.
     let mut encoders = Vec::new();
     let marker = b"CS\0\0";
     let mut offset = 0usize;
@@ -682,6 +691,26 @@ fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
         offset = pos + 4;
     }
     encoders
+}
+
+fn read_c_string_bytes(data: &[u8], offset: usize) -> Option<String> {
+    let tail = data.get(offset..)?;
+    let end = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(tail.len());
+    if end == 0 {
+        return None;
+    }
+    let value = &tail[..end];
+    if value
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    {
+        Some(String::from_utf8_lossy(value).into_owned())
+    } else {
+        None
+    }
 }
 
 fn parse_pipeline_state_events(
@@ -880,26 +909,6 @@ fn find_bytes_from(data: &[u8], needle: &[u8], offset: usize) -> Option<usize> {
         .windows(needle.len())
         .position(|window| window == needle)
         .map(|relative| offset + relative)
-}
-
-fn read_c_string_bytes(data: &[u8], offset: usize) -> Option<String> {
-    let tail = data.get(offset..)?;
-    let end = tail
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(tail.len());
-    if end == 0 {
-        return None;
-    }
-    let value = &tail[..end];
-    if value
-        .iter()
-        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
-    {
-        Some(String::from_utf8_lossy(value).into_owned())
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

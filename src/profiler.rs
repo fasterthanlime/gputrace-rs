@@ -1567,7 +1567,7 @@ fn extract_dispatches(
 
     let record_count = data.len() / record_size;
     let mut dispatches = Vec::with_capacity(record_count);
-    let mut previous_cumulative_us = 0;
+    let mut previous_cumulative_us = None;
     for index in 0..record_count {
         let offset = index * record_size;
         let record = &data[offset..offset + record_size];
@@ -1577,12 +1577,19 @@ fn extract_dispatches(
 
         let pipeline_index = (read_u64(record, 8) >> 32) as usize;
         let cumulative_us = read_u64(record, 16);
-        let duration_us = if index == 0 {
-            cumulative_us
-        } else {
-            cumulative_us.saturating_sub(previous_cumulative_us)
+        // `cumulative_us` is a running end-time stamp into a global timeline that
+        // includes idle time before the first dispatch (typically several hundred us
+        // of command-buffer scheduling overhead). It is *not* zero-based, so the
+        // very first record's value is the offset from CB/encoder origin to the end
+        // of dispatch 0 — not its duration. Without a known encoder-start offset we
+        // can't recover dispatch 0's true duration here, so attribute 0us rather
+        // than absorbing the leading idle gap into whatever kernel happens to land
+        // first.
+        let duration_us = match previous_cumulative_us {
+            Some(previous) => cumulative_us.saturating_sub(previous),
+            None => 0,
         };
-        previous_cumulative_us = cumulative_us;
+        previous_cumulative_us = Some(cumulative_us);
 
         dispatches.push(ProfilerDispatch {
             index,
@@ -2468,7 +2475,10 @@ mod tests {
             summary.dispatches[0].function_name.as_deref(),
             Some("kernel_main")
         );
-        assert_eq!(summary.dispatches[0].duration_us, 90);
+        // First dispatch's `cumulative_us` is the offset from CB/encoder origin
+        // (it includes leading idle), not its duration, so we attribute 0us to it.
+        assert_eq!(summary.dispatches[0].cumulative_us, 90);
+        assert_eq!(summary.dispatches[0].duration_us, 0);
         assert_eq!(summary.dispatches[0].sample_count, 0);
         assert!(summary.execution_costs.is_empty());
         assert!(summary.timeline.is_none());
@@ -2496,7 +2506,9 @@ mod tests {
         assert_eq!(timeline.command_buffer_timestamps[1].start_ticks, 200);
         assert_eq!(timeline.command_buffer_timestamps[1].end_ticks, 320);
         assert_eq!(summary.dispatches[0].sample_count, 1);
-        assert!(summary.dispatches[0].sampling_density > 0.0);
+        // dispatches[0].duration_us is intentionally 0 (leading idle gap), so the
+        // sampling density stays 0 too. Sample correlation still tags it.
+        assert_eq!(summary.dispatches[0].sampling_density, 0.0);
         assert_eq!(summary.dispatches[0].start_ticks, 100);
         assert_eq!(summary.dispatches[0].end_ticks, 160);
     }
