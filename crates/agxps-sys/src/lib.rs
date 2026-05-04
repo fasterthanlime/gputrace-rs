@@ -17,15 +17,20 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_void};
 use std::os::raw::c_uchar;
+use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("framework not loadable: {0}")]
     Dlopen(String),
     #[error("agxps_gpu_create({generation}, {variant}, {rev}) failed")]
-    GpuCreate { generation: u32, variant: u32, rev: u32 },
+    GpuCreate {
+        generation: u32,
+        variant: u32,
+        rev: u32,
+    },
     #[error("agxps_aps_parser_create returned NULL — descriptor invalid for this GPU")]
     ParserCreate,
     #[error("agxps_aps_parser_parse error code {code}: {message}")]
@@ -50,16 +55,16 @@ pub type AgxpsApsProfileData = *mut c_void;
 /// obey.
 #[repr(C)]
 pub struct AgxpsApsDescriptor {
-    pub gpu: *mut c_void,        // +0x00
-    pub field_0x08: u32,         // +0x08 — power of 2 in [0x10, 0x800]
-    pub field_0x0c: u32,         // +0x0c — power of 2 in [0x40, 0x2000]
-    pub field_0x10: u32,         // +0x10 — 0 or power of 2 in [0x80, 0x8000]
+    pub gpu: *mut c_void, // +0x00
+    pub field_0x08: u32,  // +0x08 — power of 2 in [0x10, 0x800]
+    pub field_0x0c: u32,  // +0x0c — power of 2 in [0x40, 0x2000]
+    pub field_0x10: u32,  // +0x10 — 0 or power of 2 in [0x80, 0x8000]
     pub field_0x14: u32,
-    pub field_0x18: u64,         // +0x18 — must be 0x400, 0x1000, or 0x40000
+    pub field_0x18: u64, // +0x18 — must be 0x400, 0x1000, or 0x40000
     pub _pad_0x20: [u8; 0x10],
-    pub field_0x30: u64,         // +0x30 — set to -1 by default
+    pub field_0x30: u64, // +0x30 — set to -1 by default
     pub _pad_0x38: [u8; 0x20],
-    pub field_0x58: u64,         // +0x58 — set to 0x32 by default
+    pub field_0x58: u64, // +0x58 — set to 0x32 by default
     pub _pad_0x60: [u8; 0x08],
 }
 
@@ -130,27 +135,31 @@ pub type FnGetCounterNames = unsafe extern "C" fn(
 /// — writes the *start pointer* of counter `idx`'s values vector into
 /// `*out`. Read `*out`[0..N] to get the actual u64 values, where N is
 /// from `get_counter_values_num_by_index`.
-pub type FnGetCounterValuesByIndex = unsafe extern "C" fn(
-    pd: AgxpsApsProfileData,
-    out_ptr: *mut *const u64,
-    idx: u32,
-) -> c_int;
+pub type FnGetCounterValuesByIndex =
+    unsafe extern "C" fn(pd: AgxpsApsProfileData, out_ptr: *mut *const u64, idx: u32) -> c_int;
 
 /// `get_counter_values_num_by_index(pd, uint64_t* out, uint32_t idx) -> int`
-pub type FnGetCounterValuesNumByIndex = unsafe extern "C" fn(
-    pd: AgxpsApsProfileData,
-    out: *mut u64,
-    idx: u32,
-) -> c_int;
+pub type FnGetCounterValuesNumByIndex =
+    unsafe extern "C" fn(pd: AgxpsApsProfileData, out: *mut u64, idx: u32) -> c_int;
 
 /// `agxps_load_counter_obfuscation_map(const char* path) -> int` — load
-/// the deobfuscation map. Pass `NULL` to use the bundled default map.
+/// a two-column CSV counter-name map. Rows are `readable,obfuscated`.
+/// Passing `NULL` asks the framework for its default path; current Xcode
+/// builds return 0 there, so callers should prefer an explicit path.
 pub type FnLoadObfuscationMap = unsafe extern "C" fn(path: *const c_char) -> c_int;
+
+/// `agxps_unload_counter_obfuscation_map()`.
+pub type FnUnloadObfuscationMap = unsafe extern "C" fn();
 
 /// `agxps_counter_deobfuscate_name(const char* obfuscated) -> const char*`
 /// — returns a pointer to the deobfuscated name, or the input string
 /// unchanged if no mapping exists / map not loaded.
 pub type FnDeobfuscateName = unsafe extern "C" fn(obfuscated: *const c_char) -> *const c_char;
+
+/// `agxps_counter_obfuscated_name(const char* readable) -> const char*`
+/// — returns a pointer to the obfuscated name, or the input string
+/// unchanged if no mapping exists / map not loaded.
+pub type FnObfuscatedName = unsafe extern "C" fn(readable: *const c_char) -> *const c_char;
 
 /// Resolved function-pointer table. All fields are non-null on success
 /// (we treat any missing symbol as a hard load error).
@@ -179,15 +188,16 @@ pub struct AgxpsApi {
     pub get_counter_values_by_index: FnGetCounterValuesByIndex,
     pub get_counter_values_num_by_index: FnGetCounterValuesNumByIndex,
     pub load_obfuscation_map: FnLoadObfuscationMap,
+    pub unload_obfuscation_map: FnUnloadObfuscationMap,
     pub deobfuscate_name: FnDeobfuscateName,
+    pub obfuscated_name: FnObfuscatedName,
     pub parse_error_string: FnParseErrorString,
 }
 
 unsafe impl Send for AgxpsApi {}
 unsafe impl Sync for AgxpsApi {}
 
-const DEFAULT_FRAMEWORK_PATH: &str =
-    "/Applications/Xcode.app/Contents/PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/GTShaderProfiler";
+const DEFAULT_FRAMEWORK_PATH: &str = "/Applications/Xcode.app/Contents/PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/GTShaderProfiler";
 
 /// dlopen `GTShaderProfiler` and dlsym every needed symbol. Returns
 /// [`Error::MissingSymbol`] if any required entry-point isn't exported
@@ -197,8 +207,6 @@ const DEFAULT_FRAMEWORK_PATH: &str =
 /// Set `AGXPS_FRAMEWORK_PATH` env var to override the default Xcode
 /// location (e.g. for Xcode-beta.app or a custom toolchain).
 pub fn load() -> Result<LoadedApi> {
-    use std::ffi::CString;
-
     let path = std::env::var("AGXPS_FRAMEWORK_PATH")
         .unwrap_or_else(|_| DEFAULT_FRAMEWORK_PATH.to_string());
     let cpath = CString::new(path.clone()).unwrap();
@@ -250,13 +258,20 @@ pub fn load() -> Result<LoadedApi> {
             "agxps_aps_profile_data_get_counter_values_num_by_index",
         )?,
         load_obfuscation_map: load_sym(handle, "agxps_load_counter_obfuscation_map")?,
+        unload_obfuscation_map: load_sym_any(
+            handle,
+            &[
+                "agxps_unload_counter_obfuscation_map",
+                "_Z36agxps_unload_counter_obfuscation_mapv",
+            ],
+        )?,
         deobfuscate_name: load_sym(handle, "agxps_counter_deobfuscate_name")?,
+        obfuscated_name: load_sym(handle, "agxps_counter_obfuscated_name")?,
         parse_error_string: load_sym(handle, "agxps_aps_parse_error_type_to_string")?,
     };
 
-    // Load the bundled default counter-deobfuscation map so
-    // `deobfuscate_name` returns readable names instead of SHA-256
-    // hashes. Failure is non-fatal; we just keep the obfuscated names.
+    // Current Xcode builds return 0 for the default path, but keep this
+    // attempt for compatibility with builds that do ship a default map.
     let _ = unsafe { (api.load_obfuscation_map)(std::ptr::null()) };
 
     Ok(LoadedApi {
@@ -278,6 +293,15 @@ fn load_sym<T>(handle: *mut c_void, name: &'static str) -> Result<T> {
     Ok(unsafe { std::mem::transmute_copy(&p) })
 }
 
+fn load_sym_any<T>(handle: *mut c_void, names: &'static [&'static str]) -> Result<T> {
+    for name in names {
+        if let Some(p) = unsafe { load_sym_raw(handle, name) } {
+            return Ok(unsafe { std::mem::transmute_copy(&p) });
+        }
+    }
+    Err(Error::MissingSymbol(names[0]))
+}
+
 pub struct LoadedApi {
     pub api: AgxpsApi,
     pub framework_path: String,
@@ -288,6 +312,44 @@ unsafe impl Send for LoadedApi {}
 unsafe impl Sync for LoadedApi {}
 
 impl LoadedApi {
+    /// Clear the process-global counter obfuscation maps.
+    pub fn unload_counter_obfuscation_map(&self) {
+        unsafe { (self.api.unload_obfuscation_map)() };
+    }
+
+    /// Load a counter obfuscation map.
+    ///
+    /// The file is parsed as CSV-like text with exactly two columns per
+    /// row: `readable_name,obfuscated_name`. Returns the framework's
+    /// boolean success value. A successful parse can still add zero
+    /// useful mappings if every row is invalid for this format.
+    pub fn load_counter_obfuscation_map(&self, path: Option<&Path>) -> bool {
+        match path {
+            Some(path) => {
+                let path = path.to_string_lossy();
+                let Ok(cpath) = CString::new(path.as_bytes()) else {
+                    return false;
+                };
+                unsafe { (self.api.load_obfuscation_map)(cpath.as_ptr()) != 0 }
+            }
+            None => unsafe { (self.api.load_obfuscation_map)(std::ptr::null()) != 0 },
+        }
+    }
+
+    /// Map an obfuscated counter name back to its readable name using
+    /// the currently loaded process-global map. If no mapping exists,
+    /// the framework returns the input unchanged.
+    pub fn deobfuscate_counter_name(&self, obfuscated: &str) -> String {
+        map_counter_name(obfuscated, self.api.deobfuscate_name)
+    }
+
+    /// Map a readable counter name to its obfuscated name using the
+    /// currently loaded process-global map. If no mapping exists, the
+    /// framework returns the input unchanged.
+    pub fn obfuscated_counter_name(&self, readable: &str) -> String {
+        map_counter_name(readable, self.api.obfuscated_name)
+    }
+
     /// Decode a single `Profiling_f_*.raw` and return per-kick data
     /// (start, end, software_id, kick_id, kick_slot, missing_end) plus
     /// the raw `usc_timestamps` and `synchronized_timestamps` vectors.
@@ -302,7 +364,11 @@ impl LoadedApi {
 
         let gpu = unsafe { (api.gpu_create)(generation, variant, rev, false) };
         if gpu.is_null() {
-            return Err(Error::GpuCreate { generation, variant, rev });
+            return Err(Error::GpuCreate {
+                generation,
+                variant,
+                rev,
+            });
         }
 
         let descriptor = AgxpsApsDescriptor::defaults_for(gpu);
@@ -331,7 +397,10 @@ impl LoadedApi {
                     CStr::from_ptr(s).to_string_lossy().into_owned()
                 }
             };
-            return Err(Error::ParserParse { code: err_code, message: msg });
+            return Err(Error::ParserParse {
+                code: err_code,
+                message: msg,
+            });
         }
 
         let n = unsafe { (api.get_kicks_num)(pd) } as usize;
@@ -385,12 +454,7 @@ impl LoadedApi {
         let mut name_ptrs = vec![std::ptr::null::<c_char>(); counter_num as usize];
         let counter_names = if counter_num > 0 {
             let ok = unsafe {
-                (api.get_counter_names)(
-                    pd,
-                    name_ptrs.as_mut_ptr(),
-                    0,
-                    counter_num as u64,
-                )
+                (api.get_counter_names)(pd, name_ptrs.as_mut_ptr(), 0, counter_num as u64)
             };
             if ok != 0 {
                 name_ptrs
@@ -401,7 +465,9 @@ impl LoadedApi {
                         }
                         let deobf = unsafe { (api.deobfuscate_name)(*p) };
                         let chosen = if deobf.is_null() { *p } else { deobf };
-                        unsafe { CStr::from_ptr(chosen) }.to_string_lossy().into_owned()
+                        unsafe { CStr::from_ptr(chosen) }
+                            .to_string_lossy()
+                            .into_owned()
                     })
                     .collect()
             } else {
@@ -416,12 +482,8 @@ impl LoadedApi {
         for idx in 0..counter_num {
             let mut n = 0u64;
             let mut start_ptr: *const u64 = std::ptr::null();
-            let ok_n = unsafe {
-                (api.get_counter_values_num_by_index)(pd, &mut n, idx)
-            };
-            let ok_v = unsafe {
-                (api.get_counter_values_by_index)(pd, &mut start_ptr, idx)
-            };
+            let ok_n = unsafe { (api.get_counter_values_num_by_index)(pd, &mut n, idx) };
+            let ok_v = unsafe { (api.get_counter_values_by_index)(pd, &mut start_ptr, idx) };
             if ok_n != 0 && ok_v != 0 && !start_ptr.is_null() && n > 0 {
                 let slice = unsafe { std::slice::from_raw_parts(start_ptr, n as usize) };
                 counter_values.push(slice.to_vec());
@@ -446,6 +508,23 @@ impl LoadedApi {
             counter_names,
             counter_values,
         })
+    }
+}
+
+fn map_counter_name(
+    input: &str,
+    f: unsafe extern "C" fn(*const c_char) -> *const c_char,
+) -> String {
+    let Ok(cinput) = CString::new(input) else {
+        return input.to_owned();
+    };
+    let out = unsafe { f(cinput.as_ptr()) };
+    if out.is_null() {
+        input.to_owned()
+    } else {
+        unsafe { CStr::from_ptr(out) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -538,8 +617,9 @@ impl DecodedProfile {
             if self.kick_missing_ends[i] {
                 continue;
             }
-            let dur =
-                self.kick_end_time(i).saturating_sub(self.kick_start_time(i)) as u64;
+            let dur = self
+                .kick_end_time(i)
+                .saturating_sub(self.kick_start_time(i)) as u64;
             let prefix = (self.kick_software_ids[i] >> 48) as u16;
             *sums.entry(prefix).or_insert(0u64) += dur;
         }

@@ -13,3 +13,7 @@ thiserror = "2.0"
 [[example]]
 name = "decode_profiling"
 path = "examples/decode_profiling.rs"
+
+[[example]]
+name = "probe_obfuscation"
+path = "examples/probe_obfuscation.rs"

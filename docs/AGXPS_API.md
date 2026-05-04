@@ -299,23 +299,39 @@ identified.
 
 ### Counter names are obfuscated; map needs RE
 
-Counter names returned by `get_counter_names` are 64-char SHA-256
-hashes (e.g. `79E88035C9BC883D403F17831B8C9264E643C6B76E9B3C1451B49B0F672C32BF`),
-not human-readable. The framework exports a deobfuscation API:
+Counter names returned by `get_counter_names` are 64-char uppercase
+hex strings (e.g. `79E88035C9BC883D403F17831B8C9264E643C6B76E9B3C1451B49B0F672C32BF`),
+not human-readable. They look SHA-256-shaped, but the simple
+`SHA256(name)` route is not confirmed: that example does not match
+any obvious `GPUCounterGraph.plist` display/vendor/unit/description
+string under basic normalization. The framework exports a
+deobfuscation API:
 
 | Symbol | Purpose |
 | ------ | ------- |
 | `agxps_load_counter_obfuscation_map(const char *path)` | load mapping (pass NULL for default) |
-| `agxps_unload_counter_obfuscation_map()` | clear map |
+| `agxps_unload_counter_obfuscation_map()` | clear map (exported as C++ mangled `_Z36agxps_unload_counter_obfuscation_mapv` for `dlsym`; `nm` shows the Mach-O leading underscore too) |
 | `agxps_counter_deobfuscate_name(const char *hash)` | hash → readable |
 | `agxps_counter_obfuscated_name(const char *name)` | readable → hash |
 
-Calling `load_counter_obfuscation_map(NULL)` doesn't populate the
-default map — it falls into a path keyed off an internal Obj-C class
-(adrp+0x698) we haven't decoded. The map likely needs an explicit
-file path; the bundled `GPUCounterGraph.plist` in
-`GTShaderProfiler.framework/Resources/` is the *display-name* graph,
-not the agxps obfuscation map.
+The de/obfuscation functions are only map lookups, not hash
+calculators. `agxps_load_counter_obfuscation_map(path)` accepts a
+CSV-like text map with exactly two columns per row:
+
+```csv
+readable counter name,64-hex obfuscated counter name
+```
+
+Then `agxps_counter_deobfuscate_name(hash)` returns the readable name
+and `agxps_counter_obfuscated_name(name)` returns the hash. Rows with
+anything other than two fields are skipped with the internal warning
+`Skipping invalid raw counter mapping`.
+
+Calling `load_counter_obfuscation_map(NULL)` returns 0 on the tested
+Xcode build and doesn't populate the default map. Passing the bundled
+`GPUCounterGraph.plist` returns success but does not create useful
+entries; that plist is the *display-name* graph, not the agxps
+obfuscation map.
 
 ### Why `(kick_end_time - kick_start_time)` is NOT compute time
 
