@@ -116,6 +116,42 @@ pub type FnGetU8Range = unsafe extern "C" fn(
 ) -> c_int;
 pub type FnParseErrorString = unsafe extern "C" fn(code: u64) -> *const c_char;
 
+/// `get_counter_names(pd, char** out, size_t start, size_t count) -> int`
+/// — copies `count` `const char*` pointers into `out`, returns 1 on
+/// success / 0 on oob.
+pub type FnGetCounterNames = unsafe extern "C" fn(
+    pd: AgxpsApsProfileData,
+    out: *mut *const c_char,
+    start_idx: u64,
+    count: u64,
+) -> c_int;
+
+/// `get_counter_values_by_index(pd, uint64_t** out, uint32_t idx) -> int`
+/// — writes the *start pointer* of counter `idx`'s values vector into
+/// `*out`. Read `*out`[0..N] to get the actual u64 values, where N is
+/// from `get_counter_values_num_by_index`.
+pub type FnGetCounterValuesByIndex = unsafe extern "C" fn(
+    pd: AgxpsApsProfileData,
+    out_ptr: *mut *const u64,
+    idx: u32,
+) -> c_int;
+
+/// `get_counter_values_num_by_index(pd, uint64_t* out, uint32_t idx) -> int`
+pub type FnGetCounterValuesNumByIndex = unsafe extern "C" fn(
+    pd: AgxpsApsProfileData,
+    out: *mut u64,
+    idx: u32,
+) -> c_int;
+
+/// `agxps_load_counter_obfuscation_map(const char* path) -> int` — load
+/// the deobfuscation map. Pass `NULL` to use the bundled default map.
+pub type FnLoadObfuscationMap = unsafe extern "C" fn(path: *const c_char) -> c_int;
+
+/// `agxps_counter_deobfuscate_name(const char* obfuscated) -> const char*`
+/// — returns a pointer to the deobfuscated name, or the input string
+/// unchanged if no mapping exists / map not loaded.
+pub type FnDeobfuscateName = unsafe extern "C" fn(obfuscated: *const c_char) -> *const c_char;
+
 /// Resolved function-pointer table. All fields are non-null on success
 /// (we treat any missing symbol as a hard load error).
 pub struct AgxpsApi {
@@ -139,6 +175,11 @@ pub struct AgxpsApi {
     pub get_synchronized_timestamps: FnGetU64Range,
     pub get_synchronized_timestamps_num: FnGetCount,
     pub get_operating_frequencies: FnGetU64Range,
+    pub get_counter_names: FnGetCounterNames,
+    pub get_counter_values_by_index: FnGetCounterValuesByIndex,
+    pub get_counter_values_num_by_index: FnGetCounterValuesNumByIndex,
+    pub load_obfuscation_map: FnLoadObfuscationMap,
+    pub deobfuscate_name: FnDeobfuscateName,
     pub parse_error_string: FnParseErrorString,
 }
 
@@ -199,8 +240,24 @@ pub fn load() -> Result<LoadedApi> {
             handle,
             "agxps_aps_profile_data_get_operating_frequencies",
         )?,
+        get_counter_names: load_sym(handle, "agxps_aps_profile_data_get_counter_names")?,
+        get_counter_values_by_index: load_sym(
+            handle,
+            "agxps_aps_profile_data_get_counter_values_by_index",
+        )?,
+        get_counter_values_num_by_index: load_sym(
+            handle,
+            "agxps_aps_profile_data_get_counter_values_num_by_index",
+        )?,
+        load_obfuscation_map: load_sym(handle, "agxps_load_counter_obfuscation_map")?,
+        deobfuscate_name: load_sym(handle, "agxps_counter_deobfuscate_name")?,
         parse_error_string: load_sym(handle, "agxps_aps_parse_error_type_to_string")?,
     };
+
+    // Load the bundled default counter-deobfuscation map so
+    // `deobfuscate_name` returns readable names instead of SHA-256
+    // hashes. Failure is non-fatal; we just keep the obfuscated names.
+    let _ = unsafe { (api.load_obfuscation_map)(std::ptr::null()) };
 
     Ok(LoadedApi {
         api,
@@ -322,6 +379,57 @@ impl LoadedApi {
 
         let counter_num = unsafe { (api.get_counter_num)(pd) };
 
+        // Fetch counter names. They're const char* into framework-owned
+        // string pool, so we copy to owned Strings while the framework
+        // is still mapped (which is forever since we leak).
+        let mut name_ptrs = vec![std::ptr::null::<c_char>(); counter_num as usize];
+        let counter_names = if counter_num > 0 {
+            let ok = unsafe {
+                (api.get_counter_names)(
+                    pd,
+                    name_ptrs.as_mut_ptr(),
+                    0,
+                    counter_num as u64,
+                )
+            };
+            if ok != 0 {
+                name_ptrs
+                    .iter()
+                    .map(|p| {
+                        if p.is_null() {
+                            return String::new();
+                        }
+                        let deobf = unsafe { (api.deobfuscate_name)(*p) };
+                        let chosen = if deobf.is_null() { *p } else { deobf };
+                        unsafe { CStr::from_ptr(chosen) }.to_string_lossy().into_owned()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // For each counter, get its values vector.
+        let mut counter_values: Vec<Vec<u64>> = Vec::with_capacity(counter_num as usize);
+        for idx in 0..counter_num {
+            let mut n = 0u64;
+            let mut start_ptr: *const u64 = std::ptr::null();
+            let ok_n = unsafe {
+                (api.get_counter_values_num_by_index)(pd, &mut n, idx)
+            };
+            let ok_v = unsafe {
+                (api.get_counter_values_by_index)(pd, &mut start_ptr, idx)
+            };
+            if ok_n != 0 && ok_v != 0 && !start_ptr.is_null() && n > 0 {
+                let slice = unsafe { std::slice::from_raw_parts(start_ptr, n as usize) };
+                counter_values.push(slice.to_vec());
+            } else {
+                counter_values.push(Vec::new());
+            }
+        }
+
         // See the noxcode crate for why we leak instead of calling destroy.
         let _ = (parser, pd, gpu);
 
@@ -335,6 +443,8 @@ impl LoadedApi {
             usc_timestamps,
             synchronized_timestamps: sync_timestamps,
             counter_num,
+            counter_names,
+            counter_values,
         })
     }
 }
@@ -351,6 +461,13 @@ pub struct DecodedProfile {
     pub usc_timestamps: Vec<u64>,
     pub synchronized_timestamps: Vec<u64>,
     pub counter_num: u32,
+    /// Counter names (length = `counter_num`).
+    pub counter_names: Vec<String>,
+    /// Per-counter values vector (outer length = `counter_num`). Inner
+    /// vec length is whatever `get_counter_values_num_by_index` returns
+    /// for that counter — likely per-kick, per-sample, or per-segment;
+    /// probe via the example to find out.
+    pub counter_values: Vec<Vec<u64>>,
 }
 
 /// Decompose a packed timestamp/index value: `kick_start`, `kick_end`,

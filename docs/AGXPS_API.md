@@ -281,6 +281,42 @@ sample) against Xcode's reported wall total of 421.08 µs:
 That clock corresponds to ~257 MHz, consistent with an Apple GPU PMU
 sampler clock.
 
+### Counters in USC profile data are metadata-only
+
+`agxps_aps_profile_data_get_counter_num` returns 12 on our trace —
+but every counter's values vector is empty. `get_counter_values_by_index`
+(returns the start pointer) and `get_counter_values_num_by_index`
+(returns the element count) both report length 0.
+
+Conclusion: USC profile data (parsed with `profile_type=0x21` from
+`Profiling_f_*.raw`) ships counter *metadata* (12 named counter
+slots) but no actual counter values. The values are stored in
+`Counters_f_*.raw`, which `agxps_aps_parser_parse` rejects with
+"tile start while a tile was still active" regardless of which
+`profile_type` we try (0x10, 0x20, 0x21, 0x22, 0x40, 0x100). That
+file format probably needs a different agxps entry point we haven't
+identified.
+
+### Counter names are obfuscated; map needs RE
+
+Counter names returned by `get_counter_names` are 64-char SHA-256
+hashes (e.g. `79E88035C9BC883D403F17831B8C9264E643C6B76E9B3C1451B49B0F672C32BF`),
+not human-readable. The framework exports a deobfuscation API:
+
+| Symbol | Purpose |
+| ------ | ------- |
+| `agxps_load_counter_obfuscation_map(const char *path)` | load mapping (pass NULL for default) |
+| `agxps_unload_counter_obfuscation_map()` | clear map |
+| `agxps_counter_deobfuscate_name(const char *hash)` | hash → readable |
+| `agxps_counter_obfuscated_name(const char *name)` | readable → hash |
+
+Calling `load_counter_obfuscation_map(NULL)` doesn't populate the
+default map — it falls into a path keyed off an internal Obj-C class
+(adrp+0x698) we haven't decoded. The map likely needs an explicit
+file path; the bundled `GPUCounterGraph.plist` in
+`GTShaderProfiler.framework/Resources/` is the *display-name* graph,
+not the agxps obfuscation map.
+
 ### Why `(kick_end_time - kick_start_time)` is NOT compute time
 
 Even with the packing fixed, summing `(end_time - start_time)` per

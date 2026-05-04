@@ -121,4 +121,21 @@ fn main() {
             decoded.synchronized_timestamps.len(),
         );
     }
+
+    println!("\ncounters: ({} total)", decoded.counter_num);
+    let total_values: usize = decoded.counter_values.iter().map(|v| v.len()).sum();
+    println!(
+        "  total counter values across all 12 indices: {total_values} \
+         (USC profile data only ships counter metadata, not values — \
+         actual values live in `Counters_f_*.raw` which uses a different \
+         parser path)",
+    );
+    println!(
+        "  (counter names below are still obfuscated SHA-256 hashes; the \
+         agxps obfuscation map needs further RE to load)",
+    );
+    for (idx, name) in decoded.counter_names.iter().enumerate() {
+        let short: String = name.chars().take(16).collect();
+        println!("  [{idx:>2}] {short}…");
+    }
 }
