@@ -5,7 +5,7 @@ edition = "2024"
 
 [workspace]
 resolver = "3"
-members = [".", "crates/xtask", "crates/agxps-sys"]
+members = [".", "crates/xtask", "crates/agxps-sys", "crates/agxps-noxcode-sys"]
 
 [[bin]]
 name = "gputrace"

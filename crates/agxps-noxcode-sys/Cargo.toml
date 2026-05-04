@@ -1,0 +1,15 @@
+[package]
+name = "agxps-noxcode-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Offset-based FFI binding to the agxps_aps_* subset exported in macOS's GPUToolsReplay.framework. Use the regular `agxps-sys` crate when Xcode is installed; this is only for environments without it (CI/headless/no-Xcode VMs)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2.0"
+
+[[example]]
+name = "decode_profiling"
+path = "examples/decode_profiling.rs"

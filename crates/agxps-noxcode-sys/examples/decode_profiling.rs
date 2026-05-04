@@ -1,14 +1,12 @@
-//! Decode a single `Profiling_f_*.raw` via Xcode's `GTShaderProfiler`
-//! framework and print per-clique kick counts, durations, and shares.
+//! Decode a single `Profiling_f_*.raw` file and print per-kick info.
 //!
 //! Usage:
 //! ```
 //! cargo run -p agxps-sys --example decode_profiling -- /path/to/Profiling_f_0.raw
 //! ```
 //!
-//! Defaults: M4 Pro (`gen=16, variant=3, rev=1`). Override via
-//! `AGXPS_GEN`, `AGXPS_VARIANT`, `AGXPS_REV`. Override the framework
-//! location via `AGXPS_FRAMEWORK_PATH`.
+//! By default assumes the host is M4 Pro (`gen=16, variant=3, rev=1`).
+//! Override with `AGXPS_GEN`, `AGXPS_VARIANT`, `AGXPS_REV` env vars.
 
 use std::env;
 use std::fs;
@@ -33,14 +31,14 @@ fn main() {
     };
     println!("loaded {} bytes from {}", bytes.len(), path);
 
-    let loaded = match agxps_sys::load() {
+    let loaded = match agxps_noxcode_sys::load() {
         Ok(l) => l,
         Err(e) => {
             eprintln!("load: {e}");
             process::exit(1);
         }
     };
-    println!("framework: {}", loaded.framework_path);
+    println!("framework UUID: {}", loaded.framework_uuid);
 
     let decoded = match loaded.parse_profiling(generation, variant, rev, &bytes) {
         Ok(d) => d,
@@ -51,45 +49,29 @@ fn main() {
     };
 
     println!("\ndecoded:");
-    println!("  kicks:                    {}", decoded.kick_starts.len());
-    println!("  usc_timestamps:           {}", decoded.usc_timestamps.len());
-    println!("  synchronized_timestamps:  {}", decoded.synchronized_timestamps.len());
-    println!("  counters:                 {}", decoded.counter_num);
+    println!("  kicks:           {}", decoded.kick_starts.len());
+    println!("  usc_timestamps:  {}", decoded.usc_timestamps.len());
+    println!("  counters:        {}", decoded.counter_num);
 
     let kick_groups = decoded.group_by_clique();
-    let dur_groups = decoded.duration_by_clique();
     let total_kicks: usize = kick_groups.values().sum();
-    let total_dur: u64 = dur_groups.values().sum();
 
     println!("\ngrouped by software-id high16 (= kernel/clique):");
-    println!("  prefix    kicks  share-by-kicks       duration       share-by-duration");
+    println!("  prefix    kicks  share");
     for (prefix, kicks) in &kick_groups {
-        let dur = dur_groups.get(prefix).copied().unwrap_or(0);
-        let kshare = if total_kicks == 0 {
+        let share = if total_kicks == 0 {
             0.0
         } else {
             100.0 * *kicks as f64 / total_kicks as f64
         };
-        let dshare = if total_dur == 0 {
-            0.0
-        } else {
-            100.0 * dur as f64 / total_dur as f64
-        };
-        println!(
-            "  0x{prefix:04x}  {kicks:>5}  {kshare:>13.4}%  {dur:>16}  {dshare:>16.4}%",
-        );
+        println!("  0x{prefix:04x}  {kicks:>5}  {share:>6.2}%");
     }
 
     println!("\nfirst 16 kicks:");
     for i in 0..decoded.kick_starts.len().min(16) {
-        let dur = decoded.kick_ends[i].saturating_sub(decoded.kick_starts[i]);
         println!(
-            "  [{i:>3}] start={:>15}  end={:>15}  dur={:>12}  slot={:>3}  swid=0x{:016x}",
-            decoded.kick_starts[i],
-            decoded.kick_ends[i],
-            dur,
-            decoded.kick_kick_slots[i],
-            decoded.kick_software_ids[i],
+            "  [{i:>3}] start={:>20} swid=0x{:016x}",
+            decoded.kick_starts[i], decoded.kick_software_ids[i],
         );
     }
 }

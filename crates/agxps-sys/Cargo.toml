@@ -2,7 +2,7 @@
 name = "agxps-sys"
 version = "0.1.0"
 edition = "2024"
-description = "FFI bindings to Apple's private agxps_aps_* sample-decoder API in GPUToolsReplay.framework"
+description = "FFI bindings to the agxps_aps_* sample-decoder API bundled in Xcode's GPUDebugger plugin (GTShaderProfiler.framework). Falls back to a much smaller subset when only macOS's GPUToolsReplay is available — see the `agxps-noxcode-sys` crate for that path."
 
 [lib]
 path = "src/lib.rs"

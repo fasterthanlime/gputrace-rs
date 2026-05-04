@@ -1,76 +1,71 @@
-//! Raw FFI bindings to Apple's private `agxps_aps_*` sample-decoder API.
+//! FFI bindings to Apple's `agxps_aps_*` sample-decoder API as bundled
+//! inside Xcode's `GPUDebugger.ideplugin` (specifically
+//! `GTShaderProfiler.framework`).
 //!
-//! These functions live in
-//! `/System/Library/PrivateFrameworks/GPUToolsReplay.framework/GPUToolsReplay`
-//! (part of macOS, in the dyld_shared_cache) and decode `Profiling_f_*.raw`
-//! files into per-kick timestamps and counter values. The symbols are NOT in
-//! the framework's export trie — `dlsym` returns NULL for them — so we resolve
-//! them at runtime by their offset within the framework's text segment.
+//! The full agxps surface — ~100 functions including `kick_end`,
+//! `kick_id`, `kick_time_stats_create_sampled`, synchronized/operating
+//! timestamps, work_clique/hw_clique/esl_clique queries, instruction
+//! traces — is exported from `GTShaderProfiler.framework` as ordinary
+//! external symbols, so `dlsym` resolves them directly. No offset
+//! tables, no UUID-keyed compatibility lookup.
 //!
-//! See `docs/AGXPS_API.md` for how the call chain was reverse-engineered.
-//!
-//! ## Status
-//!
-//! Experimental scaffold. Verified working against macOS 26.4
-//! `GPUToolsReplay` (UUID `B1DEE264-D3AF-38F9-BC6E-821AFAE2DB30`). Offsets
-//! are hardcoded for that build; loading on other versions returns
-//! [`Error::UnsupportedFrameworkVersion`].
+//! Compare with `agxps-noxcode-sys`, which targets the much smaller
+//! 15-function subset shipped in macOS's `GPUToolsReplay.framework`
+//! and resolves them by hardcoded text-section offsets per build UUID.
+//! Use this crate when Xcode is installed; fall back to
+//! `agxps-noxcode-sys` only when it isn't.
 
 #![cfg(target_os = "macos")]
 
 use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_void};
 use std::os::raw::c_uchar;
 
-mod offsets;
-
-/// Errors returned from the agxps decoder pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("framework not loadable: {0}")]
     Dlopen(String),
-    #[error("framework UUID {found} not in offset table; supported: {supported:?}")]
-    UnsupportedFrameworkVersion {
-        found: String,
-        supported: Vec<String>,
-    },
     #[error("agxps_gpu_create({generation}, {variant}, {rev}) failed")]
     GpuCreate { generation: u32, variant: u32, rev: u32 },
     #[error("agxps_aps_parser_create returned NULL — descriptor invalid for this GPU")]
     ParserCreate,
     #[error("agxps_aps_parser_parse error code {code}: {message}")]
     ParserParse { code: u64, message: String },
-    #[error("agxps_aps_profile_data_get_kick_* call failed (out-of-bounds)")]
+    #[error("agxps_aps_profile_data_get_kick_* range fetch failed")]
     KickAccess,
+    #[error("missing symbol in framework: {0}")]
+    MissingSymbol(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 // -------- Raw C ABI types --------
 
-/// Opaque GPU descriptor returned by `agxps_gpu_create`.
 pub type AgxpsGpu = *mut c_void;
+pub type AgxpsApsParser = *mut c_void;
+pub type AgxpsApsProfileData = *mut c_void;
 
-/// 0x68-byte descriptor struct passed to `agxps_aps_parser_create`.
+/// 0x68-byte descriptor passed to `agxps_aps_parser_create`. The
+/// non-zero fields are values empirically known to satisfy the per-GPU
+/// validators; see `docs/AGXPS_API.md` for the rules each field has to
+/// obey.
 #[repr(C)]
 pub struct AgxpsApsDescriptor {
     pub gpu: *mut c_void,        // +0x00
     pub field_0x08: u32,         // +0x08 — power of 2 in [0x10, 0x800]
     pub field_0x0c: u32,         // +0x0c — power of 2 in [0x40, 0x2000]
     pub field_0x10: u32,         // +0x10 — 0 or power of 2 in [0x80, 0x8000]
-    pub field_0x14: u32,         // +0x14 — padding
+    pub field_0x14: u32,
     pub field_0x18: u64,         // +0x18 — must be 0x400, 0x1000, or 0x40000
-    pub _pad_0x20: [u8; 0x10],   // +0x20..0x30
+    pub _pad_0x20: [u8; 0x10],
     pub field_0x30: u64,         // +0x30 — set to -1 by default
-    pub _pad_0x38: [u8; 0x20],   // +0x38..0x58
+    pub _pad_0x38: [u8; 0x20],
     pub field_0x58: u64,         // +0x58 — set to 0x32 by default
-    pub _pad_0x60: [u8; 0x08],   // +0x60..0x68
+    pub _pad_0x60: [u8; 0x08],
 }
 
 const _: () = assert!(std::mem::size_of::<AgxpsApsDescriptor>() == 0x68);
 
 impl AgxpsApsDescriptor {
-    /// A descriptor matching what we found works empirically against
-    /// `GPUToolsReplay` decode of M4 Pro perfdata.
     pub fn defaults_for(gpu: AgxpsGpu) -> Self {
         Self {
             gpu,
@@ -80,7 +75,7 @@ impl AgxpsApsDescriptor {
             field_0x14: 0,
             field_0x18: 0x1000,
             _pad_0x20: [0; 0x10],
-            field_0x30: u64::MAX, // -1
+            field_0x30: u64::MAX,
             _pad_0x38: [0; 0x20],
             field_0x58: 0x32,
             _pad_0x60: [0; 0x08],
@@ -88,43 +83,41 @@ impl AgxpsApsDescriptor {
     }
 }
 
-/// Opaque parser handle.
-pub type AgxpsApsParser = *mut c_void;
-
-/// Opaque decoded-profile-data handle.
-pub type AgxpsApsProfileData = *mut c_void;
-
-/// `eAPSProfilingType` value used by `LoadAPSTraceDataAtIndex`. Other
-/// values exist but haven't been enumerated.
+/// Profile-type tag for USC sample streams (`Profiling_f_*.raw`).
 pub const APS_PROFILING_TYPE_USC_SAMPLES: u32 = 0x21;
 
 // Function-pointer types matching the agxps C ABI.
-type FnGpuCreate =
+pub type FnGpuCreate =
     unsafe extern "C" fn(generation: u32, variant: u32, rev: u32, flag: bool) -> AgxpsGpu;
-type FnGpuDestroy = unsafe extern "C" fn(AgxpsGpu);
-type FnDescriptorCreate = unsafe extern "C" fn() -> AgxpsApsDescriptor;
-type FnParserCreate = unsafe extern "C" fn(*const AgxpsApsDescriptor) -> AgxpsApsParser;
-type FnParserDestroy = unsafe extern "C" fn(AgxpsApsParser);
-type FnParserParse = unsafe extern "C" fn(
+pub type FnGpuDestroy = unsafe extern "C" fn(AgxpsGpu);
+pub type FnDescriptorCreate = unsafe extern "C" fn() -> AgxpsApsDescriptor;
+pub type FnParserCreate = unsafe extern "C" fn(*const AgxpsApsDescriptor) -> AgxpsApsParser;
+pub type FnParserDestroy = unsafe extern "C" fn(AgxpsApsParser);
+pub type FnParserParse = unsafe extern "C" fn(
     parser: AgxpsApsParser,
     bytes: *const c_uchar,
     size: c_long,
     profile_type: u32,
     out: *mut c_void,
 ) -> AgxpsApsProfileData;
-type FnProfileDataDestroy = unsafe extern "C" fn(AgxpsApsProfileData);
-type FnGetKicksNum = unsafe extern "C" fn(AgxpsApsProfileData) -> c_uint;
-type FnGetCounterNum = unsafe extern "C" fn(AgxpsApsProfileData) -> c_uint;
-type FnGetU64Range = unsafe extern "C" fn(
+pub type FnProfileDataDestroy = unsafe extern "C" fn(AgxpsApsProfileData);
+pub type FnGetCount = unsafe extern "C" fn(AgxpsApsProfileData) -> c_uint;
+pub type FnGetU64Range = unsafe extern "C" fn(
     pd: AgxpsApsProfileData,
     out: *mut u64,
     start_idx: u64,
     count: u64,
 ) -> c_int;
-type FnParseErrorString = unsafe extern "C" fn(code: u64) -> *const c_char;
+pub type FnGetU8Range = unsafe extern "C" fn(
+    pd: AgxpsApsProfileData,
+    out: *mut u8,
+    start_idx: u64,
+    count: u64,
+) -> c_int;
+pub type FnParseErrorString = unsafe extern "C" fn(code: u64) -> *const c_char;
 
-/// Resolved function-pointer table. All Send/Sync because the underlying
-/// functions are stateless C functions reading from per-call inputs.
+/// Resolved function-pointer table. All fields are non-null on success
+/// (we treat any missing symbol as a hard load error).
 pub struct AgxpsApi {
     pub gpu_create: FnGpuCreate,
     pub gpu_destroy: FnGpuDestroy,
@@ -133,142 +126,104 @@ pub struct AgxpsApi {
     pub parser_destroy: FnParserDestroy,
     pub parser_parse: FnParserParse,
     pub profile_data_destroy: FnProfileDataDestroy,
-    pub get_kicks_num: FnGetKicksNum,
-    pub get_counter_num: FnGetCounterNum,
+    pub get_kicks_num: FnGetCount,
+    pub get_counter_num: FnGetCount,
     pub get_kick_start: FnGetU64Range,
+    pub get_kick_end: FnGetU64Range,
     pub get_kick_software_id: FnGetU64Range,
+    pub get_kick_id: FnGetU64Range,
+    pub get_kick_kick_slot: FnGetU64Range,
+    pub get_kick_missing_end: FnGetU8Range,
     pub get_usc_timestamps: FnGetU64Range,
+    pub get_usc_timestamps_num: FnGetCount,
+    pub get_synchronized_timestamps: FnGetU64Range,
+    pub get_synchronized_timestamps_num: FnGetCount,
+    pub get_operating_frequencies: FnGetU64Range,
     pub parse_error_string: FnParseErrorString,
 }
 
 unsafe impl Send for AgxpsApi {}
 unsafe impl Sync for AgxpsApi {}
 
-const FRAMEWORK_PATH: &str =
-    "/System/Library/PrivateFrameworks/GPUToolsReplay.framework/GPUToolsReplay";
+const DEFAULT_FRAMEWORK_PATH: &str =
+    "/Applications/Xcode.app/Contents/PlugIns/GPUDebugger.ideplugin/Contents/Frameworks/GTShaderProfiler.framework/GTShaderProfiler";
 
-/// Load `GPUToolsReplay` and resolve the agxps function table by offset.
+/// dlopen `GTShaderProfiler` and dlsym every needed symbol. Returns
+/// [`Error::MissingSymbol`] if any required entry-point isn't exported
+/// (which would mean we're looking at an Xcode version with a renamed
+/// or missing function — worth flagging early).
 ///
-/// Returns [`Error::UnsupportedFrameworkVersion`] if the loaded binary's UUID
-/// isn't one we have offsets for. The `_keep_alive` field on the returned
-/// struct holds the dlopen handle so the framework stays mapped for the life
-/// of the API table.
+/// Set `AGXPS_FRAMEWORK_PATH` env var to override the default Xcode
+/// location (e.g. for Xcode-beta.app or a custom toolchain).
 pub fn load() -> Result<LoadedApi> {
     use std::ffi::CString;
 
-    let path = CString::new(FRAMEWORK_PATH).unwrap();
-    let handle =
-        unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+    let path = std::env::var("AGXPS_FRAMEWORK_PATH")
+        .unwrap_or_else(|_| DEFAULT_FRAMEWORK_PATH.to_string());
+    let cpath = CString::new(path.clone()).unwrap();
+    let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
     if handle.is_null() {
         let err = unsafe { CStr::from_ptr(libc::dlerror()) }
             .to_string_lossy()
             .into_owned();
-        return Err(Error::Dlopen(err));
+        return Err(Error::Dlopen(format!("{path}: {err}")));
     }
 
-    let (base, _slide, uuid) = unsafe { framework_base_and_uuid() }
-        .map_err(|e| Error::Dlopen(format!("can't read GPUToolsReplay header: {e}")))?;
-
-    let table = offsets::lookup(&uuid).ok_or_else(|| Error::UnsupportedFrameworkVersion {
-        found: uuid.clone(),
-        supported: offsets::supported_uuids(),
-    })?;
-
-    // Offsets are relative to the framework's runtime image base
-    // (`_dyld_get_image_header`), so just add directly. Cache build differences
-    // and ASLR slide are absorbed into `base`.
-    let resolve = |off: usize| (base as usize + off) as *const c_void;
     let api = AgxpsApi {
-        gpu_create: unsafe { std::mem::transmute(resolve(table.gpu_create)) },
-        gpu_destroy: unsafe { std::mem::transmute(resolve(table.gpu_destroy)) },
-        descriptor_create: unsafe { std::mem::transmute(resolve(table.descriptor_create)) },
-        parser_create: unsafe { std::mem::transmute(resolve(table.parser_create)) },
-        parser_destroy: unsafe { std::mem::transmute(resolve(table.parser_destroy)) },
-        parser_parse: unsafe { std::mem::transmute(resolve(table.parser_parse)) },
-        profile_data_destroy: unsafe { std::mem::transmute(resolve(table.profile_data_destroy)) },
-        get_kicks_num: unsafe { std::mem::transmute(resolve(table.get_kicks_num)) },
-        get_counter_num: unsafe { std::mem::transmute(resolve(table.get_counter_num)) },
-        get_kick_start: unsafe { std::mem::transmute(resolve(table.get_kick_start)) },
-        get_kick_software_id: unsafe { std::mem::transmute(resolve(table.get_kick_software_id)) },
-        get_usc_timestamps: unsafe { std::mem::transmute(resolve(table.get_usc_timestamps)) },
-        parse_error_string: unsafe { std::mem::transmute(resolve(table.parse_error_string)) },
+        gpu_create: load_sym(handle, "agxps_gpu_create")?,
+        gpu_destroy: load_sym(handle, "agxps_gpu_destroy")?,
+        descriptor_create: load_sym(handle, "agxps_aps_descriptor_create")?,
+        parser_create: load_sym(handle, "agxps_aps_parser_create")?,
+        parser_destroy: load_sym(handle, "agxps_aps_parser_destroy")?,
+        parser_parse: load_sym(handle, "agxps_aps_parser_parse")?,
+        profile_data_destroy: load_sym(handle, "agxps_aps_profile_data_destroy")?,
+        get_kicks_num: load_sym(handle, "agxps_aps_profile_data_get_kicks_num")?,
+        get_counter_num: load_sym(handle, "agxps_aps_profile_data_get_counter_num")?,
+        get_kick_start: load_sym(handle, "agxps_aps_profile_data_get_kick_start")?,
+        get_kick_end: load_sym(handle, "agxps_aps_profile_data_get_kick_end")?,
+        get_kick_software_id: load_sym(handle, "agxps_aps_profile_data_get_kick_software_id")?,
+        get_kick_id: load_sym(handle, "agxps_aps_profile_data_get_kick_id")?,
+        get_kick_kick_slot: load_sym(handle, "agxps_aps_profile_data_get_kick_kick_slot")?,
+        get_kick_missing_end: load_sym(handle, "agxps_aps_profile_data_get_kick_missing_end")?,
+        get_usc_timestamps: load_sym(handle, "agxps_aps_profile_data_get_usc_timestamps")?,
+        get_usc_timestamps_num: load_sym(handle, "agxps_aps_profile_data_get_usc_timestamps_num")?,
+        get_synchronized_timestamps: load_sym(
+            handle,
+            "agxps_aps_profile_data_get_synchronized_timestamps",
+        )?,
+        get_synchronized_timestamps_num: load_sym(
+            handle,
+            "agxps_aps_profile_data_get_synchronized_timestamps_num",
+        )?,
+        get_operating_frequencies: load_sym(
+            handle,
+            "agxps_aps_profile_data_get_operating_frequencies",
+        )?,
+        parse_error_string: load_sym(handle, "agxps_aps_parse_error_type_to_string")?,
     };
 
     Ok(LoadedApi {
         api,
+        framework_path: path,
         _keep_alive: handle,
-        framework_uuid: uuid,
     })
 }
 
-/// Find `GPUToolsReplay`'s loaded base address, ASLR slide, and UUID by
-/// walking the dyld image list. Has to be called *after* a successful
-/// `dlopen` of the framework.
-unsafe fn framework_base_and_uuid() -> std::result::Result<(*const c_void, isize, String), &'static str> {
-    use std::ffi::CStr;
-
-    unsafe extern "C" {
-        fn _dyld_image_count() -> u32;
-        fn _dyld_get_image_name(idx: u32) -> *const c_char;
-        fn _dyld_get_image_header(idx: u32) -> *const c_void;
-        fn _dyld_get_image_vmaddr_slide(idx: u32) -> isize;
-    }
-
-    let count = unsafe { _dyld_image_count() };
-    for i in 0..count {
-        let name_ptr = unsafe { _dyld_get_image_name(i) };
-        if name_ptr.is_null() {
-            continue;
-        }
-        let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
-        if !name.contains("GPUToolsReplay") {
-            continue;
-        }
-        let header = unsafe { _dyld_get_image_header(i) };
-        if header.is_null() {
-            return Err("null header");
-        }
-        let slide = unsafe { _dyld_get_image_vmaddr_slide(i) };
-        let uuid = unsafe { read_uuid_from_header(header) }.ok_or("no LC_UUID")?;
-        return Ok((header, slide, uuid));
-    }
-    Err("GPUToolsReplay not found in image list")
+unsafe fn load_sym_raw(handle: *mut c_void, name: &str) -> Option<*mut c_void> {
+    use std::ffi::CString;
+    let cname = CString::new(name).unwrap();
+    let p = unsafe { libc::dlsym(handle, cname.as_ptr()) };
+    if p.is_null() { None } else { Some(p) }
 }
 
-unsafe fn read_uuid_from_header(header: *const c_void) -> Option<String> {
-    // Mach-O header layout: magic + cpu + cputype + filetype + ncmds + sizeofcmds + flags + reserved.
-    // 64-bit header is 32 bytes; load commands start right after.
-    const LC_UUID: u32 = 0x1b;
-    let header_bytes = header as *const u8;
-    let ncmds = unsafe { *(header_bytes.add(16) as *const u32) };
-    let mut cursor = unsafe { header_bytes.add(32) };
-    for _ in 0..ncmds {
-        let cmd = unsafe { *(cursor as *const u32) };
-        let cmdsize = unsafe { *(cursor.add(4) as *const u32) };
-        if cmd == LC_UUID {
-            let uuid_bytes = unsafe { std::slice::from_raw_parts(cursor.add(8), 16) };
-            return Some(format_uuid(uuid_bytes));
-        }
-        cursor = unsafe { cursor.add(cmdsize as usize) };
-    }
-    None
+fn load_sym<T>(handle: *mut c_void, name: &'static str) -> Result<T> {
+    let p = unsafe { load_sym_raw(handle, name) }.ok_or(Error::MissingSymbol(name))?;
+    Ok(unsafe { std::mem::transmute_copy(&p) })
 }
 
-fn format_uuid(bytes: &[u8]) -> String {
-    format!(
-        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-    )
-}
-
-/// A loaded agxps API plus the dlopen handle keeping it mapped.
 pub struct LoadedApi {
     pub api: AgxpsApi,
-    pub framework_uuid: String,
+    pub framework_path: String,
     _keep_alive: *mut c_void,
 }
 
@@ -276,9 +231,9 @@ unsafe impl Send for LoadedApi {}
 unsafe impl Sync for LoadedApi {}
 
 impl LoadedApi {
-    /// High-level: parse one `Profiling_f_*.raw` for the given GPU and return
-    /// per-kick start ticks + software IDs. Caller drops the returned struct
-    /// to release everything.
+    /// Decode a single `Profiling_f_*.raw` and return per-kick data
+    /// (start, end, software_id, kick_id, kick_slot, missing_end) plus
+    /// the raw `usc_timestamps` and `synchronized_timestamps` vectors.
     pub fn parse_profiling(
         &self,
         generation: u32,
@@ -296,15 +251,11 @@ impl LoadedApi {
         let descriptor = AgxpsApsDescriptor::defaults_for(gpu);
         let parser = unsafe { (api.parser_create)(&descriptor) };
         if parser.is_null() {
-            // can't destroy gpu — see leak comment below
             return Err(Error::ParserCreate);
         }
 
-        // The `out` struct's exact size isn't decoded yet; LoadAPSTraceDataAtIndex
-        // reserved ~0x300 bytes on its stack. 4 KB is generous and zero-init
-        // makes error detection (out[0] != 0) reliable.
         let mut out = vec![0u8; 4096];
-        let profile_data = unsafe {
+        let pd = unsafe {
             (api.parser_parse)(
                 parser,
                 bytes.as_ptr(),
@@ -323,134 +274,109 @@ impl LoadedApi {
                     CStr::from_ptr(s).to_string_lossy().into_owned()
                 }
             };
-            return Err(Error::ParserParse {
-                code: err_code,
-                message: msg,
-            });
+            return Err(Error::ParserParse { code: err_code, message: msg });
         }
 
-        let n = unsafe { (api.get_kicks_num)(profile_data) } as usize;
+        let n = unsafe { (api.get_kicks_num)(pd) } as usize;
         let mut starts = vec![0u64; n];
+        let mut ends = vec![0u64; n];
         let mut swids = vec![0u64; n];
+        let mut kids = vec![0u64; n];
+        let mut slots = vec![0u64; n];
+        let mut missing = vec![0u8; n];
         if n > 0 {
-            let ok1 = unsafe {
-                (api.get_kick_start)(profile_data, starts.as_mut_ptr(), 0, n as u64)
+            let nu = n as u64;
+            let ok = unsafe {
+                (api.get_kick_start)(pd, starts.as_mut_ptr(), 0, nu) != 0
+                    && (api.get_kick_end)(pd, ends.as_mut_ptr(), 0, nu) != 0
+                    && (api.get_kick_software_id)(pd, swids.as_mut_ptr(), 0, nu) != 0
+                    && (api.get_kick_id)(pd, kids.as_mut_ptr(), 0, nu) != 0
+                    && (api.get_kick_kick_slot)(pd, slots.as_mut_ptr(), 0, nu) != 0
+                    && (api.get_kick_missing_end)(pd, missing.as_mut_ptr(), 0, nu) != 0
             };
-            let ok2 = unsafe {
-                (api.get_kick_software_id)(profile_data, swids.as_mut_ptr(), 0, n as u64)
-            };
-            if ok1 == 0 || ok2 == 0 {
+            if !ok {
                 return Err(Error::KickAccess);
             }
         }
 
-        // Probe the usc_timestamps vector size by binary-searching the
-        // get_usc_timestamps return value (1=success, 0=oob). The vector size
-        // for our qa-decode-sample Profiling_f_0 was ~115k entries.
-        let usc_count = probe_usc_timestamps_count(api, profile_data);
-        let mut usc_timestamps = vec![0u64; usc_count];
-        if usc_count > 0 {
-            let ok = unsafe {
-                (api.get_usc_timestamps)(
-                    profile_data,
-                    usc_timestamps.as_mut_ptr(),
-                    0,
-                    usc_count as u64,
-                )
+        let usc_n = unsafe { (api.get_usc_timestamps_num)(pd) } as usize;
+        let mut usc_timestamps = vec![0u64; usc_n];
+        if usc_n > 0 {
+            let _ = unsafe {
+                (api.get_usc_timestamps)(pd, usc_timestamps.as_mut_ptr(), 0, usc_n as u64)
             };
-            if ok == 0 {
-                usc_timestamps.clear();
-            }
         }
 
-        let counter_num = unsafe { (api.get_counter_num)(profile_data) };
+        let sync_n = unsafe { (api.get_synchronized_timestamps_num)(pd) } as usize;
+        let mut sync_timestamps = vec![0u64; sync_n];
+        if sync_n > 0 {
+            let _ = unsafe {
+                (api.get_synchronized_timestamps)(
+                    pd,
+                    sync_timestamps.as_mut_ptr(),
+                    0,
+                    sync_n as u64,
+                )
+            };
+        }
 
-        // Intentional leak: `agxps_gpu_destroy` appears to call `delete[]`
-        // on a pointer that `agxps_gpu_create` allocated with `new` (single
-        // object). Calling it hangs or crashes on real builds. The gpu/
-        // parser/profile_data structs are small and the caller decodes one
-        // file per process anyway, so we let them ride.
-        let _ = (parser, profile_data, gpu);
+        let counter_num = unsafe { (api.get_counter_num)(pd) };
+
+        // See the noxcode crate for why we leak instead of calling destroy.
+        let _ = (parser, pd, gpu);
 
         Ok(DecodedProfile {
             kick_starts: starts,
+            kick_ends: ends,
             kick_software_ids: swids,
+            kick_ids: kids,
+            kick_kick_slots: slots,
+            kick_missing_ends: missing.into_iter().map(|b| b != 0).collect(),
             usc_timestamps,
+            synchronized_timestamps: sync_timestamps,
             counter_num,
         })
     }
 }
 
-/// Find the size of the `profile_data`'s usc_timestamps vector by probing
-/// `get_usc_timestamps` with `count=1` at increasing offsets. The function
-/// returns 1 on success (index in range) or 0 on out-of-bounds, so the size
-/// is the smallest `i` for which probing index `i` fails.
-fn probe_usc_timestamps_count(api: &AgxpsApi, pd: AgxpsApsProfileData) -> usize {
-    let scratch = [0u64; 1];
-    let probe = |idx: u64| -> bool {
-        let r = unsafe {
-            (api.get_usc_timestamps)(pd, scratch.as_ptr() as *mut u64, idx, 1)
-        };
-        r != 0
-    };
-
-    if !probe(0) {
-        return 0;
-    }
-    // Exponential climb to find an upper bound that fails.
-    let mut hi = 1u64;
-    while probe(hi) {
-        hi = hi.saturating_mul(2);
-        if hi > (1u64 << 32) {
-            return hi as usize;
-        }
-    }
-    // Binary search for the boundary in [lo, hi) where lo passes and hi fails.
-    let mut lo = hi / 2;
-    while lo + 1 < hi {
-        let mid = lo + (hi - lo) / 2;
-        if probe(mid) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    // lo is the largest passing index, so the vector size is lo + 1.
-    (lo + 1) as usize
-}
-
 /// Per-kick decoded data from one `Profiling_f_*.raw` stream.
 #[derive(Debug, Clone)]
 pub struct DecodedProfile {
-    /// Kick start times in raw GPU-ticks (units TBD — empirically large u64
-    /// values that are *not* nanoseconds-since-boot, likely cycles or some
-    /// internal counter).
     pub kick_starts: Vec<u64>,
-    /// Per-kick `software_id`. The high 16 bits appear to encode a
-    /// pipeline/clique hash that's stable across kicks of the same kernel.
+    pub kick_ends: Vec<u64>,
     pub kick_software_ids: Vec<u64>,
-    /// Raw `usc_timestamps` vector, as exposed by
-    /// `agxps_aps_profile_data_get_usc_timestamps`.
-    ///
-    /// Empirically these are NOT comparable to `kick_starts` (much smaller
-    /// magnitude, leading run of zeros, stride-of-256 pattern). The encoding
-    /// is unclear — likely packed indices or per-kick relative offsets — so
-    /// we expose them as raw u64s without interpretation. See
-    /// `docs/AGXPS_API.md` for what we've observed.
+    pub kick_ids: Vec<u64>,
+    pub kick_kick_slots: Vec<u64>,
+    pub kick_missing_ends: Vec<bool>,
     pub usc_timestamps: Vec<u64>,
-    /// Number of counters available on this profile_data.
+    pub synchronized_timestamps: Vec<u64>,
     pub counter_num: u32,
 }
 
 impl DecodedProfile {
-    /// Quick summary by software-id high16 (= clique/kernel-group).
+    /// Kick count grouped by `software_id` high 16 bits (= kernel/clique).
     pub fn group_by_clique(&self) -> std::collections::BTreeMap<u16, usize> {
         let mut counts = std::collections::BTreeMap::new();
         for swid in &self.kick_software_ids {
-            let prefix = (*swid >> 48) as u16;
-            *counts.entry(prefix).or_insert(0usize) += 1;
+            *counts.entry((*swid >> 48) as u16).or_insert(0usize) += 1;
         }
         counts
+    }
+
+    /// Sum of `kick_end - kick_start` (in raw GPU ticks) grouped by
+    /// `software_id` high 16 bits. Kicks with `missing_end=true` are
+    /// skipped.
+    pub fn duration_by_clique(&self) -> std::collections::BTreeMap<u16, u64> {
+        let mut sums = std::collections::BTreeMap::new();
+        for i in 0..self.kick_starts.len() {
+            if self.kick_missing_ends[i] {
+                continue;
+            }
+            let dur = self.kick_ends[i].saturating_sub(self.kick_starts[i]);
+            let prefix = (self.kick_software_ids[i] >> 48) as u16;
+            *sums.entry(prefix).or_insert(0u64) += dur;
+        }
+        sums
     }
 }
 
@@ -464,6 +390,7 @@ mod libc {
 
     unsafe extern "C" {
         pub fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+        pub fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
         pub fn dlerror() -> *const c_char;
     }
 }
