@@ -1131,6 +1131,7 @@ mod tests {
                 index: 3,
                 timestamp: 42,
                 offset: 0x300,
+            artifact_hashes: Vec::new(),
             },
             end_offset: 0x3ff,
             encoders: vec![ComputeEncoder {

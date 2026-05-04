@@ -98,6 +98,7 @@ pub struct CommandBufferEntry {
     pub dispatch_count: usize,
     pub encoders: Vec<CommandBufferEncoderEntry>,
     pub kernels: Vec<String>,
+    pub artifact_hashes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -645,6 +646,7 @@ pub fn command_buffers(trace: &TraceBundle) -> Result<CommandBuffersReport> {
                 })
                 .collect(),
             kernels: kernels.into_iter().collect(),
+            artifact_hashes: cb.artifact_hashes.clone(),
         });
     }
 
@@ -939,6 +941,12 @@ pub fn format_command_buffers(report: &CommandBuffersReport, detailed: bool) -> 
             }
             if !cb.kernels.is_empty() {
                 out.push_str(&format!("       kernels: {}\n", cb.kernels.join(", ")));
+            }
+            if !cb.artifact_hashes.is_empty() {
+                out.push_str(&format!(
+                    "       artifacts: {}\n",
+                    cb.artifact_hashes.join(", ")
+                ));
             }
         }
     }
@@ -1492,6 +1500,7 @@ mod tests {
                     address: 0x33,
                 }],
                 kernels: vec!["kernel".into()],
+                artifact_hashes: vec!["F34AD02BAECBD543".into()],
             }],
         };
 
@@ -1499,6 +1508,7 @@ mod tests {
         assert!(rendered.contains("1 command buffers"));
         assert!(rendered.contains("offset=0x00000020"));
         assert!(rendered.contains("encoder   0"));
+        assert!(rendered.contains("artifacts: F34AD02BAECBD543"));
         assert!(rendered.contains("kernels: kernel"));
     }
 

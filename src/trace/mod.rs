@@ -61,11 +61,15 @@ pub struct TraceSummary {
 
 pub type PipelineFunctionMap = BTreeMap<u64, String>;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CommandBuffer {
     pub index: usize,
     pub timestamp: u64,
     pub offset: usize,
+    /// 16-char hex artifact hashes carried in the CUUU sub-record's payload —
+    /// these correspond to subdirectories of the trace bundle (e.g.,
+    /// `F34AD02BAECBD543`) that hold per-CB resource snapshots.
+    pub artifact_hashes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -654,25 +658,59 @@ fn parse_command_buffers(data: &[u8]) -> Vec<CommandBuffer> {
         return Vec::new();
     };
     let mut command_buffers = Vec::new();
+    let push = |cuuu: &MTSPRecord, offset: usize, dst: &mut Vec<CommandBuffer>| {
+        dst.push(CommandBuffer {
+            index: dst.len(),
+            timestamp: 0,
+            offset,
+            artifact_hashes: parse_cuuu_hashes(&cuuu.data),
+        });
+    };
     for record in records {
         if record.record_type == RecordType::CUUU {
-            command_buffers.push(CommandBuffer {
-                index: command_buffers.len(),
-                timestamp: 0,
-                offset: record.offset,
-            });
+            push(&record, record.offset, &mut command_buffers);
         }
         for nested in MTSPRecord::parse_subrecords(&record.data) {
             if nested.record_type == RecordType::CUUU {
-                command_buffers.push(CommandBuffer {
-                    index: command_buffers.len(),
-                    timestamp: 0,
-                    offset: record.offset + nested.offset,
-                });
+                push(&nested, record.offset + nested.offset, &mut command_buffers);
             }
         }
     }
     command_buffers
+}
+
+/// Extract artifact hash strings from a CUUU sub-record's payload.
+///
+/// The sub-record layout is `[u32 size][4 magic][24 zeros][u32 count][CUUU][4
+/// zeros][u64 address][c-strings...]`. The c-strings are 16-character
+/// uppercase hex hashes that name per-CB artifact subdirectories of the
+/// trace bundle.
+fn parse_cuuu_hashes(data: &[u8]) -> Vec<String> {
+    // First c-string starts at offset 52 (size + magic + 24 zeros + count + 4
+    // tag + 4 alignment + 8 address = 52).
+    let mut hashes = Vec::new();
+    let mut pos = 52;
+    while pos < data.len() {
+        let end = data[pos..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .map(|delta| pos + delta)
+            .unwrap_or(data.len());
+        if end == pos {
+            pos += 1;
+            continue;
+        }
+        let candidate = &data[pos..end];
+        let is_hex = !candidate.is_empty()
+            && candidate
+                .iter()
+                .all(|&byte| byte.is_ascii_hexdigit() && !byte.is_ascii_lowercase());
+        if is_hex && (12..=32).contains(&candidate.len()) {
+            hashes.push(String::from_utf8_lossy(candidate).into_owned());
+        }
+        pos = end + 1;
+    }
+    hashes
 }
 
 fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
@@ -798,6 +836,7 @@ fn build_command_buffer_regions(
                 index: 0,
                 timestamp: 0,
                 offset: 0,
+            artifact_hashes: Vec::new(),
             },
             end_offset: capture.len(),
             encoders,
@@ -1085,11 +1124,13 @@ mod tests {
                 index: 0,
                 timestamp: 1,
                 offset: 10,
+            artifact_hashes: Vec::new(),
             },
             CommandBuffer {
                 index: 1,
                 timestamp: 2,
                 offset: 50,
+            artifact_hashes: Vec::new(),
             },
         ];
         let encoders = vec![
@@ -1193,6 +1234,7 @@ mod tests {
                     index: 0,
                     timestamp: 1,
                     offset: 0,
+            artifact_hashes: Vec::new(),
                 },
                 end_offset: 10,
                 encoders: vec![],
@@ -1235,6 +1277,7 @@ mod tests {
                     index: 2,
                     timestamp: 2,
                     offset: 10,
+            artifact_hashes: Vec::new(),
                 },
                 end_offset: 20,
                 encoders: vec![],

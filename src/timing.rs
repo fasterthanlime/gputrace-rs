@@ -546,7 +546,7 @@ pub fn format_report(report: &TimingReport) -> String {
     };
     if report.synthetic {
         out.push_str("Synthetic timing report\n");
-        out.push_str("Derived from command-buffer timestamps and dispatch attribution.\n\n");
+        out.push_str("Derived from command-buffer timestamps and dispatch attribution. No profiler bundle was available, so per-dispatch durations are computed by dividing the command-buffer wall time evenly across dispatches — kernel percentages here are weighted by *dispatch count*, not by actual GPU time spent in each kernel. Capture with the GPU profiler enabled to get streamData-backed per-dispatch durations.\n\n");
     } else if report.source == "streamData" {
         out.push_str("Profiler-backed timing report\n");
         out.push_str(
@@ -619,10 +619,18 @@ pub fn format_report(report: &TimingReport) -> String {
     if !report.command_buffers.is_empty() {
         out.push_str("Command buffers:\n");
         for cb in &report.command_buffers {
+            // Prefer the absolute (boot-relative) timestamp when the profiler
+            // decoded one — it's meaningful even for single-CB traces where
+            // the capture-relative `timestamp_ns` is always 0.
+            let ts = if cb.absolute_timestamp_ns != 0 {
+                cb.absolute_timestamp_ns
+            } else {
+                cb.timestamp_ns
+            };
             out.push_str(&format!(
                 "  CB {}: ts={} ns duration={} encoders={} dispatches={}\n",
                 cb.index,
-                cb.timestamp_ns,
+                ts,
                 cb.duration_ns
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "?".to_owned()),
