@@ -766,10 +766,7 @@ fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
     let mut encoders = Vec::new();
     let mut seen_offsets: BTreeSet<usize> = BTreeSet::new();
     let mut push_if_encoder =
-        |address: u64,
-         label: Option<String>,
-         offset: usize,
-         encoders: &mut Vec<ComputeEncoder>| {
+        |address: u64, label: Option<String>, offset: usize, encoders: &mut Vec<ComputeEncoder>| {
             let Some(label) = label else { return };
             if label.is_empty() || buffer_addresses.contains(&address) {
                 return;
@@ -873,7 +870,7 @@ fn build_command_buffer_regions(
                 index: 0,
                 timestamp: 0,
                 offset: 0,
-            artifact_hashes: Vec::new(),
+                artifact_hashes: Vec::new(),
             },
             end_offset: capture.len(),
             encoders,
@@ -1161,13 +1158,13 @@ mod tests {
                 index: 0,
                 timestamp: 1,
                 offset: 10,
-            artifact_hashes: Vec::new(),
+                artifact_hashes: Vec::new(),
             },
             CommandBuffer {
                 index: 1,
                 timestamp: 2,
                 offset: 50,
-            artifact_hashes: Vec::new(),
+                artifact_hashes: Vec::new(),
             },
         ];
         let encoders = vec![
@@ -1271,7 +1268,7 @@ mod tests {
                     index: 0,
                     timestamp: 1,
                     offset: 0,
-            artifact_hashes: Vec::new(),
+                    artifact_hashes: Vec::new(),
                 },
                 end_offset: 10,
                 encoders: vec![],
@@ -1314,7 +1311,7 @@ mod tests {
                     index: 2,
                     timestamp: 2,
                     offset: 10,
-            artifact_hashes: Vec::new(),
+                    artifact_hashes: Vec::new(),
                 },
                 end_offset: 20,
                 encoders: vec![],

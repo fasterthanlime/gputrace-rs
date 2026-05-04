@@ -41,25 +41,22 @@ pub struct SymbolTable {
 /// Offsets within `GPUToolsReplay` from macOS 26.4. Verified against UUID
 /// `B1DEE264-D3AF-38F9-BC6E-821AFAE2DB30` end-to-end on M4 Pro perfdata.
 const TABLE_B1DEE264: SymbolTable = SymbolTable {
-    gpu_create:           0x22fac,
-    gpu_destroy:          0x2308c,
-    descriptor_create:    0x4e6dc,
-    parser_create:        0x4e764,
-    parser_destroy:       0x4e87c,
-    parser_parse:         0x4e8a0,
+    gpu_create: 0x22fac,
+    gpu_destroy: 0x2308c,
+    descriptor_create: 0x4e6dc,
+    parser_create: 0x4e764,
+    parser_destroy: 0x4e87c,
+    parser_parse: 0x4e8a0,
     profile_data_destroy: 0x4e8cc,
-    get_kicks_num:        0x4eab4,
-    get_counter_num:      0x4eac8,
-    get_kick_start:       0x4ea04,
+    get_kicks_num: 0x4eab4,
+    get_counter_num: 0x4eac8,
+    get_kick_start: 0x4ea04,
     get_kick_software_id: 0x4ea5c,
-    get_usc_timestamps:   0x4e984,
-    parse_error_string:   0x4eb10,
+    get_usc_timestamps: 0x4e984,
+    parse_error_string: 0x4eb10,
 };
 
-const TABLE: &[(&str, SymbolTable)] = &[(
-    "B1DEE264-D3AF-38F9-BC6E-821AFAE2DB30",
-    TABLE_B1DEE264,
-)];
+const TABLE: &[(&str, SymbolTable)] = &[("B1DEE264-D3AF-38F9-BC6E-821AFAE2DB30", TABLE_B1DEE264)];
 
 pub fn lookup(uuid: &str) -> Option<SymbolTable> {
     TABLE

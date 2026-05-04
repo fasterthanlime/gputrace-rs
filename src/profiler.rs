@@ -2451,7 +2451,10 @@ mod tests {
         // GPU-active samples within [start_us(=90), end_us(=130)].
         assert_eq!(summary.dispatches[0].sample_count, 0);
         assert_eq!(summary.dispatches[0].sampling_density, 0.0);
-        assert_eq!(summary.dispatches[0].start_ticks, summary.dispatches[0].end_ticks);
+        assert_eq!(
+            summary.dispatches[0].start_ticks,
+            summary.dispatches[0].end_ticks
+        );
         assert!(summary.dispatches[1].sample_count >= 1);
         assert!(summary.dispatches[1].sampling_density > 0.0);
     }

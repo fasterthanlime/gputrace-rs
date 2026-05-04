@@ -18,9 +18,18 @@ fn main() {
         process::exit(2);
     });
 
-    let generation: u32 = env::var("AGXPS_GEN").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-    let variant: u32 = env::var("AGXPS_VARIANT").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-    let rev: u32 = env::var("AGXPS_REV").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let generation: u32 = env::var("AGXPS_GEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let variant: u32 = env::var("AGXPS_VARIANT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let rev: u32 = env::var("AGXPS_REV")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
 
     let bytes = match fs::read(&path) {
         Ok(b) => b,

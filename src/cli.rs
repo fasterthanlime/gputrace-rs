@@ -1303,7 +1303,9 @@ pub fn run() -> Result<()> {
             }
         },
         CommandSet::Profile(args) => {
-            let output_dir = args.output.unwrap_or_else(|| default_profile_output(&args.trace));
+            let output_dir = args
+                .output
+                .unwrap_or_else(|| default_profile_output(&args.trace));
             let report = replay_service::profile(&replay_service::ProfileOptions {
                 trace: args.trace.clone(),
                 output_dir: output_dir.clone(),

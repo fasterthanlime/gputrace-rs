@@ -20,9 +20,18 @@ fn main() {
         process::exit(2);
     });
 
-    let generation: u32 = env::var("AGXPS_GEN").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-    let variant: u32 = env::var("AGXPS_VARIANT").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-    let rev: u32 = env::var("AGXPS_REV").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let generation: u32 = env::var("AGXPS_GEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let variant: u32 = env::var("AGXPS_VARIANT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let rev: u32 = env::var("AGXPS_REV")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
 
     let bytes = match fs::read(&path) {
         Ok(b) => b,
@@ -52,8 +61,14 @@ fn main() {
 
     println!("\ndecoded:");
     println!("  kicks:                    {}", decoded.kick_starts.len());
-    println!("  usc_timestamps:           {}", decoded.usc_timestamps.len());
-    println!("  synchronized_timestamps:  {}", decoded.synchronized_timestamps.len());
+    println!(
+        "  usc_timestamps:           {}",
+        decoded.usc_timestamps.len()
+    );
+    println!(
+        "  synchronized_timestamps:  {}",
+        decoded.synchronized_timestamps.len()
+    );
     println!("  counters:                 {}", decoded.counter_num);
 
     let kick_groups = decoded.group_by_clique();
@@ -75,9 +90,7 @@ fn main() {
         } else {
             100.0 * dur as f64 / total_dur as f64
         };
-        println!(
-            "  0x{prefix:04x}  {kicks:>5}  {kshare:>13.4}%  {dur:>16}  {dshare:>16.4}%",
-        );
+        println!("  0x{prefix:04x}  {kicks:>5}  {kshare:>13.4}%  {dur:>16}  {dshare:>16.4}%",);
     }
 
     // The trace's full tick span vs Xcode's wall gives us the

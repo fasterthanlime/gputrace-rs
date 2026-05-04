@@ -234,7 +234,10 @@ pub fn format_kernels(report: &KernelReport, verbose: bool) -> String {
 }
 
 pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
-    encoders_with_profiler_summary(trace, profiler::stream_data_summary(&trace.path).ok().as_ref())
+    encoders_with_profiler_summary(
+        trace,
+        profiler::stream_data_summary(&trace.path).ok().as_ref(),
+    )
 }
 
 pub fn encoders_with_profiler_summary(

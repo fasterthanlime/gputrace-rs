@@ -34,7 +34,11 @@ pub enum Error {
         supported: Vec<String>,
     },
     #[error("agxps_gpu_create({generation}, {variant}, {rev}) failed")]
-    GpuCreate { generation: u32, variant: u32, rev: u32 },
+    GpuCreate {
+        generation: u32,
+        variant: u32,
+        rev: u32,
+    },
     #[error("agxps_aps_parser_create returned NULL — descriptor invalid for this GPU")]
     ParserCreate,
     #[error("agxps_aps_parser_parse error code {code}: {message}")]
@@ -53,17 +57,17 @@ pub type AgxpsGpu = *mut c_void;
 /// 0x68-byte descriptor struct passed to `agxps_aps_parser_create`.
 #[repr(C)]
 pub struct AgxpsApsDescriptor {
-    pub gpu: *mut c_void,        // +0x00
-    pub field_0x08: u32,         // +0x08 — power of 2 in [0x10, 0x800]
-    pub field_0x0c: u32,         // +0x0c — power of 2 in [0x40, 0x2000]
-    pub field_0x10: u32,         // +0x10 — 0 or power of 2 in [0x80, 0x8000]
-    pub field_0x14: u32,         // +0x14 — padding
-    pub field_0x18: u64,         // +0x18 — must be 0x400, 0x1000, or 0x40000
-    pub _pad_0x20: [u8; 0x10],   // +0x20..0x30
-    pub field_0x30: u64,         // +0x30 — set to -1 by default
-    pub _pad_0x38: [u8; 0x20],   // +0x38..0x58
-    pub field_0x58: u64,         // +0x58 — set to 0x32 by default
-    pub _pad_0x60: [u8; 0x08],   // +0x60..0x68
+    pub gpu: *mut c_void,      // +0x00
+    pub field_0x08: u32,       // +0x08 — power of 2 in [0x10, 0x800]
+    pub field_0x0c: u32,       // +0x0c — power of 2 in [0x40, 0x2000]
+    pub field_0x10: u32,       // +0x10 — 0 or power of 2 in [0x80, 0x8000]
+    pub field_0x14: u32,       // +0x14 — padding
+    pub field_0x18: u64,       // +0x18 — must be 0x400, 0x1000, or 0x40000
+    pub _pad_0x20: [u8; 0x10], // +0x20..0x30
+    pub field_0x30: u64,       // +0x30 — set to -1 by default
+    pub _pad_0x38: [u8; 0x20], // +0x38..0x58
+    pub field_0x58: u64,       // +0x58 — set to 0x32 by default
+    pub _pad_0x60: [u8; 0x08], // +0x60..0x68
 }
 
 const _: () = assert!(std::mem::size_of::<AgxpsApsDescriptor>() == 0x68);
@@ -157,8 +161,7 @@ pub fn load() -> Result<LoadedApi> {
     use std::ffi::CString;
 
     let path = CString::new(FRAMEWORK_PATH).unwrap();
-    let handle =
-        unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
     if handle.is_null() {
         let err = unsafe { CStr::from_ptr(libc::dlerror()) }
             .to_string_lossy()
@@ -204,7 +207,8 @@ pub fn load() -> Result<LoadedApi> {
 /// Find `GPUToolsReplay`'s loaded base address, ASLR slide, and UUID by
 /// walking the dyld image list. Has to be called *after* a successful
 /// `dlopen` of the framework.
-unsafe fn framework_base_and_uuid() -> std::result::Result<(*const c_void, isize, String), &'static str> {
+unsafe fn framework_base_and_uuid()
+-> std::result::Result<(*const c_void, isize, String), &'static str> {
     use std::ffi::CStr;
 
     unsafe extern "C" {
@@ -257,11 +261,22 @@ unsafe fn read_uuid_from_header(header: *const c_void) -> Option<String> {
 fn format_uuid(bytes: &[u8]) -> String {
     format!(
         "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
     )
 }
 
@@ -290,7 +305,11 @@ impl LoadedApi {
 
         let gpu = unsafe { (api.gpu_create)(generation, variant, rev, false) };
         if gpu.is_null() {
-            return Err(Error::GpuCreate { generation, variant, rev });
+            return Err(Error::GpuCreate {
+                generation,
+                variant,
+                rev,
+            });
         }
 
         let descriptor = AgxpsApsDescriptor::defaults_for(gpu);
@@ -333,9 +352,8 @@ impl LoadedApi {
         let mut starts = vec![0u64; n];
         let mut swids = vec![0u64; n];
         if n > 0 {
-            let ok1 = unsafe {
-                (api.get_kick_start)(profile_data, starts.as_mut_ptr(), 0, n as u64)
-            };
+            let ok1 =
+                unsafe { (api.get_kick_start)(profile_data, starts.as_mut_ptr(), 0, n as u64) };
             let ok2 = unsafe {
                 (api.get_kick_software_id)(profile_data, swids.as_mut_ptr(), 0, n as u64)
             };
@@ -388,9 +406,7 @@ impl LoadedApi {
 fn probe_usc_timestamps_count(api: &AgxpsApi, pd: AgxpsApsProfileData) -> usize {
     let scratch = [0u64; 1];
     let probe = |idx: u64| -> bool {
-        let r = unsafe {
-            (api.get_usc_timestamps)(pd, scratch.as_ptr() as *mut u64, idx, 1)
-        };
+        let r = unsafe { (api.get_usc_timestamps)(pd, scratch.as_ptr() as *mut u64, idx, 1) };
         r != 0
     };
 

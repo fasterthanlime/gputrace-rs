@@ -275,13 +275,12 @@ fn report_from_profiler(
         .iter()
         .map(|region| region.dispatches.len())
         .sum();
-    let single_cb_streamdata_total = if command_buffers.len() == 1
-        && summary.dispatches.len() > region_dispatches
-    {
-        Some(summary.dispatches.len())
-    } else {
-        None
-    };
+    let single_cb_streamdata_total =
+        if command_buffers.len() == 1 && summary.dispatches.len() > region_dispatches {
+            Some(summary.dispatches.len())
+        } else {
+            None
+        };
 
     let command_buffer_timings = command_buffers
         .iter()
