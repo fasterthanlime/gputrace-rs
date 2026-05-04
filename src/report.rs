@@ -235,7 +235,8 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
         apicalls::report(&trace, None).map(|report| apicalls::format_report(&report))
     })?;
     writer.write_optional_result("encoders.md", "Encoders", "encoders", || {
-        commands::encoders(&trace).map(|report| commands::format_encoders(&report, true))
+        commands::encoders_with_profiler_summary(&trace, profiler_summary.as_ref())
+            .map(|report| commands::format_encoders(&report, true))
     })?;
     writer.write_optional_result(
         "command-buffers.md",

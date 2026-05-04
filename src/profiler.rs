@@ -74,7 +74,11 @@ pub struct ProfilerDispatch {
 pub struct ProfilerEncoderTiming {
     pub index: usize,
     pub sequence_id: u64,
-    pub start_timestamp: u64,
+    /// MTL encoder address (u64 at offset 8 of `encoderInfoData`). Matches the
+    /// addresses surfaced by byte-stream `CS` records — used to bridge streamData
+    /// dispatches to the byte-stream encoder topology when attributing kernel
+    /// dispatch counts to named encoders in `encoders.md`.
+    pub address: u64,
     pub end_offset_micros: u64,
     pub duration_micros: u64,
 }
@@ -1460,7 +1464,7 @@ fn extract_encoder_timings(objects: &[Value], root: &Dictionary) -> Vec<Profiler
         encoders.push(ProfilerEncoderTiming {
             index,
             sequence_id: read_u64(record, 0),
-            start_timestamp: read_u64(record, 8),
+            address: read_u64(record, 8),
             end_offset_micros: end_offset,
             duration_micros: duration,
         });
@@ -2561,7 +2565,7 @@ mod tests {
                 encoder_timings: vec![ProfilerEncoderTiming {
                     index: 0,
                     sequence_id: 7,
-                    start_timestamp: 100,
+                    address: 0x942f15720,
                     end_offset_micros: 250,
                     duration_micros: 250,
                 }],

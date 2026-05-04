@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::analysis;
 use crate::error::Result;
+use crate::profiler;
 use crate::timeline;
 use crate::timing;
 use crate::trace::TraceBundle;
@@ -232,6 +233,13 @@ pub fn format_kernels(report: &KernelReport, verbose: bool) -> String {
 }
 
 pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
+    encoders_with_profiler_summary(trace, profiler::stream_data_summary(&trace.path).ok().as_ref())
+}
+
+pub fn encoders_with_profiler_summary(
+    trace: &TraceBundle,
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+) -> Result<EncoderReport> {
     let encoders = trace.compute_encoders()?;
     let regions = trace.command_buffer_regions()?;
     let timing = timing::report(trace).ok();
@@ -254,6 +262,46 @@ pub fn encoders(trace: &TraceBundle) -> Result<EncoderReport> {
         for dispatch in &region.dispatches {
             if let Some(encoder_id) = dispatch.encoder_id {
                 *dispatch_counts.entry(encoder_id).or_default() += 1;
+            }
+        }
+    }
+
+    // Bridge streamData dispatches to byte-stream encoders by matching the
+    // encoderInfoData `address` field (the u64 at offset 8 of each record) to
+    // the byte-stream encoder address. streamData dispatches reference
+    // `encoder_index`, but that namespace isn't shared with byte-stream
+    // encoder offsets — addresses are. With multiple streamData encoders we
+    // assign each profiler dispatch to whichever encoder's cumulative_us
+    // window contains it.
+    if let Some(summary) = profiler_summary
+        && !summary.dispatches.is_empty()
+        && !summary.encoder_timings.is_empty()
+    {
+        let bytestream_addresses: BTreeSet<u64> =
+            encoders.iter().map(|encoder| encoder.address).collect();
+        let mut prev_end_us = 0u64;
+        let mut encoder_windows: Vec<(u64, u64, u64)> = Vec::new();
+        for encoder in &summary.encoder_timings {
+            let start_us = prev_end_us;
+            let end_us = encoder.end_offset_micros;
+            prev_end_us = end_us;
+            if bytestream_addresses.contains(&encoder.address) {
+                encoder_windows.push((start_us, end_us, encoder.address));
+            }
+        }
+        for dispatch in &summary.dispatches {
+            let dispatch_us = dispatch.cumulative_us;
+            if let Some((_, _, address)) = encoder_windows
+                .iter()
+                .find(|(start, end, _)| dispatch_us > *start && dispatch_us <= *end)
+            {
+                *dispatch_counts.entry(*address).or_default() += 1;
+            } else if encoder_windows.len() == 1 {
+                // Single-encoder traces sometimes carry dispatches whose
+                // cumulative_us falls outside the encoder window because the
+                // capture-relative anchor differs from the encoder-relative
+                // anchor; attribute them anyway.
+                *dispatch_counts.entry(encoder_windows[0].2).or_default() += 1;
             }
         }
     }
