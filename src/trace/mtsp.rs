@@ -138,6 +138,76 @@ impl MTSPRecord {
         Ok(records)
     }
 
+    /// Parse the nested sub-records embedded inside a bulk record's payload.
+    ///
+    /// Bulk records (large CtU/Unknown records that hold collections of labeled
+    /// resources, dispatches, etc.) carry a stream of sub-records *inside* their
+    /// payload. Each sub-record uses the same framing as a top-level MTSP record
+    /// (`u32 size` + tag detected in the first 128 bytes), but with an extended
+    /// header inserted between the size and the tag:
+    ///
+    /// ```text
+    /// +0   u32  sub-record size (includes itself)
+    /// +4   [4]  magic: `?? YY 0xff 0xff` where YY is 0xc0 or 0xd8
+    /// +8   [24] zero-padding
+    /// +32  u32  count / inline-payload-prefix
+    /// +36  [4]  type tag (CS\0\0, Cuw\0, Ci\0\0, CUUU, ...)
+    /// +40  ...  type-specific payload
+    /// ```
+    ///
+    /// `parse_stream` can't anchor onto these sub-records reliably because the
+    /// bulk record's prelude length isn't fixed across record types and the
+    /// 4-byte stride doesn't line up with the sub-records' absolute alignment.
+    /// We instead scan for the magic header byte-by-byte, validate the framing
+    /// (sane size + 24-zero pad), and parse the sub-record by handing its bytes
+    /// back to the standard parser.
+    pub fn parse_subrecords(data: &[u8]) -> Vec<Self> {
+        let mut records = Vec::new();
+        let mut i = 4;
+        while i + 32 <= data.len() {
+            let yy = data[i + 1];
+            if (yy != 0xc0 && yy != 0xd8) || data[i + 2] != 0xff || data[i + 3] != 0xff {
+                i += 1;
+                continue;
+            }
+            let size = u32::from_le_bytes(data[i - 4..i].try_into().unwrap()) as usize;
+            let start = i - 4;
+            if size < 0x28
+                || size > 0x10000
+                || start + size > data.len()
+                || !data[i + 4..i + 4 + 24].iter().all(|&byte| byte == 0)
+            {
+                i += 1;
+                continue;
+            }
+
+            let sub = data[start..start + size].to_vec();
+            let record_type = detect_record_type(&sub);
+            let mut record = MTSPRecord {
+                record_type,
+                offset: start,
+                size,
+                label: None,
+                address: None,
+                function_address: None,
+                data: sub,
+            };
+            match record.record_type {
+                RecordType::CS => record.parse_cs_record(),
+                RecordType::CSuwuw => record.parse_csuwuw_record(),
+                RecordType::CiulSl => record.parse_ciulsl_record(),
+                RecordType::CU | RecordType::Cut => record.parse_cu_record(),
+                RecordType::Cui => record.populate_cui_record(),
+                RecordType::Ciulul => record.populate_ciulul_record(),
+                RecordType::Culul => record.parse_culul_record(),
+                _ => {}
+            }
+            records.push(record);
+            i = start + size + 4;
+        }
+        records
+    }
+
     pub fn parse_ct_record(&self) -> Result<CtRecord> {
         if self.record_type != RecordType::Ct {
             return Err(Error::InvalidTrace("record was not a Ct record"));

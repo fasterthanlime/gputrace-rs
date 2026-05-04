@@ -659,58 +659,45 @@ fn parse_command_buffers(data: &[u8]) -> Vec<CommandBuffer> {
 }
 
 fn parse_compute_encoders(data: &[u8]) -> Vec<ComputeEncoder> {
-    // The compute-encoder labels for this capture format live as nested
-    // labeled-resource entries inside bulk CtU/Unknown records (in this trace,
-    // a 256 KiB CtU at 0x1257a and a 0x2000-byte unknown at 0x3d), not as
-    // standalone CS records at the top level of the MTSP stream. The structured
-    // `MTSPRecord` parser respects record framing so it can't see those nested
-    // labels — it would return zero candidates here. Until those bulk records
-    // are reverse-engineered (e.g., a sub-record decoder for CtU payloads),
-    // we keep the byte-scan and rely on `commands::encoders` to drop entries
-    // that aren't referenced by any dispatch or command-buffer region.
+    // CS is the labeled-resource record family — compute encoders, command
+    // buffers, and MTLBuffers all share the `CS\0\0` tag. In this capture
+    // format the encoder labels typically live as *nested* sub-records inside
+    // bulk CtU/Unknown records, not as top-level CS records. We walk both:
+    // first the top-level MTSP records, then the nested sub-record streams
+    // inside each top-level record's payload. Every CS sub-record we find is
+    // a labeled-resource candidate — `commands::encoders` filters out the
+    // ones that aren't referenced by any dispatch or command-buffer region.
+    let Ok(records) = MTSPRecord::parse_stream(data) else {
+        return Vec::new();
+    };
     let mut encoders = Vec::new();
-    let marker = b"CS\0\0";
-    let mut offset = 0usize;
-    while let Some(pos) = find_bytes_from(data, marker, offset) {
-        let address_start = pos + 4;
-        let label_start = pos + 12;
-        if address_start + 8 > data.len() || label_start >= data.len() {
-            break;
-        }
-        let address =
-            u64::from_le_bytes(data[address_start..address_start + 8].try_into().unwrap());
-        let label = read_c_string_bytes(data, label_start).unwrap_or_default();
-        if !label.is_empty() {
+    for record in records {
+        if record.record_type == RecordType::CS
+            && let (Some(address), Some(label)) = (record.address, record.label.clone())
+            && !label.is_empty()
+        {
             encoders.push(ComputeEncoder {
                 index: encoders.len(),
                 address,
                 label,
-                offset: pos,
+                offset: record.offset,
             });
         }
-        offset = pos + 4;
+        for nested in MTSPRecord::parse_subrecords(&record.data) {
+            if nested.record_type == RecordType::CS
+                && let (Some(address), Some(label)) = (nested.address, nested.label)
+                && !label.is_empty()
+            {
+                encoders.push(ComputeEncoder {
+                    index: encoders.len(),
+                    address,
+                    label,
+                    offset: record.offset + nested.offset,
+                });
+            }
+        }
     }
     encoders
-}
-
-fn read_c_string_bytes(data: &[u8], offset: usize) -> Option<String> {
-    let tail = data.get(offset..)?;
-    let end = tail
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(tail.len());
-    if end == 0 {
-        return None;
-    }
-    let value = &tail[..end];
-    if value
-        .iter()
-        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
-    {
-        Some(String::from_utf8_lossy(value).into_owned())
-    } else {
-        None
-    }
 }
 
 fn parse_pipeline_state_events(
@@ -968,15 +955,48 @@ mod tests {
 
     #[test]
     fn parses_compute_encoders_from_cs_records() {
-        let mut data = vec![0u8; 64];
-        data[8..12].copy_from_slice(b"CS\0\0");
-        data[12..20].copy_from_slice(&0x1234u64.to_le_bytes());
-        data[20..27].copy_from_slice(b"Kernel\0");
+        // Top-level CS record: 32-byte framed MTSP record with the CS tag in
+        // the first 128 bytes.
+        let mut record = vec![0u8; 32];
+        record[0..4].copy_from_slice(&(32u32).to_le_bytes());
+        record[8..12].copy_from_slice(b"CS\0\0");
+        record[12..20].copy_from_slice(&0x1234u64.to_le_bytes());
+        record[20..27].copy_from_slice(b"Kernel\0");
 
-        let encoders = parse_compute_encoders(&data);
+        let encoders = parse_compute_encoders(&record);
         assert_eq!(encoders.len(), 1);
         assert_eq!(encoders[0].address, 0x1234);
         assert_eq!(encoders[0].label, "Kernel");
+    }
+
+    #[test]
+    fn parses_compute_encoders_from_nested_cs_subrecords() {
+        // Bulk top-level record (size 0x100) whose payload contains one nested
+        // CS sub-record at offset 0x40 of the bulk record.
+        let bulk_size = 0x100usize;
+        let mut bulk = vec![0u8; bulk_size];
+        bulk[0..4].copy_from_slice(&(bulk_size as u32).to_le_bytes());
+        // Tag the bulk record as Ctt so it doesn't get classified as CS itself.
+        bulk[8..12].copy_from_slice(b"Ctt\0");
+
+        // Nested sub-record at relative offset 0x40 inside the bulk record:
+        //   size=0xb0, magic=`?? c0 ff ff`, 24 zero pad, count=0xc, tag=CS\0\0,
+        //   address u64, c-string label.
+        let sub_off = 0x40usize;
+        let sub_size = 0xb0usize;
+        bulk[sub_off..sub_off + 4].copy_from_slice(&(sub_size as u32).to_le_bytes());
+        bulk[sub_off + 4..sub_off + 8].copy_from_slice(&[0x05, 0xc0, 0xff, 0xff]);
+        // Bytes [sub_off + 8 .. sub_off + 32] stay zero (already initialised).
+        bulk[sub_off + 32..sub_off + 36].copy_from_slice(&12u32.to_le_bytes());
+        bulk[sub_off + 36..sub_off + 40].copy_from_slice(b"CS\0\0");
+        bulk[sub_off + 40..sub_off + 48].copy_from_slice(&0xdeadbeefu64.to_le_bytes());
+        let label = b"NestedEncoder";
+        bulk[sub_off + 48..sub_off + 48 + label.len()].copy_from_slice(label);
+
+        let encoders = parse_compute_encoders(&bulk);
+        assert_eq!(encoders.len(), 1);
+        assert_eq!(encoders[0].address, 0xdeadbeef);
+        assert_eq!(encoders[0].label, "NestedEncoder");
     }
 
     #[test]
