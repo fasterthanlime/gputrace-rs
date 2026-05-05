@@ -21,6 +21,7 @@ use crate::xcode_mio;
 #[derive(Debug, Clone)]
 pub struct ReportOptions {
     pub output_dir: PathBuf,
+    pub progress: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,7 @@ pub struct ReportSectionTiming {
 
 struct ReportWriter {
     output_dir: PathBuf,
+    progress: bool,
     files: Vec<PathBuf>,
     failures: Vec<ReportFailure>,
     section_timings: Vec<ReportSectionTiming>,
@@ -57,29 +59,30 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
     let trace = TraceBundle::open(trace_path)?;
     let mut writer = ReportWriter {
         output_dir: options.output_dir.clone(),
+        progress: options.progress,
         files: Vec::new(),
         failures: Vec::new(),
         section_timings: Vec::new(),
     };
 
-    let profiler_summary_start = Instant::now();
+    let profiler_summary_start = writer.start_section("shared profiler streamData");
     let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
     writer.record_timing("shared profiler streamData", profiler_summary_start);
 
-    let raw_counters_start = Instant::now();
+    let raw_counters_start = writer.start_section("shared raw counters");
     let raw_counters = counter::raw_counters_report(&trace).ok();
     writer.record_timing("shared raw counters", raw_counters_start);
 
-    let raw_probe_start = Instant::now();
+    let raw_probe_start = writer.start_section("shared raw counter probe");
     let raw_probe = counter::probe_raw_counters(&trace, None, None, false).ok();
     writer.record_timing("shared raw counter probe", raw_probe_start);
 
-    let limiters_start = Instant::now();
+    let limiters_start = writer.start_section("shared counter limiters");
     let limiter_metrics = counter::extract_limiters_for_trace(&trace.path);
     writer.record_timing("shared counter limiters", limiters_start);
 
     let mut xcode_mio_summary = None;
-    let xcode_start = Instant::now();
+    let xcode_start = writer.start_section("xcode mio");
     match xcode_mio::report_with_profiler_summary(&trace, profiler_summary.as_ref()) {
         Ok(report) => {
             let summary = xcode_mio::summarize_report(&report);
@@ -103,7 +106,7 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
         }
     }
 
-    let timing_start = Instant::now();
+    let timing_start = writer.start_section("timing");
     let timing_report = match timing::report_with_context(
         &trace,
         profiler_summary.as_ref(),
@@ -131,7 +134,7 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
         }
     };
 
-    let shader_start = Instant::now();
+    let shader_start = writer.start_section("shaders");
     let shader_report = match shaders::report_with_context(
         &trace,
         &shaders::default_search_paths(),
@@ -163,7 +166,7 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
         }
     };
 
-    let analysis_start = Instant::now();
+    let analysis_start = writer.start_section("analysis");
     let analysis =
         analysis::analyze_with_context(&trace, xcode_mio_summary.clone(), timing_report.clone());
     writer.write_markdown(
@@ -201,7 +204,7 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
             .map(|report| profiler::format_coverage_report(&report))
         },
     )?;
-    let raw_counters_format_start = Instant::now();
+    let raw_counters_format_start = writer.start_section("raw counters");
     if let Some(raw_counters) = &raw_counters {
         writer.write_section(
             "raw-counters.md",
@@ -274,6 +277,13 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
 }
 
 impl ReportWriter {
+    fn start_section(&self, section: &str) -> Instant {
+        if self.progress {
+            eprintln!("report: {section}...");
+        }
+        Instant::now()
+    }
+
     fn write_result<F>(
         &mut self,
         file_name: &str,
@@ -284,7 +294,7 @@ impl ReportWriter {
     where
         F: FnOnce() -> Result<String>,
     {
-        let start = Instant::now();
+        let start = self.start_section(section);
         match build() {
             Ok(body) => self.write_section(file_name, title, section, body, start),
             Err(error) => self.write_failure(file_name, section, title, &error.to_string(), start),
@@ -301,7 +311,7 @@ impl ReportWriter {
     where
         F: FnOnce() -> Result<String>,
     {
-        let start = Instant::now();
+        let start = self.start_section(section);
         match build() {
             Ok(body) => self.write_section(file_name, title, section, body, start),
             Err(error) => {
@@ -336,7 +346,7 @@ impl ReportWriter {
             message: message.to_owned(),
         });
         let body = format!("# {title}\n\nThis section failed:\n\n```text\n{message}\n```\n");
-        self.write_markdown(file_name, body, section, start)
+        self.write_markdown_with_status(file_name, body, section, start, "failed")
     }
 
     fn record_failure(&mut self, section: &str, message: &str, start: Instant) {
@@ -344,17 +354,22 @@ impl ReportWriter {
             section: section.to_owned(),
             message: message.to_owned(),
         });
-        self.section_timings.push(ReportSectionTiming {
-            section: section.to_owned(),
-            ms: elapsed_ms(start),
-        });
+        self.record_elapsed(section, start, "failed");
     }
 
     fn record_timing(&mut self, section: &str, start: Instant) {
+        self.record_elapsed(section, start, "done");
+    }
+
+    fn record_elapsed(&mut self, section: &str, start: Instant, status: &str) {
+        let ms = elapsed_ms(start);
         self.section_timings.push(ReportSectionTiming {
             section: section.to_owned(),
-            ms: elapsed_ms(start),
+            ms,
         });
+        if self.progress {
+            eprintln!("report: {section} {status} in {ms:.1} ms");
+        }
     }
 
     fn write_markdown(
@@ -364,13 +379,21 @@ impl ReportWriter {
         section: &str,
         start: Instant,
     ) -> Result<()> {
+        self.write_markdown_with_status(file_name, markdown, section, start, "wrote")
+    }
+
+    fn write_markdown_with_status(
+        &mut self,
+        file_name: &str,
+        markdown: String,
+        section: &str,
+        start: Instant,
+        status: &str,
+    ) -> Result<()> {
         let path = self.output_dir.join(file_name);
         fs::write(&path, markdown)?;
         self.files.push(path);
-        self.section_timings.push(ReportSectionTiming {
-            section: section.to_owned(),
-            ms: elapsed_ms(start),
-        });
+        self.record_elapsed(section, start, status);
         Ok(())
     }
 

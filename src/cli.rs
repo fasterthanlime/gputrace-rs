@@ -724,7 +724,13 @@ pub fn run() -> Result<()> {
             let output_dir = args
                 .output
                 .unwrap_or_else(|| default_report_output(&args.trace));
-            let report = report::generate(&args.trace, &report::ReportOptions { output_dir })?;
+            let report = report::generate(
+                &args.trace,
+                &report::ReportOptions {
+                    output_dir,
+                    progress: true,
+                },
+            )?;
             println!(
                 "Wrote {} markdown files to {} in {:.1} ms",
                 report.files.len(),

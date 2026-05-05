@@ -70,7 +70,8 @@ profiler-coverage.md
 ```
 
 Start with `index.md`. It links the rest of the report and records parser or
-profiler failures in one place.
+profiler failures in one place. The command prints live progress while it runs;
+`index.md` records the total report time and per-section timings.
 
 ## What The Report Means
 
