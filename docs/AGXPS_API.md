@@ -334,6 +334,28 @@ sample trace there is only one encoder sample row for the whole
 encoder, so it cannot distinguish the five `light_add` dispatches from
 the five `heavy_alu` dispatches.
 
+`raw-counters` now prints the timestamp alignment explicitly. On the
+sample, all `GPRWCNTR` records are before the profiler dispatch
+windows:
+
+```text
+profiler dispatches=10 ticks=16161378792923-16161378801666 span=8743 (364.292 us)
+raw counter records=18096 ticks=16161292897771-16161372070097 span=79172326 (3298.847 ms)
+direct_overlap_records=0 before_dispatch=18096 after_dispatch=0
+raw_end_to_dispatch_start_gap=6722826 (280.118 ms)
+```
+
+The diagnostic shift `raw_start_to_dispatch_start` maps 58 raw records
+onto all 10 dispatches, but it is not a validated join. Evaluating AGX
+derived counters under that shift yields fragment/texture-style metrics
+(`Fragment Generator Primitive Utilization`, `Texture Filtering
+Utilization`, `Average Overdraw`) rather than Xcode's compute command
+metrics. The AGX G14G catalog keys for Xcode's compute table
+(`CSInvocation`, `CSALUInstructions`, `CSALUF32Percent`) are defined in
+the system counter plists, but their raw hashes are not present in this
+`GPRWCNTR` schema. Treat shifted dispatch rows as RE diagnostics only,
+not as counter-derived execution cost.
+
 ### Counter names are obfuscated; map needs RE
 
 Counter names returned by `get_counter_names` are 64-char uppercase
@@ -465,6 +487,113 @@ join catches more light work in aggregate, but is noisier per dispatch
 and over-attributes `light#0`/`light#4`. Do not treat either metric as
 exact Xcode `Execution Cost` yet.
 
+Non-synthetic sanity check:
+`/Users/amos/bearcove/bee/target/gputrace-captures/qa-decode-ar-legacy.gputrace`
+paired with
+`qa-decode-ar-legacy-perfdata/qa-decode-ar-legacy.gpuprofiler_raw`
+decodes 908 GPU commands and 15 pipeline states. Our
+analyzer-weighted output for that trace was:
+
+```text
+tq6_1s_matvec_prerot_qa                    76.867%
+tq6_1s_matmul_prerot_tile_wide             17.462%
+tq1s_attention_sequence_gqa_roped_cache     1.408%
+tq1s_fill_range_attention_mask              1.243%
+tq6_fused_rmsnorm_activation_quantize        0.677%
+```
+
+The same Xcode values can be copied directly from **Counters → GPU
+Commands → Compute Kernel**. Pasting those cells to `/tmp/ha.txt`
+gave 908 command rows, matching the MIO command count exactly, and
+the copied `Execution Cost` column sums to 99.993%. The helper command
+for this validation is:
+
+```sh
+GPUTRACE_PROFILER_DIR=/path/to/qa-decode-ar-legacy.gpuprofiler_raw \
+  cargo run -- xcode-command-costs \
+    /Users/amos/bearcove/bee/target/gputrace-captures/qa-decode-ar-legacy.gputrace \
+    --table /tmp/ha.txt
+```
+
+The pasted Xcode pipeline totals are:
+
+```text
+tq6_1s_matvec_prerot_qa                    69.999%
+tq6_1s_matmul_prerot_tile_wide              9.483%
+tq1s_attention_sequence_gqa_roped_cache     9.182%
+tq6_fused_rmsnorm_activation_quantize        4.365%
+tq6_activation_quantize                      2.407%
+tq6_silu_mul_activation_quantize             1.366%
+tq1s_argmax_rows                             1.312%
+tq1s_add_residual_rms_norm_heads_to          0.656%
+tq1s_rms_norm_qk_pair_q_rope_to              0.444%
+tq1s_quantize_and_store_k_tq8_v_tq4          0.406%
+tq1s_add_inplace                             0.305%
+tq1s_rms_norm_heads_to                       0.022%
+tq1s_rotate_hidden                           0.019%
+tq6_1s_rows                                  0.017%
+tq1s_fill_range_attention_mask               0.010%
+```
+
+Comparison against the full pasted table:
+
+```text
+metric     MAE       RMSE      max error  top-5 MAE
+analyzer   2.215pp   3.590pp   7.979pp    5.657pp
+w1         1.903pp   3.282pp   7.894pp    4.879pp
+cmd-count  5.360pp   8.452pp  26.830pp   10.164pp
+```
+
+So `w1` is slightly better than analyzer-weighted duration on this
+real workload, while analyzer-weighted duration was better on the
+synthetic heavy/light aggregate. Neither metric is the Xcode shader
+cost denominator. The current output treats them as candidate metrics,
+not as ground truth.
+
+`GTMioNonOverlappingCounters` is also not the missing public Compute
+Kernel table. For this raw-directory profile, its per-command rows only
+carry the internal `PredicatedALUPercentage=100` value; the display
+columns Xcode shows (`Execution Cost`, `Kernel Invocations`, `Kernel
+ALU Instructions`, `Kernel ALU Float Instructions`) are not populated
+through that object.
+
+The Xcode **Pipeline Statistics** inspector is a much stronger lead
+than the counter panes. For selected dispatches it shows **Total
+Function Execution Time** and per-dispatch times. Manual samples from
+the same `qa-decode` trace:
+
+```text
+pipeline      function                         Xcode cost  Pipeline Stats time  implied denom
+0x72a65dc00   tq6_1s_matmul_prerot_tile_wide      9.483%          1.48449 ms       15.654 ms
+0x72a63ad80   tq1s_attention_sequence...          9.182%          1.47 ms          16.010 ms
+0x72a639c00   tq6_fused_rmsnorm_activation...     4.365%          548.13 us        12.557 ms
+0x72a65df80   tq1s_argmax_rows                    1.312%          124.45 us         9.486 ms
+0x72a639880   tq6_1s_rows                         0.017%          2.87 us          16.882 ms
+0x72a639500   tq1s_fill_range_attention_mask      0.010%          789.01 ns         7.890 ms
+```
+
+For `0x72a65dc00`, Xcode's left-tree dispatch costs are exactly time
+shares over a ~15.51 ms denominator:
+
+```text
+#1529 795.66 us / 15.51 ms = 5.13%
+#3065 688.83 us / 15.51 ms = 4.44%
+```
+
+`0x72a63ad80` also lines up: 1.47 ms / 9.182% = ~16.01 ms. This
+explains the largest AGXPS miss: Xcode's table is not using the
+timing-trace `w1` or analyzer-weighted counters for that kernel; it is
+using a Pipeline Statistics function-time model.
+
+The inconsistent denominators on `0x72a639c00`, `0x72a65df80`, and
+`0x72a639500` are likely shader-variant/selection effects. In the
+inspector, some dispatches under the same pipeline show `0 ns` while
+the copied GPU Commands table has nonzero `Execution Cost` rows for
+them. The selected `[Just-In-Time]` statistics node is therefore not
+always the complete per-pipeline cost source. The next RE target is to
+extract **all** Pipeline Statistics shader-variant function-time rows
+from Xcode's model, then sum them by pipeline address.
+
 The older, heavier route is still useful for RE: join work cliques to
 timing-analyzer command spans by system-time overlap, then call
 `agxps_aps_clique_instruction_trace_get_instruction_stats`.
@@ -559,6 +688,12 @@ The Xcode-rich path now uses the exported agxps symbols from
 5. Aggregate timing-analyzer weighted clique duration per pipeline.
 6. Optionally aggregate work-clique instruction stats per pipeline for
    the slower `w1` RE metric.
+
+`timing.md` now includes an `AGXPS analyzer-weighted pipeline cost`
+section when a precomputed Xcode-MIO summary is available, and the
+standalone `timing` command can request the same slow path with
+`--agxps`. Without AGXPS, `timing` continues to print streamData's
+dispatch-cadence timing and explicitly labels it as not real GPU cost.
 
 The no-Xcode fallback still cannot do this through
 `GPUToolsReplay.framework` without extra symbol-resolution work: the

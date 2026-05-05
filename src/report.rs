@@ -104,29 +104,32 @@ pub fn generate(trace_path: &Path, options: &ReportOptions) -> Result<GeneratedR
     }
 
     let timing_start = Instant::now();
-    let timing_report =
-        match timing::report_with_profiler_summary(&trace, profiler_summary.as_ref()) {
-            Ok(report) => {
-                writer.write_section(
-                    "timing.md",
-                    "Timing",
-                    "timing",
-                    timing::format_report(&report),
-                    timing_start,
-                )?;
-                Some(report)
-            }
-            Err(error) => {
-                writer.write_failure(
-                    "timing.md",
-                    "timing",
-                    "Timing",
-                    &error.to_string(),
-                    timing_start,
-                )?;
-                None
-            }
-        };
+    let timing_report = match timing::report_with_context(
+        &trace,
+        profiler_summary.as_ref(),
+        xcode_mio_summary.as_ref(),
+    ) {
+        Ok(report) => {
+            writer.write_section(
+                "timing.md",
+                "Timing",
+                "timing",
+                timing::format_report(&report),
+                timing_start,
+            )?;
+            Some(report)
+        }
+        Err(error) => {
+            writer.write_failure(
+                "timing.md",
+                "timing",
+                "Timing",
+                &error.to_string(),
+                timing_start,
+            )?;
+            None
+        }
+    };
 
     let shader_start = Instant::now();
     let shader_report = match shaders::report_with_context(

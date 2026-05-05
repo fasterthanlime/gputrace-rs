@@ -78,6 +78,7 @@ pub struct RawCountersReport {
     pub trace_source: PathBuf,
     pub profiler_directory: PathBuf,
     pub timings: Vec<RawCounterDecodeTiming>,
+    pub dispatch_alignment: Option<RawCounterDispatchAlignmentReport>,
     pub aggregate_metadata: Vec<RawCounterAggregateMetadata>,
     pub sample_trace_indices: Vec<RawCounterSampleTraceIndex>,
     pub trace_maps: Vec<RawCounterTraceMapEntry>,
@@ -89,6 +90,7 @@ pub struct RawCountersReport {
     pub metrics: Vec<RawCounterDecodedMetric>,
     pub derived_metrics: Vec<RawCounterJsDerivedMetric>,
     pub grouped_derived_metrics: Vec<RawCounterJsDerivedMetricGroup>,
+    pub shifted_dispatch_metric_candidates: Vec<RawCounterShiftedDispatchMetricCandidate>,
     pub encoder_sample_metrics: Vec<RawCounterEncoderSampleMetric>,
     pub warnings: Vec<String>,
 }
@@ -97,6 +99,56 @@ pub struct RawCountersReport {
 pub struct RawCounterDecodeTiming {
     pub stage: String,
     pub ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterDispatchAlignmentReport {
+    pub timebase_numer: Option<u64>,
+    pub timebase_denom: Option<u64>,
+    pub dispatch_count: usize,
+    pub dispatch_start_ticks: u64,
+    pub dispatch_end_ticks: u64,
+    pub dispatch_span_ticks: u64,
+    pub dispatch_span_ns: Option<f64>,
+    pub raw_record_count: usize,
+    pub raw_start_ticks: u64,
+    pub raw_end_ticks: u64,
+    pub raw_span_ticks: u64,
+    pub raw_span_ns: Option<f64>,
+    pub direct_overlap_record_count: usize,
+    pub raw_before_dispatch_record_count: usize,
+    pub raw_after_dispatch_record_count: usize,
+    pub raw_end_to_dispatch_start_gap_ticks: i64,
+    pub raw_end_to_dispatch_start_gap_ns: Option<f64>,
+    pub raw_start_to_dispatch_start_delta_ticks: i64,
+    pub raw_start_to_dispatch_start_delta_ns: Option<f64>,
+    pub candidate_shifts: Vec<RawCounterDispatchAlignmentCandidate>,
+    pub source_spans: Vec<RawCounterTimestampSpan>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterDispatchAlignmentCandidate {
+    pub name: String,
+    pub shift_ticks: i64,
+    pub shift_ns: Option<f64>,
+    pub shifted_raw_start_ticks: u64,
+    pub shifted_raw_end_ticks: u64,
+    pub overlap_record_count: usize,
+    pub dispatches_covered: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterTimestampSpan {
+    pub sample_group: Option<usize>,
+    pub source_index: Option<usize>,
+    pub ring_indices: Vec<usize>,
+    pub record_count: usize,
+    pub start_ticks: u64,
+    pub end_ticks: u64,
+    pub span_ticks: u64,
+    pub direct_overlap_record_count: usize,
+    pub nearest_dispatch_gap_ticks: i64,
+    pub nearest_dispatch_gap_ns: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -214,6 +266,16 @@ pub struct RawCounterJsDerivedMetricGroup {
     pub profiler_start_ticks: Option<u64>,
     pub profiler_end_ticks: Option<u64>,
     pub derived_metrics: Vec<RawCounterJsDerivedMetric>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RawCounterShiftedDispatchMetricCandidate {
+    pub name: String,
+    pub shift_ticks: i64,
+    pub shift_ns: Option<f64>,
+    pub overlap_record_count: usize,
+    pub dispatches_covered: usize,
+    pub groups: Vec<RawCounterJsDerivedMetricGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -605,6 +667,20 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         measure_raw_counter_stage(&mut timings, "decode APS aggregate metadata", || {
             probe_aggregate_counter_metadata_from_groups(&stream_groups)
         });
+    let dispatch_alignment = measure_raw_counter_stage(
+        &mut timings,
+        "align raw counter/profiler timestamps",
+        || {
+            raw_counter_dispatch_alignment_report(
+                &sample_blobs,
+                profiler_summary
+                    .as_ref()
+                    .map(|summary| summary.dispatches.as_slice())
+                    .unwrap_or(&[]),
+                &aggregate_metadata,
+            )
+        },
+    );
     let sample_trace_indices =
         measure_raw_counter_stage(&mut timings, "decode sample trace indices", || {
             probe_sample_trace_indices_from_groups(&stream_groups)
@@ -649,6 +725,9 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
     let js_variables = measure_raw_counter_stage(&mut timings, "aggregate JS variables", || {
         raw_counter_js_variables_from_parts(&schema_map, &fallback_counter_names, &sample_blobs)
     });
+    let device_identifier = measure_raw_counter_stage(&mut timings, "identify AGX device", || {
+        trace_agx_device_identifier(&trace.path)
+    });
     let js_variable_groups = measure_raw_counter_stage(
         &mut timings,
         "group JS variables by encoder/dispatch",
@@ -665,9 +744,6 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
             )
         },
     );
-    let device_identifier = measure_raw_counter_stage(&mut timings, "identify AGX device", || {
-        trace_agx_device_identifier(&trace.path)
-    });
     let derived_metrics =
         measure_raw_counter_stage(&mut timings, "evaluate AGX derived metrics", || {
             evaluate_agx_derived_metrics(&catalog, &js_variables, device_identifier.as_deref())
@@ -680,6 +756,24 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
                 device_identifier.as_deref(),
             )
         });
+    let shifted_dispatch_metric_candidates = measure_raw_counter_stage(
+        &mut timings,
+        "evaluate shifted dispatch counter candidates",
+        || {
+            raw_counter_shifted_dispatch_metric_candidates(
+                &schema_map,
+                &fallback_counter_names,
+                &sample_blobs,
+                profiler_summary
+                    .as_ref()
+                    .map(|summary| summary.dispatches.as_slice())
+                    .unwrap_or(&[]),
+                dispatch_alignment.as_ref(),
+                &catalog,
+                device_identifier.as_deref(),
+            )
+        },
+    );
     let schemas = measure_raw_counter_stage(&mut timings, "materialize schemas", || {
         schema_map
             .iter()
@@ -783,6 +877,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         trace_source: trace.path.clone(),
         profiler_directory,
         timings,
+        dispatch_alignment,
         aggregate_metadata,
         sample_trace_indices,
         trace_maps,
@@ -794,6 +889,7 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
         metrics,
         derived_metrics,
         grouped_derived_metrics,
+        shifted_dispatch_metric_candidates,
         encoder_sample_metrics,
         warnings,
     })
@@ -1068,6 +1164,73 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
     if !report.warnings.is_empty() {
         out.push('\n');
     }
+    if let Some(alignment) = &report.dispatch_alignment {
+        out.push_str("Counter/dispatch timestamp alignment:\n");
+        out.push_str(&format!(
+            "  profiler dispatches={} ticks={}-{} span={} ({})\n",
+            alignment.dispatch_count,
+            alignment.dispatch_start_ticks,
+            alignment.dispatch_end_ticks,
+            alignment.dispatch_span_ticks,
+            format_optional_duration_ns(alignment.dispatch_span_ns)
+        ));
+        out.push_str(&format!(
+            "  raw counter records={} ticks={}-{} span={}\n",
+            alignment.raw_record_count,
+            alignment.raw_start_ticks,
+            alignment.raw_end_ticks,
+            format_ticks_with_duration(alignment.raw_span_ticks, alignment.raw_span_ns)
+        ));
+        out.push_str(&format!(
+            "  direct_overlap_records={} before_dispatch={} after_dispatch={}\n",
+            alignment.direct_overlap_record_count,
+            alignment.raw_before_dispatch_record_count,
+            alignment.raw_after_dispatch_record_count
+        ));
+        out.push_str(&format!(
+            "  raw_end_to_dispatch_start_gap={} ({}) raw_start_to_dispatch_start_delta={} ({})\n",
+            alignment.raw_end_to_dispatch_start_gap_ticks,
+            format_optional_duration_ns(alignment.raw_end_to_dispatch_start_gap_ns),
+            alignment.raw_start_to_dispatch_start_delta_ticks,
+            format_optional_duration_ns(alignment.raw_start_to_dispatch_start_delta_ns)
+        ));
+        if !alignment.candidate_shifts.is_empty() {
+            out.push_str("  diagnostic candidate shifts (not applied to counter joins):\n");
+            for candidate in &alignment.candidate_shifts {
+                out.push_str(&format!(
+                    "    {} shift={} ({}) shifted_ticks={}-{} overlap_records={} dispatches_covered={}\n",
+                    candidate.name,
+                    candidate.shift_ticks,
+                    format_optional_duration_ns(candidate.shift_ns),
+                    candidate.shifted_raw_start_ticks,
+                    candidate.shifted_raw_end_ticks,
+                    candidate.overlap_record_count,
+                    candidate.dispatches_covered
+                ));
+            }
+        }
+        if !alignment.source_spans.is_empty() {
+            out.push_str("  nearest raw source spans:\n");
+            for span in alignment.source_spans.iter().take(12) {
+                out.push_str(&format!(
+                    "    group={} source={} rings={:?} records={} ticks={}-{} gap={} ({}) overlap_records={}\n",
+                    format_optional_usize(span.sample_group),
+                    format_optional_usize(span.source_index),
+                    span.ring_indices,
+                    span.record_count,
+                    span.start_ticks,
+                    span.end_ticks,
+                    span.nearest_dispatch_gap_ticks,
+                    format_optional_duration_ns(span.nearest_dispatch_gap_ns),
+                    span.direct_overlap_record_count
+                ));
+            }
+        }
+        if alignment.direct_overlap_record_count == 0 {
+            out.push_str("  no raw counter records fall inside profiler dispatch windows; dispatch-level raw counters are not emitted.\n");
+        }
+        out.push('\n');
+    }
     for metadata in &report.aggregate_metadata {
         out.push_str(&format!(
             "APSCounterData[{}]: timebase={}/{} num_encoders={} perf={:?}\n",
@@ -1314,6 +1477,56 @@ pub fn format_raw_counters_report(report: &RawCountersReport) -> String {
                     metric.key,
                     metric.counter_type.as_deref().unwrap_or("-")
                 ));
+            }
+        }
+    }
+    if !report.shifted_dispatch_metric_candidates.is_empty() {
+        out.push_str(
+            "\nShifted dispatch AGX JavaScript-derived counter candidates (diagnostic only):\n",
+        );
+        for candidate in &report.shifted_dispatch_metric_candidates {
+            out.push_str(&format!(
+                "  candidate={} shift={} ({}) overlap_records={} dispatches_covered={}\n",
+                candidate.name,
+                candidate.shift_ticks,
+                format_optional_duration_ns(candidate.shift_ns),
+                candidate.overlap_record_count,
+                candidate.dispatches_covered
+            ));
+            for group in candidate.groups.iter().take(12) {
+                out.push_str(&format!(
+                    "    dispatch={} function={} records={} ticks={}-{}\n",
+                    group
+                        .profiler_dispatch_index
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    group.profiler_function_name.as_deref().unwrap_or("-"),
+                    group.record_count,
+                    group
+                        .start_ticks
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                    group
+                        .end_ticks
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned())
+                ));
+                let mut metrics =
+                    top_derived_metrics_matching(&group.derived_metrics, 4, |metric| {
+                        shifted_dispatch_metric_is_interesting(metric)
+                    });
+                if metrics.is_empty() {
+                    metrics = top_derived_metrics(&group.derived_metrics, 4);
+                }
+                for metric in metrics {
+                    out.push_str(&format!(
+                        "      {:>12.4} {} ({}) type={}\n",
+                        metric.value,
+                        metric.name,
+                        metric.key,
+                        metric.counter_type.as_deref().unwrap_or("-")
+                    ));
+                }
             }
         }
     }
@@ -1651,6 +1864,21 @@ fn top_derived_metrics_matching(
     });
     sorted.truncate(limit);
     sorted
+}
+
+fn shifted_dispatch_metric_is_interesting(metric: &RawCounterJsDerivedMetric) -> bool {
+    let key = metric.key.to_ascii_lowercase();
+    let name = metric.name.to_ascii_lowercase();
+    [
+        "cs",
+        "kernel",
+        "alu",
+        "invocation",
+        "utilization",
+        "performance",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle) || name.contains(needle))
 }
 
 fn optional_usize_csv(value: Option<usize>) -> String {
@@ -2569,6 +2797,446 @@ fn raw_counter_js_variable_groups_from_parts(
     groups
 }
 
+fn raw_counter_shifted_dispatch_metric_candidates(
+    counter_schemas: &CounterSchemaByGroup,
+    fallback_counter_names: &[String],
+    sample_blobs: &[SampleBlob],
+    profiler_dispatches: &[profiler::ProfilerDispatch],
+    alignment: Option<&RawCounterDispatchAlignmentReport>,
+    catalog: &RawCounterCatalog,
+    device_identifier: Option<&str>,
+) -> Vec<RawCounterShiftedDispatchMetricCandidate> {
+    let Some(alignment) = alignment else {
+        return Vec::new();
+    };
+    if alignment.direct_overlap_record_count != 0 {
+        return Vec::new();
+    }
+    let Some(candidate) = alignment.candidate_shifts.iter().max_by(|left, right| {
+        left.dispatches_covered
+            .cmp(&right.dispatches_covered)
+            .then_with(|| left.overlap_record_count.cmp(&right.overlap_record_count))
+            .then_with(|| {
+                right
+                    .shift_ticks
+                    .unsigned_abs()
+                    .cmp(&left.shift_ticks.unsigned_abs())
+            })
+    }) else {
+        return Vec::new();
+    };
+    if candidate.overlap_record_count == 0 || candidate.dispatches_covered == 0 {
+        return Vec::new();
+    }
+
+    let variable_groups = raw_counter_shifted_dispatch_variable_groups_from_parts(
+        counter_schemas,
+        fallback_counter_names,
+        sample_blobs,
+        profiler_dispatches,
+        candidate.shift_ticks,
+    );
+    let groups = evaluate_agx_derived_metric_groups(catalog, variable_groups, device_identifier);
+    if groups.is_empty() {
+        return Vec::new();
+    }
+
+    vec![RawCounterShiftedDispatchMetricCandidate {
+        name: candidate.name.clone(),
+        shift_ticks: candidate.shift_ticks,
+        shift_ns: candidate.shift_ns,
+        overlap_record_count: candidate.overlap_record_count,
+        dispatches_covered: candidate.dispatches_covered,
+        groups,
+    }]
+}
+
+fn raw_counter_shifted_dispatch_variable_groups_from_parts(
+    counter_schemas: &CounterSchemaByGroup,
+    fallback_counter_names: &[String],
+    sample_blobs: &[SampleBlob],
+    profiler_dispatches: &[profiler::ProfilerDispatch],
+    shift_ticks: i64,
+) -> Vec<RawCounterJsVariableGroup> {
+    if profiler_dispatches.is_empty()
+        || (counter_schemas.is_empty() && fallback_counter_names.is_empty())
+    {
+        return Vec::new();
+    }
+
+    let mut dispatch_groups = BTreeMap::<usize, RawCounterJsGroupAccum>::new();
+    for (path, data) in sample_blobs {
+        if !path.contains("/Derived Counter Sample Data/") {
+            continue;
+        }
+        let Some((record_size, _)) = gprw_record_info(data) else {
+            continue;
+        };
+        let records = gprw_u64_records(data, record_size);
+        if records.is_empty() {
+            continue;
+        }
+        let path_ids = parse_derived_counter_sample_path(path);
+        let Some(counter_names) = path_ids
+            .sample_group
+            .and_then(|group| counter_schemas.get(&group).map(Vec::as_slice))
+            .or((!fallback_counter_names.is_empty()).then_some(fallback_counter_names))
+        else {
+            continue;
+        };
+        for record in &records {
+            let Some(raw_ticks) = record.get(1).copied() else {
+                continue;
+            };
+            let Some(shifted_ticks) = shifted_tick(raw_ticks, shift_ticks) else {
+                continue;
+            };
+            let Some(dispatch) = profiler_dispatch_for_tick(shifted_ticks, profiler_dispatches)
+            else {
+                continue;
+            };
+            let dispatch_accum = dispatch_groups.entry(dispatch.index).or_default();
+            dispatch_accum.push_record_metadata_with_ticks(record, &path_ids, Some(shifted_ticks));
+            push_raw_counter_js_values(dispatch_accum, record, counter_names);
+        }
+    }
+
+    let dispatches_by_index = profiler_dispatches
+        .iter()
+        .map(|dispatch| (dispatch.index, dispatch))
+        .collect::<BTreeMap<_, _>>();
+    dispatch_groups
+        .into_iter()
+        .filter_map(|(index, accum)| {
+            let dispatch = dispatches_by_index.get(&index).copied();
+            RawCounterJsVariableGroup::from_accum(
+                "profiler_dispatch_shifted",
+                index.to_string(),
+                None,
+                None,
+                dispatch,
+                accum,
+            )
+        })
+        .collect()
+}
+
+fn raw_counter_dispatch_alignment_report(
+    sample_blobs: &[SampleBlob],
+    dispatches: &[profiler::ProfilerDispatch],
+    aggregate_metadata: &[RawCounterAggregateMetadata],
+) -> Option<RawCounterDispatchAlignmentReport> {
+    if dispatches.is_empty() {
+        return None;
+    }
+
+    let dispatch_start_ticks = dispatches
+        .iter()
+        .filter_map(|dispatch| (dispatch.start_ticks != 0).then_some(dispatch.start_ticks))
+        .min()?;
+    let dispatch_end_ticks = dispatches
+        .iter()
+        .filter_map(|dispatch| (dispatch.end_ticks != 0).then_some(dispatch.end_ticks))
+        .max()?;
+    if dispatch_end_ticks < dispatch_start_ticks {
+        return None;
+    }
+    let dispatch_span_ticks = dispatch_end_ticks - dispatch_start_ticks;
+    let (timebase_numer, timebase_denom) = raw_counter_timebase(aggregate_metadata);
+
+    let mut timestamps = Vec::new();
+    let mut raw_start_ticks = u64::MAX;
+    let mut raw_end_ticks = 0u64;
+    let mut direct_overlap_record_count = 0usize;
+    let mut raw_before_dispatch_record_count = 0usize;
+    let mut raw_after_dispatch_record_count = 0usize;
+    let mut source_spans =
+        BTreeMap::<(Option<usize>, Option<usize>), RawCounterTimestampSpanAccum>::new();
+
+    for (path, data) in sample_blobs {
+        if !path.contains("/Derived Counter Sample Data/") {
+            continue;
+        }
+        let Some((record_size, _)) = gprw_record_info(data) else {
+            continue;
+        };
+        let path_ids = parse_derived_counter_sample_path(path);
+        for record in gprw_u64_records(data, record_size) {
+            let Some(ticks) = record.get(1).copied() else {
+                continue;
+            };
+            timestamps.push(ticks);
+            raw_start_ticks = raw_start_ticks.min(ticks);
+            raw_end_ticks = raw_end_ticks.max(ticks);
+            let overlaps_dispatch = profiler_dispatch_for_tick(ticks, dispatches).is_some();
+            if overlaps_dispatch {
+                direct_overlap_record_count += 1;
+            } else if ticks < dispatch_start_ticks {
+                raw_before_dispatch_record_count += 1;
+            } else if ticks > dispatch_end_ticks {
+                raw_after_dispatch_record_count += 1;
+            }
+            source_spans
+                .entry((path_ids.sample_group, path_ids.source_index))
+                .or_default()
+                .push(ticks, overlaps_dispatch, path_ids.ring_index);
+        }
+    }
+    if timestamps.is_empty() || raw_start_ticks == u64::MAX {
+        return None;
+    }
+
+    let raw_span_ticks = raw_end_ticks.saturating_sub(raw_start_ticks);
+    let mut source_spans = source_spans
+        .into_iter()
+        .filter_map(|((sample_group, source_index), accum)| {
+            accum.into_span(
+                sample_group,
+                source_index,
+                dispatch_start_ticks,
+                dispatch_end_ticks,
+                timebase_numer,
+                timebase_denom,
+            )
+        })
+        .collect::<Vec<_>>();
+    source_spans.sort_by(|left, right| {
+        left.nearest_dispatch_gap_ticks
+            .unsigned_abs()
+            .cmp(&right.nearest_dispatch_gap_ticks.unsigned_abs())
+            .then_with(|| left.sample_group.cmp(&right.sample_group))
+            .then_with(|| left.source_index.cmp(&right.source_index))
+    });
+
+    let candidate_shifts = raw_counter_dispatch_alignment_candidates(
+        &timestamps,
+        raw_start_ticks,
+        raw_end_ticks,
+        dispatch_start_ticks,
+        dispatch_end_ticks,
+        dispatches,
+        timebase_numer,
+        timebase_denom,
+    );
+
+    Some(RawCounterDispatchAlignmentReport {
+        timebase_numer,
+        timebase_denom,
+        dispatch_count: dispatches.len(),
+        dispatch_start_ticks,
+        dispatch_end_ticks,
+        dispatch_span_ticks,
+        dispatch_span_ns: tick_delta_to_ns(
+            dispatch_span_ticks as i64,
+            timebase_numer,
+            timebase_denom,
+        ),
+        raw_record_count: timestamps.len(),
+        raw_start_ticks,
+        raw_end_ticks,
+        raw_span_ticks,
+        raw_span_ns: tick_delta_to_ns(raw_span_ticks as i64, timebase_numer, timebase_denom),
+        direct_overlap_record_count,
+        raw_before_dispatch_record_count,
+        raw_after_dispatch_record_count,
+        raw_end_to_dispatch_start_gap_ticks: signed_tick_delta(dispatch_start_ticks, raw_end_ticks),
+        raw_end_to_dispatch_start_gap_ns: tick_delta_to_ns(
+            signed_tick_delta(dispatch_start_ticks, raw_end_ticks),
+            timebase_numer,
+            timebase_denom,
+        ),
+        raw_start_to_dispatch_start_delta_ticks: signed_tick_delta(
+            dispatch_start_ticks,
+            raw_start_ticks,
+        ),
+        raw_start_to_dispatch_start_delta_ns: tick_delta_to_ns(
+            signed_tick_delta(dispatch_start_ticks, raw_start_ticks),
+            timebase_numer,
+            timebase_denom,
+        ),
+        candidate_shifts,
+        source_spans,
+    })
+}
+
+#[derive(Debug, Default)]
+struct RawCounterTimestampSpanAccum {
+    record_count: usize,
+    start_ticks: Option<u64>,
+    end_ticks: Option<u64>,
+    direct_overlap_record_count: usize,
+    ring_indices: BTreeSet<usize>,
+}
+
+impl RawCounterTimestampSpanAccum {
+    fn push(&mut self, ticks: u64, overlaps_dispatch: bool, ring_index: Option<usize>) {
+        self.record_count += 1;
+        self.start_ticks = Some(
+            self.start_ticks
+                .map(|current| current.min(ticks))
+                .unwrap_or(ticks),
+        );
+        self.end_ticks = Some(
+            self.end_ticks
+                .map(|current| current.max(ticks))
+                .unwrap_or(ticks),
+        );
+        if overlaps_dispatch {
+            self.direct_overlap_record_count += 1;
+        }
+        if let Some(ring_index) = ring_index {
+            self.ring_indices.insert(ring_index);
+        }
+    }
+
+    fn into_span(
+        self,
+        sample_group: Option<usize>,
+        source_index: Option<usize>,
+        dispatch_start_ticks: u64,
+        dispatch_end_ticks: u64,
+        timebase_numer: Option<u64>,
+        timebase_denom: Option<u64>,
+    ) -> Option<RawCounterTimestampSpan> {
+        let start_ticks = self.start_ticks?;
+        let end_ticks = self.end_ticks?;
+        let span_ticks = end_ticks.saturating_sub(start_ticks);
+        let nearest_dispatch_gap_ticks = tick_span_gap_to_dispatch(
+            start_ticks,
+            end_ticks,
+            dispatch_start_ticks,
+            dispatch_end_ticks,
+        );
+        Some(RawCounterTimestampSpan {
+            sample_group,
+            source_index,
+            ring_indices: self.ring_indices.into_iter().collect(),
+            record_count: self.record_count,
+            start_ticks,
+            end_ticks,
+            span_ticks,
+            direct_overlap_record_count: self.direct_overlap_record_count,
+            nearest_dispatch_gap_ticks,
+            nearest_dispatch_gap_ns: tick_delta_to_ns(
+                nearest_dispatch_gap_ticks,
+                timebase_numer,
+                timebase_denom,
+            ),
+        })
+    }
+}
+
+fn raw_counter_timebase(
+    aggregate_metadata: &[RawCounterAggregateMetadata],
+) -> (Option<u64>, Option<u64>) {
+    aggregate_metadata
+        .iter()
+        .find_map(|metadata| Some((metadata.timebase_numer?, metadata.timebase_denom?)))
+        .map(|(numer, denom)| (Some(numer), Some(denom)))
+        .unwrap_or((None, None))
+}
+
+fn raw_counter_dispatch_alignment_candidates(
+    timestamps: &[u64],
+    raw_start_ticks: u64,
+    raw_end_ticks: u64,
+    dispatch_start_ticks: u64,
+    dispatch_end_ticks: u64,
+    dispatches: &[profiler::ProfilerDispatch],
+    timebase_numer: Option<u64>,
+    timebase_denom: Option<u64>,
+) -> Vec<RawCounterDispatchAlignmentCandidate> {
+    [
+        (
+            "raw_start_to_dispatch_start",
+            signed_tick_delta(dispatch_start_ticks, raw_start_ticks),
+        ),
+        (
+            "raw_end_to_dispatch_end",
+            signed_tick_delta(dispatch_end_ticks, raw_end_ticks),
+        ),
+        (
+            "raw_end_to_dispatch_start",
+            signed_tick_delta(dispatch_start_ticks, raw_end_ticks),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, shift_ticks)| {
+        let shifted_raw_start_ticks = shifted_tick(raw_start_ticks, shift_ticks)?;
+        let shifted_raw_end_ticks = shifted_tick(raw_end_ticks, shift_ticks)?;
+        let mut dispatches_covered = BTreeSet::new();
+        let overlap_record_count = timestamps
+            .iter()
+            .filter_map(|ticks| shifted_tick(*ticks, shift_ticks))
+            .filter(|ticks| {
+                let Some(dispatch) = profiler_dispatch_for_tick(*ticks, dispatches) else {
+                    return false;
+                };
+                dispatches_covered.insert(dispatch.index);
+                true
+            })
+            .count();
+        Some(RawCounterDispatchAlignmentCandidate {
+            name: name.to_owned(),
+            shift_ticks,
+            shift_ns: tick_delta_to_ns(shift_ticks, timebase_numer, timebase_denom),
+            shifted_raw_start_ticks,
+            shifted_raw_end_ticks,
+            overlap_record_count,
+            dispatches_covered: dispatches_covered.len(),
+        })
+    })
+    .collect()
+}
+
+fn profiler_dispatch_for_tick(
+    ticks: u64,
+    dispatches: &[profiler::ProfilerDispatch],
+) -> Option<&profiler::ProfilerDispatch> {
+    let index = dispatches
+        .partition_point(|dispatch| dispatch.end_ticks != 0 && dispatch.end_ticks < ticks);
+    dispatches
+        .get(index)
+        .filter(|dispatch| dispatch.start_ticks <= ticks && ticks <= dispatch.end_ticks)
+}
+
+fn tick_span_gap_to_dispatch(
+    start_ticks: u64,
+    end_ticks: u64,
+    dispatch_start_ticks: u64,
+    dispatch_end_ticks: u64,
+) -> i64 {
+    if end_ticks < dispatch_start_ticks {
+        signed_tick_delta(dispatch_start_ticks, end_ticks)
+    } else if start_ticks > dispatch_end_ticks {
+        signed_tick_delta(dispatch_end_ticks, start_ticks)
+    } else {
+        0
+    }
+}
+
+fn signed_tick_delta(target_ticks: u64, source_ticks: u64) -> i64 {
+    let delta = target_ticks as i128 - source_ticks as i128;
+    delta.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn shifted_tick(ticks: u64, shift_ticks: i64) -> Option<u64> {
+    let shifted = ticks as i128 + shift_ticks as i128;
+    (0..=u64::MAX as i128)
+        .contains(&shifted)
+        .then_some(shifted as u64)
+}
+
+fn tick_delta_to_ns(
+    ticks: i64,
+    timebase_numer: Option<u64>,
+    timebase_denom: Option<u64>,
+) -> Option<f64> {
+    let numer = timebase_numer?;
+    let denom = timebase_denom?;
+    (denom != 0).then(|| ticks as f64 * numer as f64 / denom as f64)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RawCounterEncoderSampleWindow {
     start_record_index: usize,
@@ -2855,11 +3523,7 @@ fn profiler_dispatch_for_raw_counter_record<'a>(
     dispatches: &'a [profiler::ProfilerDispatch],
 ) -> Option<&'a profiler::ProfilerDispatch> {
     let timestamp = record.get(1).copied()?;
-    let index = dispatches
-        .partition_point(|dispatch| dispatch.end_ticks != 0 && dispatch.end_ticks < timestamp);
-    dispatches
-        .get(index)
-        .filter(|dispatch| dispatch.start_ticks <= timestamp && timestamp <= dispatch.end_ticks)
+    profiler_dispatch_for_tick(timestamp, dispatches)
 }
 
 #[derive(Debug)]
@@ -2937,11 +3601,20 @@ struct RawCounterJsGroupAccum {
 
 impl RawCounterJsGroupAccum {
     fn push_record_metadata(&mut self, record: &[u64], path_ids: &DerivedCounterSamplePath) {
+        self.push_record_metadata_with_ticks(record, path_ids, record.get(1).copied());
+    }
+
+    fn push_record_metadata_with_ticks(
+        &mut self,
+        record: &[u64],
+        path_ids: &DerivedCounterSamplePath,
+        ticks: impl Into<Option<u64>>,
+    ) {
         self.record_count += 1;
         if let Some(ring_index) = path_ids.ring_index {
             self.ring_indices.insert(ring_index);
         }
-        if let Some(timestamp) = record.get(1).copied() {
+        if let Some(timestamp) = ticks.into() {
             self.start_ticks = Some(
                 self.start_ticks
                     .map(|current| current.min(timestamp))
@@ -3411,6 +4084,24 @@ fn format_optional_u64_hex(value: Option<u64>) -> String {
     value
         .map(|value| format!("0x{value:x}"))
         .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_ticks_with_duration(ticks: u64, ns: Option<f64>) -> String {
+    format!("{ticks} ({})", format_optional_duration_ns(ns))
+}
+
+fn format_optional_duration_ns(ns: Option<f64>) -> String {
+    let Some(ns) = ns else {
+        return "-".to_owned();
+    };
+    let abs = ns.abs();
+    if abs >= 1_000_000.0 {
+        format!("{:.3} ms", ns / 1_000_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{:.3} us", ns / 1_000.0)
+    } else {
+        format!("{ns:.1} ns")
+    }
 }
 
 fn format_u64_hex_list(values: &[u64], limit: usize) -> String {
@@ -5681,6 +6372,18 @@ mod tests {
         record
     }
 
+    fn gprw_blob(timestamps: &[u64]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for timestamp in timestamps {
+            let mut record = vec![0u8; 64];
+            record[0..8].copy_from_slice(b"GPRWCNTR");
+            record[8..16].copy_from_slice(&timestamp.to_le_bytes());
+            record[16..24].copy_from_slice(&1_u64.to_le_bytes());
+            data.extend_from_slice(&record);
+        }
+        data
+    }
+
     #[test]
     fn parses_derived_counter_sample_group_source_and_ring() {
         let path = "APSCounterData[44]/Derived Counter Sample Data/10/1/0";
@@ -5731,6 +6434,51 @@ mod tests {
     }
 
     #[test]
+    fn reports_raw_counter_dispatch_timestamp_alignment() {
+        let sample_blobs = vec![(
+            "APSCounterData[0]/Derived Counter Sample Data/2/1/0".to_owned(),
+            gprw_blob(&[10, 20, 30]),
+        )];
+        let dispatches = vec![profiler::ProfilerDispatch {
+            index: 0,
+            pipeline_index: 0,
+            pipeline_id: Some(42),
+            function_name: Some("kernel".to_owned()),
+            encoder_index: 0,
+            cumulative_us: 0,
+            duration_us: 1,
+            sample_count: 0,
+            sampling_density: 0.0,
+            start_ticks: 100,
+            end_ticks: 120,
+        }];
+        let metadata = vec![RawCounterAggregateMetadata {
+            archive_index: 0,
+            timebase_numer: Some(2),
+            timebase_denom: Some(1),
+            num_encoders: Some(1),
+            perf_info: BTreeMap::new(),
+            encoder_sample_indices: Vec::new(),
+            encoder_infos: Vec::new(),
+        }];
+
+        let report =
+            raw_counter_dispatch_alignment_report(&sample_blobs, &dispatches, &metadata).unwrap();
+
+        assert_eq!(report.direct_overlap_record_count, 0);
+        assert_eq!(report.raw_end_to_dispatch_start_gap_ticks, 70);
+        assert_eq!(report.raw_end_to_dispatch_start_gap_ns, Some(140.0));
+        assert_eq!(report.source_spans[0].nearest_dispatch_gap_ticks, 70);
+        let candidate = report
+            .candidate_shifts
+            .iter()
+            .find(|candidate| candidate.name == "raw_end_to_dispatch_start")
+            .unwrap();
+        assert_eq!(candidate.overlap_record_count, 1);
+        assert_eq!(candidate.dispatches_covered, 1);
+    }
+
+    #[test]
     fn parses_trace_map_entries_from_keyed_dictionary() {
         let mut root = Dictionary::new();
         root.insert(
@@ -5775,6 +6523,7 @@ mod tests {
             trace_source: PathBuf::from("trace.gputrace"),
             profiler_directory: PathBuf::from("trace.gputrace/raw"),
             timings: Vec::new(),
+            dispatch_alignment: None,
             aggregate_metadata: Vec::new(),
             sample_trace_indices: Vec::new(),
             trace_maps: Vec::new(),
@@ -5836,6 +6585,7 @@ mod tests {
             ],
             derived_metrics: Vec::new(),
             grouped_derived_metrics: Vec::new(),
+            shifted_dispatch_metric_candidates: Vec::new(),
             encoder_sample_metrics: Vec::new(),
             warnings: Vec::new(),
         };
@@ -5886,6 +6636,7 @@ mod tests {
             trace_source: PathBuf::from("trace.gputrace"),
             profiler_directory: PathBuf::from("trace.gputrace/raw"),
             timings: Vec::new(),
+            dispatch_alignment: None,
             aggregate_metadata: Vec::new(),
             sample_trace_indices: Vec::new(),
             trace_maps: Vec::new(),
@@ -5897,6 +6648,7 @@ mod tests {
             metrics: vec![metric],
             derived_metrics: Vec::new(),
             grouped_derived_metrics: Vec::new(),
+            shifted_dispatch_metric_candidates: Vec::new(),
             encoder_sample_metrics: Vec::new(),
             warnings: Vec::new(),
         };
@@ -5915,6 +6667,7 @@ mod tests {
             trace_source: PathBuf::from("trace.gputrace"),
             profiler_directory: PathBuf::from("trace.gputrace/raw"),
             timings: Vec::new(),
+            dispatch_alignment: None,
             aggregate_metadata: Vec::new(),
             sample_trace_indices: Vec::new(),
             trace_maps: Vec::new(),
@@ -5952,6 +6705,7 @@ mod tests {
             metrics: Vec::new(),
             derived_metrics: Vec::new(),
             grouped_derived_metrics: Vec::new(),
+            shifted_dispatch_metric_candidates: Vec::new(),
             encoder_sample_metrics: Vec::new(),
             warnings: Vec::new(),
         };

@@ -30,7 +30,20 @@ pub struct XcodeMioReport {
     pub draw_timeline_records: Vec<XcodeMioDrawTimelineRecord>,
     pub draw_metadata_records: Vec<XcodeMioDrawMetadataRecord>,
     pub pipelines: Vec<XcodeMioPipeline>,
+    pub encoders: Vec<XcodeMioEncoder>,
     pub gpu_commands: Vec<XcodeMioGpuCommand>,
+    pub gpu_command_function_times: Vec<XcodeMioGpuCommandFunctionTime>,
+    pub gpu_command_function_time_probes: Vec<XcodeMioFunctionTimeProbe>,
+    pub draw_array_probes: Vec<XcodeMioDrawArrayProbe>,
+    pub usc_clique_summaries: Vec<XcodeMioUSCCliqueSummary>,
+    pub usc_clique_probes: Vec<XcodeMioUSCCliqueProbe>,
+    pub encoder_quad_probes: Vec<XcodeMioEncoderQuadProbe>,
+    pub draw_execution_history_probes: Vec<XcodeMioDrawExecutionHistoryProbe>,
+    pub top_draw_tracks: Vec<XcodeMioTopDrawTrack>,
+    pub gpu_command_direct_costs: Vec<XcodeMioGpuCommandDirectCost>,
+    pub gpu_command_shader_profiler_costs: Vec<XcodeMioGpuCommandShaderProfilerCost>,
+    pub gpu_command_counter_rows: Vec<XcodeMioGpuCommandCounterRow>,
+    pub shader_profiler_numeric_arrays: Vec<XcodeMioPrivateNumericArray>,
     pub warnings: Vec<String>,
 }
 
@@ -49,6 +62,19 @@ pub struct XcodeMioTimings {
     pub cost_timeline_request_ms: f64,
     pub cost_timeline_decode_ms: f64,
     pub final_metadata_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct XcodeMioDecodeOptions {
+    pub decode_cost_details: bool,
+}
+
+impl Default for XcodeMioDecodeOptions {
+    fn default() -> Self {
+        Self {
+            decode_cost_details: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -341,6 +367,240 @@ pub struct XcodeMioGpuCommand {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioEncoder {
+    pub index: usize,
+    pub function_index: u64,
+    pub gpu_command_start_index: usize,
+    pub gpu_command_count: usize,
+    pub load_time: u64,
+    pub store_time: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioGpuCommandFunctionTime {
+    pub source: &'static str,
+    pub command_index: usize,
+    pub function_index: u64,
+    pub sub_command_index: i32,
+    pub encoder_index: usize,
+    pub pipeline_index: usize,
+    pub function_name: Option<String>,
+    pub draw_index: u32,
+    pub data_master: u16,
+    pub duration_ns: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioFunctionTimeProbe {
+    pub source: &'static str,
+    pub target_kind: &'static str,
+    pub target_id_kind: &'static str,
+    pub target_id: u64,
+    pub pipeline_index: Option<usize>,
+    pub encoder_index: Option<usize>,
+    pub function_name: Option<String>,
+    pub reported_draw_count: u64,
+    pub enumerated_draw_count: usize,
+    pub sampled_draws: Vec<u32>,
+    pub best_draw_index: Option<u32>,
+    pub best_data_master: Option<u16>,
+    pub best_duration_ns: u64,
+    pub kick_duration_ns: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioDrawArrayProbe {
+    pub source: &'static str,
+    pub array_index_kind: &'static str,
+    pub array_index: usize,
+    pub command_index: usize,
+    pub function_index: u64,
+    pub sub_command_index: i32,
+    pub encoder_index: usize,
+    pub pipeline_index: usize,
+    pub function_name: Option<String>,
+    pub trace_raw0: u64,
+    pub trace_raw1: u64,
+    pub trace_raw2: u32,
+    pub trace_raw3: u16,
+    pub trace_duration_ns: u64,
+    pub metadata_raw0: u32,
+    pub metadata_raw1: u32,
+    pub metadata_raw2: u32,
+    pub metadata_raw3: u32,
+    pub metadata_raw4: i32,
+    pub metadata_raw5: u32,
+    pub metadata_raw6: u64,
+    pub metadata_raw7: u32,
+    pub metadata_raw8: u32,
+    pub metadata_raw9: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioTopDrawTrack {
+    pub source: &'static str,
+    pub track_index: usize,
+    pub trace_index: usize,
+    pub track_id: i32,
+    pub first_index: u64,
+    pub start_timestamp_ns: u64,
+    pub end_timestamp_ns: u64,
+    pub duration_ns: u64,
+    pub trace_count: u64,
+    pub trace_raw0: u64,
+    pub trace_raw1: u64,
+    pub trace_raw2: u32,
+    pub trace_raw3: u16,
+    pub trace_duration_ns: u64,
+    pub command_index: Option<usize>,
+    pub function_index: Option<u64>,
+    pub sub_command_index: Option<i32>,
+    pub encoder_index: Option<usize>,
+    pub pipeline_index: Option<usize>,
+    pub function_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioUSCCliqueProbe {
+    pub source: &'static str,
+    pub usc_index: usize,
+    pub field_index: usize,
+    pub data_master: Option<u16>,
+    pub match_kind: &'static str,
+    pub matched_value: u32,
+    pub command_index: usize,
+    pub function_index: u64,
+    pub sub_command_index: i32,
+    pub encoder_index: usize,
+    pub pipeline_index: usize,
+    pub function_name: Option<String>,
+    pub clique_count: usize,
+    pub first_clique_index: usize,
+    pub last_clique_index: usize,
+    pub duration_sum_ns: u64,
+    pub span_duration_ns: u64,
+    pub min_duration_ns: u64,
+    pub max_duration_ns: u64,
+    pub min_timestamp_ns: u64,
+    pub max_timestamp_ns: u64,
+    pub sample_raw0: u64,
+    pub sample_raw1: u64,
+    pub sample_u32_fields: Vec<u32>,
+    pub sample_u16_fields: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioUSCCliqueSummary {
+    pub source: &'static str,
+    pub usc_index: Option<usize>,
+    pub usc_count: u64,
+    pub clique_count: u64,
+    pub has_cliques: bool,
+    pub has_enumerate_kick_cliques_by_function: bool,
+    pub sample_raw0: u64,
+    pub sample_raw1: u64,
+    pub sample_duration_ns: u64,
+    pub sample_u32_fields: Vec<u32>,
+    pub sample_u16_fields: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioEncoderQuadProbe {
+    pub source: &'static str,
+    pub mode: &'static str,
+    pub encoder_index: Option<usize>,
+    pub encoder_function_index: u32,
+    pub pipeline_index: Option<usize>,
+    pub pipeline_id_kind: Option<&'static str>,
+    pub pipeline_id: Option<u64>,
+    pub draw_id_kind: Option<&'static str>,
+    pub draw_index: Option<u32>,
+    pub function_name: Option<String>,
+    pub program_type: u16,
+    pub options: u64,
+    pub draw_count: u64,
+    pub quad_count: u64,
+    pub min_timestamp_ns: u64,
+    pub max_timestamp_ns: u64,
+    pub duration_ns: u64,
+    pub max_cost: f64,
+    pub min_cost: f64,
+    pub sampled_draws: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioDrawExecutionHistoryProbe {
+    pub source: &'static str,
+    pub mode: &'static str,
+    pub node_source: &'static str,
+    pub command_index: usize,
+    pub draw_index: u32,
+    pub pipeline_index: usize,
+    pub function_name: Option<String>,
+    pub style: u32,
+    pub options: u32,
+    pub program_type: u16,
+    pub generated: bool,
+    pub top_cost_percentage: f64,
+    pub duration_percentage: f64,
+    pub total_duration_ns: u64,
+    pub total_cost: f64,
+    pub instruction_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioGpuCommandCounterRow {
+    pub command_index: usize,
+    pub function_index: u64,
+    pub sub_command_index: i32,
+    pub encoder_index: usize,
+    pub pipeline_index: usize,
+    pub function_name: Option<String>,
+    pub counters: Vec<XcodeMioPipelineCounter>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioGpuCommandDirectCost {
+    pub source: &'static str,
+    pub command_index: usize,
+    pub function_index: u64,
+    pub sub_command_index: i32,
+    pub encoder_index: usize,
+    pub pipeline_index: usize,
+    pub function_name: Option<String>,
+    pub cost: f64,
+    pub cost_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioGpuCommandShaderProfilerCost {
+    pub source: &'static str,
+    pub draw_index: usize,
+    pub command_index: usize,
+    pub function_index: u64,
+    pub sub_command_index: i32,
+    pub encoder_index: usize,
+    pub pipeline_index: usize,
+    pub function_name: Option<String>,
+    pub binary_key: String,
+    pub full_path: Option<String>,
+    pub type_name: Option<String>,
+    pub shader_type: u32,
+    pub addr_start: u32,
+    pub addr_end: u32,
+    pub total_binary_cost: f64,
+    pub total_binary_samples: u64,
+    pub cost: f64,
+    pub cost_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioPrivateNumericArray {
+    pub source: &'static str,
+    pub rows: Vec<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct XcodeMioCostTimeline {
     pub draw_count: usize,
     pub pipeline_state_count: usize,
@@ -393,6 +653,10 @@ pub struct XcodeMioPipelineAnalysis {
     pub agxps_trace_cost_percent: Option<f64>,
     pub agxps_trace_events: u64,
     pub agxps_trace_matched_work_cliques: usize,
+    pub agxps_analyzer_cost: u64,
+    pub agxps_analyzer_cost_percent: Option<f64>,
+    pub agxps_analyzer_avg_duration_sum: u64,
+    pub agxps_analyzer_record_cliques: u64,
     pub execution_top_cost_percent: Option<f64>,
     pub execution_duration_percent: Option<f64>,
     pub execution_total_cost: Option<f64>,
@@ -408,6 +672,18 @@ pub fn report(trace: &TraceBundle) -> Result<XcodeMioReport> {
 pub fn report_with_profiler_summary(
     trace: &TraceBundle,
     precomputed_profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+) -> Result<XcodeMioReport> {
+    report_with_options(
+        trace,
+        precomputed_profiler_summary,
+        XcodeMioDecodeOptions::default(),
+    )
+}
+
+pub fn report_with_options(
+    trace: &TraceBundle,
+    precomputed_profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+    options: XcodeMioDecodeOptions,
 ) -> Result<XcodeMioReport> {
     let total_start = Instant::now();
     let locate_start = Instant::now();
@@ -438,6 +714,7 @@ pub fn report_with_profiler_summary(
         stream_data_path,
         profiler_summary,
         timings.clone(),
+        options,
     )?;
     timings = report.timings.clone();
     timings.total_ms = elapsed_ms(total_start);
@@ -447,6 +724,20 @@ pub fn report_with_profiler_summary(
 
 pub fn analysis_report(trace: &TraceBundle) -> Result<XcodeMioAnalysisReport> {
     Ok(summarize_report(&report(trace)?))
+}
+
+pub fn agxps_analysis_report(
+    trace: &TraceBundle,
+    precomputed_profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+) -> Result<XcodeMioAnalysisReport> {
+    let report = report_with_options(
+        trace,
+        precomputed_profiler_summary,
+        XcodeMioDecodeOptions {
+            decode_cost_details: false,
+        },
+    )?;
+    Ok(summarize_report(&report))
 }
 
 pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
@@ -483,6 +774,12 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
         .flat_map(|pipeline| pipeline.agxps_trace_costs.iter())
         .map(|cost| cost.stats_word1)
         .sum::<u64>();
+    let agxps_analyzer_cost_denominator = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| pipeline.agxps_trace_costs.iter())
+        .map(|cost| cost.analyzer_weighted_duration)
+        .sum::<u64>();
     let timeline_binaries_by_index = report
         .timeline_binaries
         .iter()
@@ -514,6 +811,21 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
                 .agxps_trace_costs
                 .iter()
                 .map(|cost| cost.stats_word1)
+                .sum::<u64>();
+            let agxps_analyzer_cost = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.analyzer_weighted_duration)
+                .sum::<u64>();
+            let agxps_analyzer_avg_duration_sum = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.analyzer_avg_duration_sum)
+                .sum::<u64>();
+            let agxps_analyzer_record_cliques = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.record_cliques)
                 .sum::<u64>();
             let agxps_trace_events = pipeline
                 .agxps_trace_costs
@@ -586,7 +898,7 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
             if shader_binary_cost > 0.0 {
                 metric_sources.push("xcode-shader-binary-cost".to_owned());
             }
-            if agxps_trace_cost > 0 {
+            if agxps_trace_cost > 0 || agxps_analyzer_cost > 0 {
                 metric_sources.push("agxps-timing-trace".to_owned());
             }
             if best_execution.is_some_and(|history| {
@@ -645,6 +957,14 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
                     .then(|| agxps_trace_cost as f64 * 100.0 / agxps_trace_cost_denominator as f64),
                 agxps_trace_events,
                 agxps_trace_matched_work_cliques,
+                agxps_analyzer_cost,
+                agxps_analyzer_cost_percent: (agxps_analyzer_cost_denominator > 0
+                    && agxps_analyzer_cost > 0)
+                    .then(|| {
+                        agxps_analyzer_cost as f64 * 100.0 / agxps_analyzer_cost_denominator as f64
+                    }),
+                agxps_analyzer_avg_duration_sum,
+                agxps_analyzer_record_cliques,
                 execution_top_cost_percent: best_execution
                     .map(|history| history.top_cost_percentage),
                 execution_duration_percent: best_execution
@@ -705,13 +1025,31 @@ pub fn format_analysis_report(report: &XcodeMioAnalysisReport) -> String {
         report.timings.cost_timeline_decode_ms,
         report.timings.final_metadata_ms,
     ));
+    if report
+        .top_pipelines
+        .iter()
+        .any(|pipeline| pipeline.agxps_analyzer_cost_percent.is_some())
+    {
+        out.push_str(
+            "AGX Ana % uses analyzer-weighted clique duration; AGX W1 % uses instruction-stats word1. They are candidate metrics, not exact Xcode UI parity on the validated non-synthetic trace.\n\n",
+        );
+    }
     out.push_str(&format!(
-        "{:<42} {:>5} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8}\n",
-        "Function", "Cmds", "Cmd %", "Bins", "ExecBin", "AGXPS %", "Time %", "TL Cost", "Exec %"
+        "{:<42} {:>5} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8}\n",
+        "Function",
+        "Cmds",
+        "Cmd %",
+        "Bins",
+        "ExecBin",
+        "AGX Ana",
+        "AGX W1",
+        "Time %",
+        "TL Cost",
+        "Exec %"
     ));
     for pipeline in report.top_pipelines.iter().take(25) {
         out.push_str(&format!(
-            "{:<42} {:>5} {:>6.2}% {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
+            "{:<42} {:>5} {:>6.2}% {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
             truncate(
                 pipeline
                     .function_name
@@ -723,6 +1061,7 @@ pub fn format_analysis_report(report: &XcodeMioAnalysisReport) -> String {
             pipeline.command_percent,
             pipeline.unique_timeline_binary_count,
             pipeline.executable_shader_binary_reference_count,
+            format_optional_percent(pipeline.agxps_analyzer_cost_percent),
             format_optional_percent(pipeline.agxps_trace_cost_percent),
             format_optional_percent(pipeline.xcode_time_percent),
             format_optional_percent(pipeline.timeline_cost_percent),
@@ -745,6 +1084,7 @@ fn elapsed_ms(start: Instant) -> f64 {
 fn pipeline_rank_score(pipeline: &XcodeMioPipelineAnalysis) -> f64 {
     [
         pipeline.execution_top_cost_percent,
+        pipeline.agxps_analyzer_cost_percent,
         pipeline.agxps_trace_cost_percent,
         pipeline.shader_profiler_cost_percent,
         pipeline.timeline_cost_percent,
@@ -838,6 +1178,22 @@ pub fn format_report(report: &XcodeMioReport) -> String {
             report.shader_binary_info.len()
         ));
     }
+    if !report.encoders.is_empty() {
+        out.push_str("MIO encoders:\n");
+        out.push_str("  idx function_index start_cmd commands load_time store_time\n");
+        for encoder in report.encoders.iter().take(16) {
+            out.push_str(&format!(
+                "  {idx:>3} {function_index:>14} {start:>9} {commands:>8} {load:>9} {store:>10}\n",
+                idx = encoder.index,
+                function_index = encoder.function_index,
+                start = encoder.gpu_command_start_index,
+                commands = encoder.gpu_command_count,
+                load = encoder.load_time,
+                store = encoder.store_time,
+            ));
+        }
+        out.push('\n');
+    }
     let mut binary_references = report
         .pipelines
         .iter()
@@ -922,6 +1278,507 @@ pub fn format_report(report: &XcodeMioReport) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("  {:<56} {}\n", name, counters));
+        }
+        out.push('\n');
+    }
+    if !report.gpu_command_counter_rows.is_empty() {
+        out.push_str("GPU command counters from Xcode non-overlapping counters:\n");
+        out.push_str(
+            "  cmd sub  execution_cost  invocations  alu_instructions  alu_float% function                 nonzero_internal_counters\n",
+        );
+        for row in report.gpu_command_counter_rows.iter().take(80) {
+            let name = row.function_name.as_deref().unwrap_or("<unknown>");
+            let execution_cost = counter_value(row, "Execution Cost");
+            let invocations = counter_value(row, "Kernel Invocations");
+            let alu_instructions = counter_value(row, "Kernel ALU Instructions");
+            let alu_float = counter_value(row, "Kernel ALU Float Instructions");
+            let internal_counters = row
+                .counters
+                .iter()
+                .take(4)
+                .map(|counter| format!("{}={:.3}", counter.name, counter.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "  {cmd:>3} {sub:>3} {cost:>14} {invocations:>12} {alu:>17} {float_pct:>10} {name:<24} {internal_counters}\n",
+                cmd = row.command_index,
+                sub = row.sub_command_index,
+                cost = format_optional_counter(execution_cost, 3),
+                invocations = format_optional_counter(invocations, 0),
+                alu = format_optional_counter(alu_instructions, 0),
+                float_pct = format_optional_counter(alu_float, 2),
+            ));
+        }
+        out.push_str("  note: these names are Xcode's internal draw counters. The public Compute Kernel display columns above are not populated through this object on raw-directory profiles.\n");
+        out.push('\n');
+    }
+    if !report.top_draw_tracks.is_empty() {
+        let mut rows = report.top_draw_tracks.iter().collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .trace_duration_ns
+                .max(right.duration_ns)
+                .cmp(&left.trace_duration_ns.max(left.duration_ns))
+                .then_with(|| left.source.cmp(right.source))
+                .then_with(|| left.track_index.cmp(&right.track_index))
+                .then_with(|| left.trace_index.cmp(&right.trace_index))
+        });
+        let total_ns = best_top_draw_track_rows(rows.iter().copied())
+            .iter()
+            .map(|row| row.trace_duration_ns.max(row.duration_ns))
+            .sum::<u64>();
+        out.push_str("Top draw tracks from GTMioTraceDataHelper.generateTopDrawTracks:\n");
+        out.push_str(
+            "  src                    track trace cmd   normalized% duration trace_duration raw0 raw1 raw2 raw3 function\n",
+        );
+        for row in rows.into_iter().take(80) {
+            let duration_ns = row.trace_duration_ns.max(row.duration_ns);
+            let pct = percent_u64(duration_ns, total_ns);
+            let cmd = row
+                .command_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let name = row.function_name.as_deref().unwrap_or("<unknown>");
+            out.push_str(&format!(
+                "  {source:<22} {track:>5} {trace:>5} {cmd:>4} {pct:>10.4}% {duration:>10} {trace_duration:>14} {raw0:>10} {raw1:>10} {raw2:>5} {raw3:>4} {name}\n",
+                source = row.source,
+                track = row.track_index,
+                trace = row.trace_index,
+                duration = format_duration_ns(duration_ns),
+                trace_duration = format_duration_ns(row.trace_duration_ns),
+                raw0 = row.trace_raw0,
+                raw1 = row.trace_raw1,
+                raw2 = row.trace_raw2,
+                raw3 = row.trace_raw3,
+            ));
+        }
+        out.push('\n');
+    }
+    if !report.gpu_command_function_times.is_empty() {
+        out.push_str("GPU command function times from Xcode durationForDraw:dataMaster:\n");
+        let mut by_source =
+            std::collections::BTreeMap::<&'static str, Vec<&XcodeMioGpuCommandFunctionTime>>::new();
+        for row in &report.gpu_command_function_times {
+            by_source.entry(row.source).or_default().push(row);
+        }
+        let mut source_totals = std::collections::BTreeMap::new();
+        for (source, rows) in &by_source {
+            let best_rows = best_function_time_rows(rows.iter().copied());
+            let total_ns = best_rows.iter().map(|row| row.duration_ns).sum::<u64>();
+            source_totals.insert(*source, total_ns);
+            out.push_str(&format!(
+                "  source={source:<23} rows={:<4} commands={:<4} total={}\n",
+                rows.len(),
+                best_rows.len(),
+                format_duration_ns(total_ns),
+            ));
+
+            let mut pipeline_totals =
+                std::collections::BTreeMap::<usize, (u64, usize, Option<String>)>::new();
+            for row in best_rows {
+                let entry = pipeline_totals
+                    .entry(row.pipeline_index)
+                    .or_insert_with(|| (0, 0, row.function_name.clone()));
+                entry.0 = entry.0.saturating_add(row.duration_ns);
+                entry.1 += 1;
+            }
+            let mut pipeline_totals = pipeline_totals.into_iter().collect::<Vec<_>>();
+            pipeline_totals
+                .sort_by(|left, right| right.1.0.cmp(&left.1.0).then_with(|| left.0.cmp(&right.0)));
+            for (_, (duration_ns, command_count, function_name)) in pipeline_totals.iter().take(8) {
+                let pct = percent_u64(*duration_ns, total_ns);
+                let name = function_name.as_deref().unwrap_or("<unknown function>");
+                out.push_str(&format!(
+                    "    {:>7.3}% {:>10} cmds={:<4} {}\n",
+                    pct,
+                    format_duration_ns(*duration_ns),
+                    command_count,
+                    truncate(name, 56),
+                ));
+            }
+        }
+        out.push_str("  rows: source cmd draw dm duration normalized% function\n");
+        for row in report.gpu_command_function_times.iter().take(80) {
+            let total_ns = source_totals.get(row.source).copied().unwrap_or(0);
+            let pct = percent_u64(row.duration_ns, total_ns);
+            let name = row.function_name.as_deref().unwrap_or("<unknown>");
+            out.push_str(&format!(
+                "  {source:<23} {cmd:>4} {draw:>5} {dm:>2} {duration:>10} {pct:>10.4}% {name}\n",
+                source = row.source,
+                cmd = row.command_index,
+                draw = row.draw_index,
+                dm = row.data_master,
+                duration = format_duration_ns(row.duration_ns),
+            ));
+        }
+        out.push('\n');
+    }
+    if !report.gpu_command_function_time_probes.is_empty() {
+        out.push_str("GPU command function-time probes:\n");
+        out.push_str(
+            "  src                       kind     id_kind                    id pipe enc reported enum samples                       best_draw dm best_duration kick_duration function\n",
+        );
+        let mut probes = report
+            .gpu_command_function_time_probes
+            .iter()
+            .collect::<Vec<_>>();
+        probes.sort_by(|left, right| {
+            right
+                .best_duration_ns
+                .cmp(&left.best_duration_ns)
+                .then_with(|| right.kick_duration_ns.cmp(&left.kick_duration_ns))
+                .then_with(|| right.reported_draw_count.cmp(&left.reported_draw_count))
+                .then_with(|| right.enumerated_draw_count.cmp(&left.enumerated_draw_count))
+                .then_with(|| left.source.cmp(right.source))
+                .then_with(|| left.target_kind.cmp(right.target_kind))
+                .then_with(|| left.target_id.cmp(&right.target_id))
+        });
+        for probe in probes.iter().take(120) {
+            let name = probe.function_name.as_deref().unwrap_or("-");
+            let pipeline = probe
+                .pipeline_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let encoder = probe
+                .encoder_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let best_draw = probe
+                .best_draw_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let best_data_master = probe
+                .best_data_master
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let samples = format_u32_samples(&probe.sampled_draws, 8);
+            out.push_str(&format!(
+                "  {source:<25} {kind:<8} {id_kind:<24} {id:>6} {pipe:>4} {enc:>3} {reported:>8} {enumerated:>4} {samples:<29} {best_draw:>9} {dm:>2} {best:>13} {kick:>13} {name}\n",
+                source = probe.source,
+                kind = probe.target_kind,
+                id_kind = probe.target_id_kind,
+                id = probe.target_id,
+                pipe = pipeline,
+                enc = encoder,
+                reported = probe.reported_draw_count,
+                enumerated = probe.enumerated_draw_count,
+                samples = samples,
+                dm = best_data_master,
+                best = format_duration_ns(probe.best_duration_ns),
+                kick = format_duration_ns(probe.kick_duration_ns),
+            ));
+        }
+        out.push('\n');
+    }
+    if !report.draw_array_probes.is_empty() {
+        out.push_str("MIO raw draw-array probes:\n");
+        out.push_str(
+            "  src                       idx_kind       arr_idx  cmd  fn_idx sub enc pipe trace_duration trace0        trace1        t2  dm meta0 meta7 function\n",
+        );
+        let mut probes = report.draw_array_probes.iter().collect::<Vec<_>>();
+        probes.sort_by(|left, right| {
+            left.command_index
+                .cmp(&right.command_index)
+                .then_with(|| left.source.cmp(right.source))
+                .then_with(|| left.array_index_kind.cmp(right.array_index_kind))
+                .then_with(|| left.array_index.cmp(&right.array_index))
+        });
+        for probe in probes.iter().take(500) {
+            let name = probe.function_name.as_deref().unwrap_or("-");
+            out.push_str(&format!(
+                "  {source:<25} {idx_kind:<14} {arr_idx:>7} {cmd:>4} {fn_idx:>7} {sub:>3} {enc:>3} {pipe:>4} {duration:>14} {trace0:>12} {trace1:>12} {t2:>3} {dm:>3} {meta0:>5} {meta7:>5} {name}\n",
+                source = probe.source,
+                idx_kind = probe.array_index_kind,
+                arr_idx = probe.array_index,
+                cmd = probe.command_index,
+                fn_idx = probe.function_index,
+                sub = probe.sub_command_index,
+                enc = probe.encoder_index,
+                pipe = probe.pipeline_index,
+                duration = format_duration_ns(probe.trace_duration_ns),
+                trace0 = probe.trace_raw0,
+                trace1 = probe.trace_raw1,
+                t2 = probe.trace_raw2,
+                dm = probe.trace_raw3,
+                meta0 = probe.metadata_raw0,
+                meta7 = probe.metadata_raw7,
+            ));
+        }
+        out.push('\n');
+    }
+    if !report.usc_clique_summaries.is_empty() {
+        out.push_str("MIO USC clique inventory:\n");
+        out.push_str(
+            "  src                       usc usc_count clique_count cliques enum_by_fn sample_duration sample0      sample1      u32_fields                              u16_fields\n",
+        );
+        for summary in report.usc_clique_summaries.iter().take(80) {
+            let usc = summary
+                .usc_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let u32_fields = format_u32_samples(&summary.sample_u32_fields, 14);
+            let u16_fields = format_u16_samples(&summary.sample_u16_fields, 3);
+            out.push_str(&format!(
+                "  {source:<25} {usc:>3} {usc_count:>9} {clique_count:>12} {has_cliques:>7} {has_enum:>10} {duration:>15} {raw0:>12} {raw1:>12} {u32_fields:<39} {u16_fields}\n",
+                source = summary.source,
+                usc_count = summary.usc_count,
+                clique_count = summary.clique_count,
+                has_cliques = summary.has_cliques,
+                has_enum = summary.has_enumerate_kick_cliques_by_function,
+                duration = format_duration_ns(summary.sample_duration_ns),
+                raw0 = summary.sample_raw0,
+                raw1 = summary.sample_raw1,
+            ));
+        }
+        out.push('\n');
+    }
+    if !report.usc_clique_probes.is_empty() {
+        out.push_str("MIO USC clique candidate timings:\n");
+        out.push_str(
+            "  src                       usc field  dm match          value  cmd  fn_idx sub enc pipe cliques sum_duration span_duration min       max       first  last   sample0      sample1      u32_fields                              u16_fields function\n",
+        );
+        let mut probes = report.usc_clique_probes.iter().collect::<Vec<_>>();
+        probes.sort_by(|left, right| {
+            left.command_index
+                .cmp(&right.command_index)
+                .then_with(|| right.duration_sum_ns.cmp(&left.duration_sum_ns))
+                .then_with(|| left.source.cmp(right.source))
+                .then_with(|| left.usc_index.cmp(&right.usc_index))
+                .then_with(|| left.field_index.cmp(&right.field_index))
+                .then_with(|| left.match_kind.cmp(right.match_kind))
+        });
+        for probe in probes.iter().take(500) {
+            let name = probe.function_name.as_deref().unwrap_or("-");
+            let u32_fields = format_u32_samples(&probe.sample_u32_fields, 14);
+            let u16_fields = format_u16_samples(&probe.sample_u16_fields, 3);
+            let data_master = probe
+                .data_master
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            out.push_str(&format!(
+                "  {source:<25} {usc:>3} r{field:<3} {dm:>2} {kind:<14} {value:>6} {cmd:>4} {fn_idx:>7} {sub:>3} {enc:>3} {pipe:>4} {cliques:>7} {sum:>12} {span:>13} {min:>9} {max:>9} {first:>6} {last:>6} {raw0:>12} {raw1:>12} {u32_fields:<39} {u16_fields:<10} {name}\n",
+                source = probe.source,
+                usc = probe.usc_index,
+                field = probe.field_index,
+                dm = data_master,
+                kind = probe.match_kind,
+                value = probe.matched_value,
+                cmd = probe.command_index,
+                fn_idx = probe.function_index,
+                sub = probe.sub_command_index,
+                enc = probe.encoder_index,
+                pipe = probe.pipeline_index,
+                cliques = probe.clique_count,
+                sum = format_duration_ns(probe.duration_sum_ns),
+                span = format_duration_ns(probe.span_duration_ns),
+                min = format_duration_ns(probe.min_duration_ns),
+                max = format_duration_ns(probe.max_duration_ns),
+                first = probe.first_clique_index,
+                last = probe.last_clique_index,
+                raw0 = probe.sample_raw0,
+                raw1 = probe.sample_raw1,
+            ));
+        }
+        out.push('\n');
+    }
+    if !report.encoder_quad_probes.is_empty() {
+        out.push_str("GTMioEncoderQuadData probes:\n");
+        out.push_str(
+            "  src                  mode              enc enc_fn pipe id_kind      id draw_kind draw     pt opt draws quads duration     min_ts     max_ts max_cost samples                       function\n",
+        );
+        let mut probes = report.encoder_quad_probes.iter().collect::<Vec<_>>();
+        probes.sort_by(|left, right| {
+            right
+                .duration_ns
+                .cmp(&left.duration_ns)
+                .then_with(|| right.draw_count.cmp(&left.draw_count))
+                .then_with(|| right.quad_count.cmp(&left.quad_count))
+                .then_with(|| left.source.cmp(right.source))
+                .then_with(|| left.mode.cmp(right.mode))
+                .then_with(|| {
+                    left.encoder_function_index
+                        .cmp(&right.encoder_function_index)
+                })
+        });
+        for probe in probes.iter().take(160) {
+            let encoder = probe
+                .encoder_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let pipeline = probe
+                .pipeline_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let pipeline_id_kind = probe.pipeline_id_kind.unwrap_or("-");
+            let pipeline_id = probe
+                .pipeline_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let draw_id_kind = probe.draw_id_kind.unwrap_or("-");
+            let draw_index = probe
+                .draw_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let samples = format_u32_samples(&probe.sampled_draws, 8);
+            let name = probe.function_name.as_deref().unwrap_or("-");
+            out.push_str(&format!(
+                "  {source:<20} {mode:<17} {enc:>3} {enc_fn:>6} {pipe:>4} {id_kind:<12} {id:>6} {draw_kind:<9} {draw:>5} {pt:>6} {opt:>3} {draws:>5} {quads:>5} {duration:>10} {min_ts:>10} {max_ts:>10} {max_cost:>8.3} {samples:<29} {name}\n",
+                source = probe.source,
+                mode = probe.mode,
+                enc = encoder,
+                enc_fn = probe.encoder_function_index,
+                pipe = pipeline,
+                id_kind = pipeline_id_kind,
+                id = pipeline_id,
+                draw_kind = draw_id_kind,
+                draw = draw_index,
+                pt = probe.program_type,
+                opt = probe.options,
+                draws = probe.draw_count,
+                quads = probe.quad_count,
+                duration = format_duration_ns(probe.duration_ns),
+                min_ts = probe.min_timestamp_ns,
+                max_ts = probe.max_timestamp_ns,
+                max_cost = probe.max_cost,
+                samples = samples,
+            ));
+        }
+        out.push('\n');
+    }
+    if !report.draw_execution_history_probes.is_empty() {
+        out.push_str("GTMioShaderExecutionHistory draw probes:\n");
+        out.push_str(
+            "  src                  mode             node             cmd  draw pipe style opt     pt generated duration   dur%   top% total_cost instr function\n",
+        );
+        let mut probes = report
+            .draw_execution_history_probes
+            .iter()
+            .collect::<Vec<_>>();
+        probes.sort_by(|left, right| {
+            right
+                .total_duration_ns
+                .cmp(&left.total_duration_ns)
+                .then_with(|| {
+                    right
+                        .duration_percentage
+                        .partial_cmp(&left.duration_percentage)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.command_index.cmp(&right.command_index))
+                .then_with(|| left.source.cmp(right.source))
+                .then_with(|| left.mode.cmp(right.mode))
+        });
+        for probe in probes.iter().take(160) {
+            let name = probe.function_name.as_deref().unwrap_or("-");
+            out.push_str(&format!(
+                "  {source:<20} {mode:<16} {node:<16} {cmd:>4} {draw:>5} {pipe:>4} {style:>5} {opt:>3} {pt:>6} {generated:>9} {duration:>10} {dur_pct:>6.2} {top_pct:>6.2} {cost:>10.3} {instr:>5} {name}\n",
+                source = probe.source,
+                mode = probe.mode,
+                node = probe.node_source,
+                cmd = probe.command_index,
+                draw = probe.draw_index,
+                pipe = probe.pipeline_index,
+                style = probe.style,
+                opt = probe.options,
+                pt = probe.program_type,
+                generated = probe.generated,
+                duration = format_duration_ns(probe.total_duration_ns),
+                dur_pct = probe.duration_percentage,
+                top_pct = probe.top_cost_percentage,
+                cost = probe.total_cost,
+                instr = probe.instruction_count,
+            ));
+        }
+        out.push('\n');
+    }
+    if !report.gpu_command_shader_profiler_costs.is_empty() {
+        let denominator = report
+            .gpu_command_shader_profiler_costs
+            .iter()
+            .map(|row| row.cost)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .sum::<f64>();
+        out.push_str("GPU commands by Xcode shader-profiler per-draw cost:\n");
+        out.push_str(
+            "  src       cmd draw sub   normalized%    private%       cost function                 key\n",
+        );
+        for row in report.gpu_command_shader_profiler_costs.iter().take(80) {
+            let normalized_percent = if denominator > 0.0 {
+                Some(row.cost * 100.0 / denominator)
+            } else {
+                None
+            };
+            let name = row.function_name.as_deref().unwrap_or("<unknown>");
+            out.push_str(&format!(
+                "  {source:<8} {cmd:>3} {draw:>4} {sub:>3} {norm:>12} {private:>10} {cost:>10.3} {name:<24} {key}\n",
+                source = row.source,
+                cmd = row.command_index,
+                draw = row.draw_index,
+                sub = row.sub_command_index,
+                norm = format_optional_percent(normalized_percent),
+                private = format_optional_percent(row.cost_percent),
+                cost = row.cost,
+                key = row.binary_key,
+            ));
+        }
+        out.push('\n');
+    }
+    if !report.gpu_command_direct_costs.is_empty() {
+        let denominator = report
+            .gpu_command_direct_costs
+            .iter()
+            .map(|row| row.cost)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .sum::<f64>();
+        out.push_str("GPU commands by direct trace-data per-draw cost:\n");
+        out.push_str(
+            "  src                    cmd sub   normalized%    private%       cost function\n",
+        );
+        let mut rows = report.gpu_command_direct_costs.iter().collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .cost
+                .partial_cmp(&left.cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.source.cmp(right.source))
+                .then_with(|| left.command_index.cmp(&right.command_index))
+        });
+        for row in rows.into_iter().take(80) {
+            let normalized_percent = if denominator > 0.0 {
+                Some(row.cost * 100.0 / denominator)
+            } else {
+                None
+            };
+            let name = row.function_name.as_deref().unwrap_or("<unknown>");
+            out.push_str(&format!(
+                "  {source:<22} {cmd:>3} {sub:>3} {norm:>12} {private:>10} {cost:>10.3} {name}\n",
+                source = row.source,
+                cmd = row.command_index,
+                sub = row.sub_command_index,
+                norm = format_optional_percent(normalized_percent),
+                private = format_optional_percent(row.cost_percent),
+                cost = row.cost,
+            ));
+        }
+        out.push('\n');
+    }
+    if !report.shader_profiler_numeric_arrays.is_empty() {
+        out.push_str("Private shader-profiler numeric arrays:\n");
+        for probe in &report.shader_profiler_numeric_arrays {
+            out.push_str(&format!("  {} rows={}\n", probe.source, probe.rows.len()));
+            for (row_index, row) in probe.rows.iter().enumerate().take(32) {
+                let values = row
+                    .iter()
+                    .take(24)
+                    .map(|value| format_private_numeric_value(*value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let suffix = if row.len() > 24 { ", ..." } else { "" };
+                out.push_str(&format!(
+                    "    row {row_index:>3} len={len:>4}: [{values}{suffix}]\n",
+                    len = row.len(),
+                ));
+            }
         }
         out.push('\n');
     }
@@ -1544,6 +2401,114 @@ fn percent_u64(value: u64, denominator: u64) -> f64 {
     }
 }
 
+fn counter_value(row: &XcodeMioGpuCommandCounterRow, name: &str) -> Option<f64> {
+    row.counters
+        .iter()
+        .find(|counter| counter.name == name)
+        .map(|counter| counter.value)
+}
+
+fn format_optional_counter(value: Option<f64>, precision: usize) -> String {
+    match value {
+        Some(value) if value.is_finite() => format!("{value:.precision$}"),
+        _ => "-".to_owned(),
+    }
+}
+
+fn best_function_time_rows<'a, I>(rows: I) -> Vec<&'a XcodeMioGpuCommandFunctionTime>
+where
+    I: IntoIterator<Item = &'a XcodeMioGpuCommandFunctionTime>,
+{
+    let mut by_command =
+        std::collections::BTreeMap::<usize, &XcodeMioGpuCommandFunctionTime>::new();
+    for row in rows {
+        by_command
+            .entry(row.command_index)
+            .and_modify(|existing| {
+                if row.duration_ns > existing.duration_ns {
+                    *existing = row;
+                }
+            })
+            .or_insert(row);
+    }
+    by_command.into_values().collect()
+}
+
+fn best_top_draw_track_rows<'a, I>(rows: I) -> Vec<&'a XcodeMioTopDrawTrack>
+where
+    I: IntoIterator<Item = &'a XcodeMioTopDrawTrack>,
+{
+    let mut by_command = std::collections::BTreeMap::<usize, &XcodeMioTopDrawTrack>::new();
+    for row in rows {
+        let Some(command_index) = row.command_index else {
+            continue;
+        };
+        by_command
+            .entry(command_index)
+            .and_modify(|existing| {
+                let duration = row.trace_duration_ns.max(row.duration_ns);
+                let existing_duration = existing.trace_duration_ns.max(existing.duration_ns);
+                if duration > existing_duration {
+                    *existing = row;
+                }
+            })
+            .or_insert(row);
+    }
+    by_command.into_values().collect()
+}
+
+fn format_duration_ns(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.3} ms", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.3} us", value as f64 / 1_000.0)
+    } else {
+        format!("{value} ns")
+    }
+}
+
+fn format_u32_samples(values: &[u32], limit: usize) -> String {
+    if values.is_empty() {
+        return "-".to_owned();
+    }
+    let mut out = values
+        .iter()
+        .take(limit)
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    if values.len() > limit {
+        out.push_str(",...");
+    }
+    out
+}
+
+fn format_u16_samples(values: &[u16], limit: usize) -> String {
+    if values.is_empty() {
+        return "-".to_owned();
+    }
+    let mut out = values
+        .iter()
+        .take(limit)
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    if values.len() > limit {
+        out.push_str(",...");
+    }
+    out
+}
+
+fn format_private_numeric_value(value: f64) -> String {
+    if !value.is_finite() {
+        value.to_string()
+    } else if value.abs() >= 1000.0 || value.fract().abs() < 0.000_001 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.6}")
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1555,15 +2520,19 @@ mod platform {
     use std::time::{Duration, Instant};
 
     use super::{
-        XcodeMioBinaryTrace, XcodeMioCostTimeline, XcodeMioDecodedCostRecord,
-        XcodeMioDrawMetadataRecord, XcodeMioDrawTimelineRecord, XcodeMioGpuCommand,
-        XcodeMioPipeline, XcodeMioPipelineAgxpsTraceCost, XcodeMioPipelineCounter,
-        XcodeMioPipelineExecutionHistory, XcodeMioPipelineProfilerTiming,
+        XcodeMioBinaryTrace, XcodeMioCostTimeline, XcodeMioDecodeOptions,
+        XcodeMioDecodedCostRecord, XcodeMioDrawArrayProbe, XcodeMioDrawExecutionHistoryProbe,
+        XcodeMioDrawMetadataRecord, XcodeMioDrawTimelineRecord, XcodeMioEncoder,
+        XcodeMioEncoderQuadProbe, XcodeMioFunctionTimeProbe, XcodeMioGpuCommand,
+        XcodeMioGpuCommandCounterRow, XcodeMioGpuCommandDirectCost, XcodeMioGpuCommandFunctionTime,
+        XcodeMioGpuCommandShaderProfilerCost, XcodeMioPipeline, XcodeMioPipelineAgxpsTraceCost,
+        XcodeMioPipelineCounter, XcodeMioPipelineExecutionHistory, XcodeMioPipelineProfilerTiming,
         XcodeMioPipelineScopeCost, XcodeMioPipelineShaderBinary, XcodeMioPipelineShaderBinaryCost,
         XcodeMioPipelineShaderBinaryReference, XcodeMioPipelineShaderProfilerCost,
-        XcodeMioPipelineShaderStat, XcodeMioPipelineShaderTrack, XcodeMioReport,
-        XcodeMioShaderBinaryInfo, XcodeMioTimelineBinary, XcodeMioTimelineCandidate,
-        XcodeMioTimings, elapsed_ms,
+        XcodeMioPipelineShaderStat, XcodeMioPipelineShaderTrack, XcodeMioPrivateNumericArray,
+        XcodeMioReport, XcodeMioShaderBinaryInfo, XcodeMioTimelineBinary,
+        XcodeMioTimelineCandidate, XcodeMioTimings, XcodeMioTopDrawTrack, XcodeMioUSCCliqueProbe,
+        XcodeMioUSCCliqueSummary, elapsed_ms,
     };
     use crate::error::{Error, Result};
     use crate::profiler;
@@ -1572,6 +2541,7 @@ mod platform {
     type Id = *mut c_void;
     type Class = *mut c_void;
     type Sel = *mut c_void;
+    type Ivar = *mut c_void;
     type CfTypeRef = *const c_void;
     type CfStringRef = *const c_void;
 
@@ -1588,6 +2558,10 @@ mod platform {
         fn dup2(src: c_int, dst: c_int) -> c_int;
         fn close(fd: c_int) -> c_int;
         fn objc_lookUpClass(name: *const c_char) -> Class;
+        fn object_getClass(obj: Id) -> Class;
+        fn class_getInstanceVariable(cls: Class, name: *const c_char) -> Ivar;
+        fn ivar_getTypeEncoding(ivar: Ivar) -> *const c_char;
+        fn object_getIvar(obj: Id, ivar: Ivar) -> Id;
         fn sel_registerName(name: *const c_char) -> Sel;
         fn objc_msgSend();
         fn CFStringCreateWithCString(
@@ -1610,6 +2584,7 @@ mod platform {
         stream_data_path: PathBuf,
         profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
         mut timings: XcodeMioTimings,
+        options: XcodeMioDecodeOptions,
     ) -> Result<XcodeMioReport> {
         let framework_path = PathBuf::from(GT_SHADER_PROFILER_FRAMEWORK);
         let silence = FdSilencer::new();
@@ -1720,15 +2695,33 @@ mod platform {
                 function_name,
             });
         }
+
+        let mut decoded_encoders = Vec::with_capacity(encoder_count);
+        for index in 0..encoder_count {
+            let encoder = unsafe { runtime.array_object(encoders, index)? };
+            decoded_encoders.push(XcodeMioEncoder {
+                index,
+                function_index: unsafe { runtime.send_u64(encoder, "functionIndex")? },
+                gpu_command_start_index: unsafe {
+                    runtime.send_u32(encoder, "gpuCommandStartIndex")? as usize
+                },
+                gpu_command_count: unsafe { runtime.send_u32(encoder, "numGPUCommands")? as usize },
+                load_time: unsafe { runtime.send_u64(encoder, "loadTime")? },
+                store_time: unsafe { runtime.send_u64(encoder, "storeTime")? },
+            });
+        }
         timings.decode_pipeline_commands_ms = elapsed_ms(topology_start);
 
         let mut warnings = Vec::new();
+        let mut gpu_command_shader_profiler_costs = Vec::new();
         let shader_probe_start = Instant::now();
         if let Err(error) = unsafe {
             runtime.decode_shader_profiler_costs(
+                "processor",
                 shader_result,
                 &decoded_commands,
                 &mut decoded_pipelines,
+                &mut gpu_command_shader_profiler_costs,
             )
         } {
             warnings.push(format!(
@@ -1742,8 +2735,14 @@ mod platform {
                 "private shader-profiler timingInfo probe failed: {error}"
             ));
         }
+        let mut shader_profiler_numeric_arrays = Vec::new();
+        unsafe {
+            push_parent_processor_numeric_probes(&mut shader_profiler_numeric_arrays, processor);
+        }
         match unsafe { runtime.direct_shader_profiler_result(stream) } {
-            Ok(direct_shader_result) => {
+            Ok(direct) => {
+                let direct_shader_result = direct.shader_result;
+                shader_profiler_numeric_arrays.extend(direct.numeric_arrays);
                 if let Err(error) = unsafe {
                     runtime.merge_shader_profiler_pipeline_state_data(
                         direct_shader_result,
@@ -1766,9 +2765,11 @@ mod platform {
                 }
                 if let Err(error) = unsafe {
                     runtime.decode_shader_profiler_costs(
+                        "direct",
                         direct_shader_result,
                         &decoded_commands,
                         &mut decoded_pipelines,
+                        &mut gpu_command_shader_profiler_costs,
                     )
                 } {
                     warnings.push(format!("direct shader-profiler cost probe failed: {error}"));
@@ -1778,6 +2779,13 @@ mod platform {
                 warnings.push(format!("direct shader-profiler processor failed: {error}"));
             }
         }
+        gpu_command_shader_profiler_costs.sort_by(|left, right| {
+            left.source
+                .cmp(right.source)
+                .then_with(|| left.draw_index.cmp(&right.draw_index))
+                .then_with(|| left.command_index.cmp(&right.command_index))
+                .then_with(|| left.binary_key.cmp(&right.binary_key))
+        });
         timings.shader_profiler_probe_ms = elapsed_ms(shader_probe_start);
         let cost_request_start = Instant::now();
         let (cost_timeline, cost_timeline_object) =
@@ -1801,6 +2809,7 @@ mod platform {
         let mut timeline_binaries = Vec::new();
         let mut timeline_pipeline_state_ids = Vec::new();
         let mut shader_binary_info = Vec::new();
+        let mut gpu_command_counter_rows = Vec::new();
         if let Some(timeline) = cost_timeline_object {
             let cost_decode_start = Instant::now();
             timeline_binary_count = unsafe { runtime.timeline_binary_count(timeline) };
@@ -1819,36 +2828,97 @@ mod platform {
             {
                 warnings.push(format!("AGXPS timing-trace probe failed: {error}"));
             }
-            decoded_cost_records = unsafe { runtime.decode_timeline_cost_records(timeline) };
-            draw_timeline_records = unsafe { runtime.decode_draw_timeline_records(timeline) };
-            draw_metadata_records = unsafe { runtime.decode_draw_metadata_records(timeline) };
-            unsafe {
-                runtime.decode_pipeline_draw_timeline(
-                    mio,
-                    timeline,
-                    &draw_timeline_records,
-                    &draw_metadata_records,
-                    &decoded_commands,
-                    &mut decoded_pipelines,
-                )
-            };
-            if let Err(error) = unsafe {
-                runtime.decode_pipeline_private_costs(
-                    mio,
-                    timeline,
-                    &decoded_cost_records,
-                    &mut decoded_pipelines,
-                    &timeline_pipeline_state_ids,
-                )
-            } {
-                warnings.push(format!("private per-pipeline cost probe failed: {error}"));
-            }
-            if let Err(error) =
-                unsafe { runtime.decode_pipeline_counters(mio, &mut decoded_pipelines) }
-            {
-                warnings.push(format!("private pipeline counter probe failed: {error}"));
+            if options.decode_cost_details {
+                decoded_cost_records = unsafe { runtime.decode_timeline_cost_records(timeline) };
+                draw_timeline_records = unsafe { runtime.decode_draw_timeline_records(timeline) };
+                draw_metadata_records = unsafe { runtime.decode_draw_metadata_records(timeline) };
+                unsafe {
+                    runtime.decode_pipeline_draw_timeline(
+                        mio,
+                        timeline,
+                        &draw_timeline_records,
+                        &draw_metadata_records,
+                        &decoded_commands,
+                        &mut decoded_pipelines,
+                    )
+                };
+                if let Err(error) = unsafe {
+                    runtime.decode_pipeline_private_costs(
+                        mio,
+                        timeline,
+                        &decoded_cost_records,
+                        &mut decoded_pipelines,
+                        &timeline_pipeline_state_ids,
+                    )
+                } {
+                    warnings.push(format!("private per-pipeline cost probe failed: {error}"));
+                }
+                if let Err(error) =
+                    unsafe { runtime.decode_pipeline_counters(mio, &mut decoded_pipelines) }
+                {
+                    warnings.push(format!("private pipeline counter probe failed: {error}"));
+                }
             }
             timings.cost_timeline_decode_ms = elapsed_ms(cost_decode_start);
+        }
+        let (gpu_command_function_times, gpu_command_function_time_probes) = unsafe {
+            runtime.decode_gpu_command_function_times(
+                mio,
+                cost_timeline_object,
+                &decoded_pipelines,
+                &decoded_encoders,
+                &decoded_commands,
+                &timeline_pipeline_state_ids,
+            )
+        };
+        let gpu_command_direct_costs = unsafe {
+            runtime.decode_gpu_command_direct_costs(mio, cost_timeline_object, &decoded_commands)
+        };
+        let draw_array_probes = unsafe {
+            runtime.decode_draw_array_probes(
+                mio,
+                cost_timeline_object,
+                &decoded_pipelines,
+                &decoded_commands,
+            )
+        };
+        let usc_clique_summaries =
+            unsafe { runtime.decode_usc_clique_summaries(mio, cost_timeline_object) };
+        let usc_clique_probes = unsafe {
+            runtime.decode_usc_clique_probes(
+                mio,
+                cost_timeline_object,
+                &decoded_pipelines,
+                &decoded_commands,
+            )
+        };
+        let encoder_quad_probes = unsafe {
+            runtime.decode_encoder_quad_probes(
+                mio,
+                cost_timeline_object,
+                &decoded_pipelines,
+                &decoded_encoders,
+                &decoded_commands,
+                &timeline_pipeline_state_ids,
+            )
+        };
+        let draw_execution_history_probes = unsafe {
+            runtime.decode_draw_execution_history_probes(
+                mio,
+                cost_timeline_object,
+                &decoded_pipelines,
+                &decoded_commands,
+            )
+        };
+        let top_draw_tracks =
+            unsafe { runtime.decode_top_draw_tracks(mio, cost_timeline_object, &decoded_commands) };
+        if options.decode_cost_details {
+            match unsafe { runtime.decode_gpu_command_counters(mio, &decoded_commands) } {
+                Ok(rows) => gpu_command_counter_rows = rows,
+                Err(error) => {
+                    warnings.push(format!("private GPU command counter probe failed: {error}"))
+                }
+            }
         }
         if profiler_summary.is_some_and(|summary| summary.num_gpu_commands != command_count) {
             warnings.push("private MIO command count differs from streamData summary".to_owned());
@@ -1888,7 +2958,20 @@ mod platform {
             draw_timeline_records,
             draw_metadata_records,
             pipelines: decoded_pipelines,
+            encoders: decoded_encoders,
             gpu_commands: decoded_commands,
+            gpu_command_function_times,
+            gpu_command_function_time_probes,
+            draw_array_probes,
+            usc_clique_summaries,
+            usc_clique_probes,
+            encoder_quad_probes,
+            draw_execution_history_probes,
+            top_draw_tracks,
+            gpu_command_direct_costs,
+            gpu_command_shader_profiler_costs,
+            gpu_command_counter_rows,
+            shader_profiler_numeric_arrays,
             warnings,
         };
         drop(runtime);
@@ -1899,6 +2982,28 @@ mod platform {
 
     struct Runtime {
         pool: Id,
+    }
+
+    struct DirectShaderProfilerResult {
+        shader_result: Id,
+        numeric_arrays: Vec<XcodeMioPrivateNumericArray>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct EnumFunctionTimeSources {
+        object_id: &'static str,
+        pointer_id: &'static str,
+        function_index: &'static str,
+        pipeline_index: &'static str,
+    }
+
+    #[derive(Clone, Copy)]
+    struct FunctionTimeTraceDataSource {
+        object: Id,
+        source: &'static str,
+        function_index_source: &'static str,
+        command_index_source: &'static str,
+        pipeline_sources: EnumFunctionTimeSources,
     }
 
     impl Runtime {
@@ -1938,7 +3043,10 @@ mod platform {
             }
         }
 
-        unsafe fn direct_shader_profiler_result(&mut self, stream: Id) -> Result<Id> {
+        unsafe fn direct_shader_profiler_result(
+            &mut self,
+            stream: Id,
+        ) -> Result<DirectShaderProfilerResult> {
             unsafe {
                 let processor_class = lookup_class("GTAGX2StreamDataShaderProfilerProcessor")?;
                 let processor = send_id(processor_class, "alloc")?;
@@ -1950,7 +3058,48 @@ mod platform {
                 if responds_to_selector(processor, "waitUntilBatchIDCounterFinished") {
                     let _ = send_void(processor, "waitUntilBatchIDCounterFinished");
                 }
-                send_id(processor, "shaderProfilerResult")
+                if responds_to_selector(processor, "processBatchIDFilteringData") {
+                    let _ = send_void(processor, "processBatchIDFilteringData");
+                }
+                if responds_to_selector(processor, "waitUntilBatchIDCounterFinished") {
+                    let _ = send_void(processor, "waitUntilBatchIDCounterFinished");
+                }
+                let mut numeric_arrays = Vec::new();
+                push_numeric_ivar_probe(
+                    &mut numeric_arrays,
+                    processor,
+                    "_effectivePerEncoderDrawKickTimes",
+                    "processor._effectivePerEncoderDrawKickTimes",
+                );
+                push_numeric_ivar_probe(
+                    &mut numeric_arrays,
+                    processor,
+                    "_shaderProfilerFrameTimes",
+                    "processor._shaderProfilerFrameTimes",
+                );
+                if let Some(shader_profiler) =
+                    object_ivar_assume_object(processor, "_shaderProfiler")
+                {
+                    if responds_to_selector(shader_profiler, "updatePerDrawCounters") {
+                        let _ = send_void(shader_profiler, "updatePerDrawCounters");
+                    }
+                    push_numeric_array_probe(
+                        &mut numeric_arrays,
+                        shader_profiler,
+                        "effectiveKickTimes",
+                        "shader_profiler.effectiveKickTimes",
+                    );
+                    push_numeric_array_probe(
+                        &mut numeric_arrays,
+                        shader_profiler,
+                        "averagePerDrawKickDurations",
+                        "shader_profiler.averagePerDrawKickDurations",
+                    );
+                }
+                Ok(DirectShaderProfilerResult {
+                    shader_result: send_id(processor, "shaderProfilerResult")?,
+                    numeric_arrays,
+                })
             }
         }
 
@@ -2179,9 +3328,11 @@ mod platform {
 
         unsafe fn decode_shader_profiler_costs(
             &mut self,
+            source: &'static str,
             shader_result: Id,
             gpu_commands: &[XcodeMioGpuCommand],
             pipelines: &mut [XcodeMioPipeline],
+            gpu_command_costs: &mut Vec<XcodeMioGpuCommandShaderProfilerCost>,
         ) -> Result<()> {
             unsafe {
                 let binaries = self.send_id_allow_nil(shader_result, "shaderBinaries")?;
@@ -2254,26 +3405,61 @@ mod platform {
                         responds_to_selector(binary, "costPercentageForDrawAtIndex:");
                     let mut by_pipeline =
                         BTreeMap::<usize, XcodeMioPipelineShaderProfilerCost>::new();
-                    for draw_index in 0..gpu_commands.len() {
-                        let cost = send_f64_u32(binary, "costForDrawAtIndex:", draw_index as u32)
-                            .unwrap_or(0.0);
-                        if !cost.is_finite() || cost <= 0.0 {
-                            continue;
+                    for command in gpu_commands {
+                        let mut candidates = Vec::with_capacity(2);
+                        if let Ok(command_index) = u32::try_from(command.index) {
+                            candidates.push(command_index);
                         }
-                        let Some(command) = gpu_commands.get(draw_index) else {
+                        if let Ok(function_index) = u32::try_from(command.function_index)
+                            && !candidates.contains(&function_index)
+                        {
+                            candidates.push(function_index);
+                        }
+                        let mut hit = None;
+                        for draw_index in candidates {
+                            let cost = send_f64_u32(binary, "costForDrawAtIndex:", draw_index)
+                                .unwrap_or(0.0);
+                            if !cost.is_finite() || cost <= 0.0 {
+                                continue;
+                            }
+                            let percent = if has_cost_percentage {
+                                send_f64_u32(binary, "costPercentageForDrawAtIndex:", draw_index)
+                                    .ok()
+                                    .filter(|value| value.is_finite() && *value > 0.0)
+                            } else {
+                                None
+                            };
+                            hit = Some((draw_index as usize, cost, percent));
+                            break;
+                        }
+                        let Some((draw_index, cost, percent)) = hit else {
                             continue;
                         };
-                        let percent = if has_cost_percentage {
-                            send_f64_u32(binary, "costPercentageForDrawAtIndex:", draw_index as u32)
-                                .unwrap_or(0.0)
-                        } else {
-                            0.0
-                        };
+                        gpu_command_costs.push(XcodeMioGpuCommandShaderProfilerCost {
+                            source,
+                            draw_index,
+                            command_index: command.index,
+                            function_index: command.function_index,
+                            sub_command_index: command.sub_command_index,
+                            encoder_index: command.encoder_index,
+                            pipeline_index: command.pipeline_index,
+                            function_name: command.function_name.clone(),
+                            binary_key: key.clone(),
+                            full_path: full_path.clone(),
+                            type_name: type_name.clone(),
+                            shader_type,
+                            addr_start,
+                            addr_end,
+                            total_binary_cost,
+                            total_binary_samples,
+                            cost,
+                            cost_percent: percent,
+                        });
                         by_pipeline
                             .entry(command.pipeline_index)
                             .and_modify(|entry| {
                                 entry.pipeline_cost += cost;
-                                if percent.is_finite() && percent > 0.0 {
+                                if let Some(percent) = percent {
                                     entry.pipeline_cost_percent_sum += percent;
                                 }
                                 entry.nonzero_draw_count += 1;
@@ -2290,11 +3476,7 @@ mod platform {
                                 total_binary_cost,
                                 total_binary_samples,
                                 pipeline_cost: cost,
-                                pipeline_cost_percent_sum: if percent.is_finite() && percent > 0.0 {
-                                    percent
-                                } else {
-                                    0.0
-                                },
+                                pipeline_cost_percent_sum: percent.unwrap_or(0.0),
                                 nonzero_draw_count: 1,
                                 first_draw_index: draw_index,
                                 last_draw_index: draw_index,
@@ -2491,6 +3673,1172 @@ mod platform {
                 }
             }
             Ok(())
+        }
+
+        unsafe fn decode_gpu_command_counters(
+            &mut self,
+            mio: Id,
+            gpu_commands: &[XcodeMioGpuCommand],
+        ) -> Result<Vec<XcodeMioGpuCommandCounterRow>> {
+            unsafe {
+                let counters = self.send_id_allow_nil(mio, "nonOverlappingCounters")?;
+                if counters.is_null() {
+                    return Ok(Vec::new());
+                }
+                let names = self.send_id_allow_nil(counters, "drawCounterNames")?;
+                if names.is_null() {
+                    return Ok(Vec::new());
+                }
+                let name_count = self.array_count(names)?;
+                let value_count = send_u64(counters, "numDrawCounters")? as usize;
+                let count = name_count.min(value_count);
+                let mut counter_names = Vec::with_capacity(count);
+                for index in 0..count {
+                    let name = self.array_object(names, index)?;
+                    counter_names.push(
+                        nsstring_to_string(name).unwrap_or_else(|| format!("draw_counter_{index}")),
+                    );
+                }
+
+                let mut rows = Vec::new();
+                for command in gpu_commands {
+                    let values = send_ptr_u64_i32(
+                        counters,
+                        "counterValuesForGPUCommandAtFunctionIndex:subCommandIndex:",
+                        command.function_index,
+                        command.sub_command_index,
+                    )?;
+                    if values.is_null() {
+                        continue;
+                    }
+                    let values = values.cast::<f64>();
+                    let mut row_counters = Vec::new();
+                    for (index, name) in counter_names.iter().enumerate() {
+                        let value = *values.add(index);
+                        if !value.is_finite() || value == 0.0 {
+                            continue;
+                        }
+                        row_counters.push(XcodeMioPipelineCounter {
+                            name: name.clone(),
+                            value,
+                        });
+                    }
+                    if row_counters.is_empty() {
+                        continue;
+                    }
+                    rows.push(XcodeMioGpuCommandCounterRow {
+                        command_index: command.index,
+                        function_index: command.function_index,
+                        sub_command_index: command.sub_command_index,
+                        encoder_index: command.encoder_index,
+                        pipeline_index: command.pipeline_index,
+                        function_name: command.function_name.clone(),
+                        counters: row_counters,
+                    });
+                }
+                rows.sort_by(|left, right| {
+                    left.command_index
+                        .cmp(&right.command_index)
+                        .then_with(|| left.sub_command_index.cmp(&right.sub_command_index))
+                });
+                Ok(rows)
+            }
+        }
+
+        unsafe fn decode_gpu_command_function_times(
+            &mut self,
+            trace_data: Id,
+            timeline: Option<Id>,
+            pipelines: &[XcodeMioPipeline],
+            encoders: &[XcodeMioEncoder],
+            gpu_commands: &[XcodeMioGpuCommand],
+            timeline_pipeline_state_ids: &[u64],
+        ) -> (
+            Vec<XcodeMioGpuCommandFunctionTime>,
+            Vec<XcodeMioFunctionTimeProbe>,
+        ) {
+            let mut rows = Vec::new();
+            let mut probes = Vec::new();
+            unsafe {
+                for source in function_time_trace_data_sources(trace_data, timeline) {
+                    if responds_to_selector(source.object, "durationForDraw:dataMaster:") {
+                        push_gpu_command_function_time_source(
+                            &mut rows,
+                            source.object,
+                            source.function_index_source,
+                            source.command_index_source,
+                            gpu_commands,
+                        );
+                    }
+                    if responds_to_selector(
+                        source.object,
+                        "enumerateDrawsForPipelineState:enumerator:",
+                    ) || responds_to_selector(source.object, "numDrawsForPipelineState:")
+                    {
+                        push_enumerated_gpu_command_function_time_source(
+                            &mut rows,
+                            &mut probes,
+                            source,
+                            pipelines,
+                            gpu_commands,
+                            timeline_pipeline_state_ids,
+                        );
+                    }
+                    if responds_to_selector(source.object, "enumerateDrawsForEncoder:enumerator:")
+                        || responds_to_selector(source.object, "numDrawsForEncoder:")
+                        || responds_to_selector(source.object, "kickDurationForEncoder:dataMaster:")
+                        || responds_to_selector(source.object, "kickDurationForEncoder:")
+                    {
+                        push_enumerated_encoder_function_time_source(
+                            &mut rows,
+                            &mut probes,
+                            source,
+                            encoders,
+                            gpu_commands,
+                        );
+                    }
+                }
+            }
+            rows.sort_by(|left, right| {
+                left.source
+                    .cmp(right.source)
+                    .then_with(|| left.command_index.cmp(&right.command_index))
+                    .then_with(|| left.draw_index.cmp(&right.draw_index))
+                    .then_with(|| left.data_master.cmp(&right.data_master))
+            });
+            probes.sort_by(|left, right| {
+                left.source
+                    .cmp(right.source)
+                    .then_with(|| left.target_kind.cmp(right.target_kind))
+                    .then_with(|| left.target_id_kind.cmp(right.target_id_kind))
+                    .then_with(|| left.target_id.cmp(&right.target_id))
+            });
+            (rows, probes)
+        }
+
+        unsafe fn decode_gpu_command_direct_costs(
+            &mut self,
+            trace_data: Id,
+            timeline: Option<Id>,
+            gpu_commands: &[XcodeMioGpuCommand],
+        ) -> Vec<XcodeMioGpuCommandDirectCost> {
+            let mut rows = Vec::new();
+            unsafe {
+                for source in function_time_trace_data_sources(trace_data, timeline) {
+                    if !responds_to_selector(source.object, "costForDrawAtIndex:") {
+                        continue;
+                    }
+                    let has_cost_percent =
+                        responds_to_selector(source.object, "costPercentageForDrawAtIndex:");
+                    for command in gpu_commands {
+                        let Ok(draw_index) = u32::try_from(command.index) else {
+                            continue;
+                        };
+                        let Ok(cost) =
+                            send_f64_u32(source.object, "costForDrawAtIndex:", draw_index)
+                        else {
+                            continue;
+                        };
+                        if !cost.is_finite() || cost <= 0.0 {
+                            continue;
+                        }
+                        let cost_percent = if has_cost_percent {
+                            send_f64_u32(source.object, "costPercentageForDrawAtIndex:", draw_index)
+                                .ok()
+                                .filter(|value| value.is_finite() && *value > 0.0)
+                        } else {
+                            None
+                        };
+                        rows.push(XcodeMioGpuCommandDirectCost {
+                            source: source.source,
+                            command_index: command.index,
+                            function_index: command.function_index,
+                            sub_command_index: command.sub_command_index,
+                            encoder_index: command.encoder_index,
+                            pipeline_index: command.pipeline_index,
+                            function_name: command.function_name.clone(),
+                            cost,
+                            cost_percent,
+                        });
+                    }
+                }
+            }
+            rows.sort_by(|left, right| {
+                left.source
+                    .cmp(right.source)
+                    .then_with(|| left.command_index.cmp(&right.command_index))
+            });
+            rows
+        }
+
+        unsafe fn decode_top_draw_tracks(
+            &mut self,
+            trace_data: Id,
+            timeline: Option<Id>,
+            gpu_commands: &[XcodeMioGpuCommand],
+        ) -> Vec<XcodeMioTopDrawTrack> {
+            let mut rows = Vec::new();
+            unsafe {
+                let Ok(helper_class) = lookup_class("GTMioTraceDataHelper") else {
+                    return rows;
+                };
+                let mut seen_sources = BTreeSet::new();
+                for source in function_time_trace_data_sources(trace_data, timeline) {
+                    if source.object.is_null() || !seen_sources.insert(source.object as usize) {
+                        continue;
+                    }
+                    let Ok(helper) = send_id(helper_class, "alloc") else {
+                        continue;
+                    };
+                    let Ok(helper) = send_id_id(helper, "initWithTraceData:", source.object) else {
+                        continue;
+                    };
+                    let _ = send_void_i8(helper, "setShowDriverInternalShaders:", 1);
+                    let _ = send_void_i8(helper, "setShowDriverIntersectionShaders:", 1);
+                    let _ = send_void_i8(helper, "setShowESLShaders:", 1);
+                    let Ok(tracks) = send_id_allow_nil(helper, "generateTopDrawTracks") else {
+                        continue;
+                    };
+                    if tracks.is_null() {
+                        continue;
+                    }
+                    let Ok(track_count) = self.array_count(tracks) else {
+                        continue;
+                    };
+                    for track_index in 0..track_count {
+                        let Ok(track) = self.array_object(tracks, track_index) else {
+                            continue;
+                        };
+                        let track_id = send_i32(track, "trackId").unwrap_or(0);
+                        let first_index = send_u64(track, "firstIndex").unwrap_or(0);
+                        let start_timestamp_ns = send_u64(track, "startTimestamp").unwrap_or(0);
+                        let end_timestamp_ns = send_u64(track, "endTimestamp").unwrap_or(0);
+                        let duration_ns = send_u64(track, "duration").unwrap_or(0);
+                        let trace_count = send_u64(track, "traceCount").unwrap_or(0);
+                        let traces = send_ptr(track, "traces")
+                            .ok()
+                            .filter(|ptr| !ptr.is_null())
+                            .map(|ptr| ptr.cast::<RawGtmioDrawTrace>());
+                        if trace_count == 0 || traces.is_none() {
+                            let matched =
+                                command_for_top_draw_track(first_index, None, gpu_commands);
+                            rows.push(top_draw_track_row(
+                                source.source,
+                                track_index,
+                                0,
+                                track_id,
+                                first_index,
+                                start_timestamp_ns,
+                                end_timestamp_ns,
+                                duration_ns,
+                                trace_count,
+                                RawGtmioDrawTrace::default(),
+                                matched,
+                            ));
+                            continue;
+                        }
+                        let traces = traces.expect("checked above");
+                        for trace_index in 0..trace_count as usize {
+                            let trace = *traces.add(trace_index);
+                            let matched =
+                                command_for_top_draw_track(first_index, Some(trace), gpu_commands);
+                            rows.push(top_draw_track_row(
+                                source.source,
+                                track_index,
+                                trace_index,
+                                track_id,
+                                first_index,
+                                start_timestamp_ns,
+                                end_timestamp_ns,
+                                duration_ns,
+                                trace_count,
+                                trace,
+                                matched,
+                            ));
+                        }
+                    }
+                }
+            }
+            rows.sort_by(|left, right| {
+                left.source
+                    .cmp(right.source)
+                    .then_with(|| left.track_index.cmp(&right.track_index))
+                    .then_with(|| left.trace_index.cmp(&right.trace_index))
+            });
+            rows
+        }
+
+        unsafe fn decode_draw_array_probes(
+            &mut self,
+            trace_data: Id,
+            timeline: Option<Id>,
+            pipelines: &[XcodeMioPipeline],
+            gpu_commands: &[XcodeMioGpuCommand],
+        ) -> Vec<XcodeMioDrawArrayProbe> {
+            let command_indices = draw_array_probe_command_indices(pipelines, gpu_commands);
+            let mut probes = Vec::new();
+            let mut seen = BTreeSet::new();
+            unsafe {
+                for source in function_time_trace_data_sources(trace_data, timeline) {
+                    let Ok(draw_count) = send_u64(source.object, "drawCount") else {
+                        continue;
+                    };
+                    if draw_count == 0 {
+                        continue;
+                    }
+                    let draw_traces = send_ptr(source.object, "drawTraces")
+                        .ok()
+                        .filter(|ptr| !ptr.is_null())
+                        .map(|ptr| ptr.cast::<RawGtmioDrawTrace>());
+                    let draws = send_ptr(source.object, "draws")
+                        .ok()
+                        .filter(|ptr| !ptr.is_null())
+                        .map(|ptr| ptr.cast::<u8>());
+                    if draw_traces.is_none() && draws.is_none() {
+                        continue;
+                    }
+
+                    for command_index in &command_indices {
+                        let Some(command) = gpu_commands.get(*command_index) else {
+                            continue;
+                        };
+                        let mut array_indices = Vec::with_capacity(2);
+                        array_indices.push(("command_index", command.index));
+                        if let Ok(function_index) = usize::try_from(command.function_index)
+                            && function_index != command.index
+                            && function_index < draw_count as usize
+                        {
+                            array_indices.push(("function_index", function_index));
+                        }
+                        for (array_index_kind, array_index) in array_indices {
+                            if array_index >= draw_count as usize
+                                || !seen.insert((source.source, array_index_kind, array_index))
+                            {
+                                continue;
+                            }
+                            let trace = draw_traces
+                                .map(|draw_traces| *draw_traces.add(array_index))
+                                .unwrap_or_default();
+                            let metadata =
+                                draws.map(|draws| decode_draw_metadata_record(draws, array_index));
+                            let metadata = metadata.unwrap_or(XcodeMioDrawMetadataRecord {
+                                index: array_index,
+                                raw0: 0,
+                                raw1: 0,
+                                raw2: 0,
+                                raw3: 0,
+                                raw4: 0,
+                                raw5: 0,
+                                raw6: 0,
+                                raw7: 0,
+                                raw8: 0,
+                                raw9: 0,
+                            });
+                            probes.push(XcodeMioDrawArrayProbe {
+                                source: source.source,
+                                array_index_kind,
+                                array_index,
+                                command_index: command.index,
+                                function_index: command.function_index,
+                                sub_command_index: command.sub_command_index,
+                                encoder_index: command.encoder_index,
+                                pipeline_index: command.pipeline_index,
+                                function_name: command.function_name.clone(),
+                                trace_raw0: trace.raw0,
+                                trace_raw1: trace.raw1,
+                                trace_raw2: trace.raw2,
+                                trace_raw3: trace.raw3,
+                                trace_duration_ns: trace.raw1.saturating_sub(trace.raw0),
+                                metadata_raw0: metadata.raw0,
+                                metadata_raw1: metadata.raw1,
+                                metadata_raw2: metadata.raw2,
+                                metadata_raw3: metadata.raw3,
+                                metadata_raw4: metadata.raw4,
+                                metadata_raw5: metadata.raw5,
+                                metadata_raw6: metadata.raw6,
+                                metadata_raw7: metadata.raw7,
+                                metadata_raw8: metadata.raw8,
+                                metadata_raw9: metadata.raw9,
+                            });
+                        }
+                    }
+                }
+            }
+            probes.sort_by(|left, right| {
+                left.command_index
+                    .cmp(&right.command_index)
+                    .then_with(|| left.source.cmp(right.source))
+                    .then_with(|| left.array_index_kind.cmp(right.array_index_kind))
+                    .then_with(|| left.array_index.cmp(&right.array_index))
+            });
+            probes
+        }
+
+        unsafe fn decode_usc_clique_summaries(
+            &mut self,
+            trace_data: Id,
+            timeline: Option<Id>,
+        ) -> Vec<XcodeMioUSCCliqueSummary> {
+            let mut summaries = Vec::new();
+            unsafe {
+                for source in function_time_trace_data_sources(trace_data, timeline) {
+                    if !responds_to_selector(source.object, "uscs") {
+                        summaries.push(XcodeMioUSCCliqueSummary {
+                            source: source.source,
+                            usc_index: None,
+                            usc_count: 0,
+                            clique_count: 0,
+                            has_cliques: false,
+                            has_enumerate_kick_cliques_by_function: false,
+                            sample_raw0: 0,
+                            sample_raw1: 0,
+                            sample_duration_ns: 0,
+                            sample_u32_fields: Vec::new(),
+                            sample_u16_fields: Vec::new(),
+                        });
+                        continue;
+                    }
+                    let Ok(uscs) = send_id_allow_nil(source.object, "uscs") else {
+                        continue;
+                    };
+                    if uscs.is_null() || !responds_to_selector(uscs, "count") {
+                        summaries.push(XcodeMioUSCCliqueSummary {
+                            source: source.source,
+                            usc_index: None,
+                            usc_count: 0,
+                            clique_count: 0,
+                            has_cliques: false,
+                            has_enumerate_kick_cliques_by_function: false,
+                            sample_raw0: 0,
+                            sample_raw1: 0,
+                            sample_duration_ns: 0,
+                            sample_u32_fields: Vec::new(),
+                            sample_u16_fields: Vec::new(),
+                        });
+                        continue;
+                    }
+                    let usc_count = send_u64(uscs, "count").unwrap_or(0);
+                    if usc_count == 0 {
+                        summaries.push(XcodeMioUSCCliqueSummary {
+                            source: source.source,
+                            usc_index: None,
+                            usc_count,
+                            clique_count: 0,
+                            has_cliques: false,
+                            has_enumerate_kick_cliques_by_function: false,
+                            sample_raw0: 0,
+                            sample_raw1: 0,
+                            sample_duration_ns: 0,
+                            sample_u32_fields: Vec::new(),
+                            sample_u16_fields: Vec::new(),
+                        });
+                        continue;
+                    }
+                    for usc_index in 0..(usc_count as usize).min(256) {
+                        let Ok(usc) = send_id_usize(uscs, "objectAtIndex:", usc_index) else {
+                            continue;
+                        };
+                        let has_cliques = !usc.is_null()
+                            && responds_to_selector(usc, "cliquesCount")
+                            && responds_to_selector(usc, "cliques");
+                        let has_enumerate = !usc.is_null()
+                            && responds_to_selector(
+                                usc,
+                                "enumerateKickCliquesAtFunctionIndex:dataMaster:enumerator:",
+                            );
+                        let mut sample = RawGtmioUSCCliqueMetadata::default();
+                        let clique_count = if has_cliques {
+                            send_u64(usc, "cliquesCount").unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        if clique_count > 0
+                            && clique_count <= 5_000_000
+                            && let Ok(cliques) = send_ptr(usc, "cliques")
+                            && !cliques.is_null()
+                        {
+                            sample = *cliques.cast::<RawGtmioUSCCliqueMetadata>();
+                        }
+                        summaries.push(XcodeMioUSCCliqueSummary {
+                            source: source.source,
+                            usc_index: Some(usc_index),
+                            usc_count,
+                            clique_count,
+                            has_cliques,
+                            has_enumerate_kick_cliques_by_function: has_enumerate,
+                            sample_raw0: sample.raw0,
+                            sample_raw1: sample.raw1,
+                            sample_duration_ns: sample.duration_ns(),
+                            sample_u32_fields: sample.u32_fields().to_vec(),
+                            sample_u16_fields: sample.u16_fields().to_vec(),
+                        });
+                    }
+                }
+            }
+            summaries
+        }
+
+        unsafe fn decode_usc_clique_probes(
+            &mut self,
+            trace_data: Id,
+            timeline: Option<Id>,
+            pipelines: &[XcodeMioPipeline],
+            gpu_commands: &[XcodeMioGpuCommand],
+        ) -> Vec<XcodeMioUSCCliqueProbe> {
+            #[derive(Clone, Copy)]
+            struct CliqueAggregate {
+                clique_count: usize,
+                first_clique_index: usize,
+                last_clique_index: usize,
+                duration_sum_ns: u64,
+                min_duration_ns: u64,
+                max_duration_ns: u64,
+                min_timestamp_ns: u64,
+                max_timestamp_ns: u64,
+                sample: RawGtmioUSCCliqueMetadata,
+            }
+
+            impl CliqueAggregate {
+                fn new(index: usize, clique: RawGtmioUSCCliqueMetadata) -> Self {
+                    let duration = clique.duration_ns();
+                    Self {
+                        clique_count: 1,
+                        first_clique_index: index,
+                        last_clique_index: index,
+                        duration_sum_ns: duration,
+                        min_duration_ns: duration,
+                        max_duration_ns: duration,
+                        min_timestamp_ns: clique.raw0,
+                        max_timestamp_ns: clique.raw1,
+                        sample: clique,
+                    }
+                }
+
+                fn push(&mut self, index: usize, clique: RawGtmioUSCCliqueMetadata) {
+                    let duration = clique.duration_ns();
+                    self.clique_count += 1;
+                    self.last_clique_index = index;
+                    self.duration_sum_ns = self.duration_sum_ns.saturating_add(duration);
+                    self.min_duration_ns = self.min_duration_ns.min(duration);
+                    self.max_duration_ns = self.max_duration_ns.max(duration);
+                    self.min_timestamp_ns = self.min_timestamp_ns.min(clique.raw0);
+                    self.max_timestamp_ns = self.max_timestamp_ns.max(clique.raw1);
+                }
+            }
+
+            let command_indices = draw_array_probe_command_indices(pipelines, gpu_commands);
+            let mut target_values = BTreeMap::<u32, Vec<(&'static str, usize)>>::new();
+            for command_index in &command_indices {
+                let Some(command) = gpu_commands.get(*command_index) else {
+                    continue;
+                };
+                if let Ok(index) = u32::try_from(command.index)
+                    && index != 0
+                {
+                    target_values
+                        .entry(index)
+                        .or_default()
+                        .push(("command_index", command.index));
+                }
+                if let Ok(function_index) = u32::try_from(command.function_index) {
+                    target_values
+                        .entry(function_index)
+                        .or_default()
+                        .push(("function_index", command.index));
+                }
+            }
+            if target_values.is_empty() {
+                return Vec::new();
+            }
+
+            let mut probes = Vec::new();
+            unsafe {
+                for source in function_time_trace_data_sources(trace_data, timeline) {
+                    if !responds_to_selector(source.object, "uscs") {
+                        continue;
+                    }
+                    let Ok(uscs) = send_id_allow_nil(source.object, "uscs") else {
+                        continue;
+                    };
+                    if uscs.is_null() || !responds_to_selector(uscs, "count") {
+                        continue;
+                    }
+                    let usc_count = send_u64(uscs, "count").unwrap_or(0).min(256);
+                    for usc_index in 0..usc_count as usize {
+                        let Ok(usc) = send_id_usize(uscs, "objectAtIndex:", usc_index) else {
+                            continue;
+                        };
+                        if usc.is_null()
+                            || !responds_to_selector(usc, "cliquesCount")
+                            || !responds_to_selector(usc, "cliques")
+                        {
+                            continue;
+                        }
+                        let clique_count = send_u64(usc, "cliquesCount").unwrap_or(0);
+                        if clique_count == 0 || clique_count > 5_000_000 {
+                            continue;
+                        }
+                        let Ok(cliques) = send_ptr(usc, "cliques") else {
+                            continue;
+                        };
+                        if cliques.is_null() {
+                            continue;
+                        }
+                        let cliques = cliques.cast::<RawGtmioUSCCliqueMetadata>();
+                        let mut aggregates = BTreeMap::<
+                            (usize, usize, &'static str, u32, usize),
+                            CliqueAggregate,
+                        >::new();
+                        for clique_index in 0..clique_count as usize {
+                            let clique = *cliques.add(clique_index);
+                            for (field_offset, value) in clique.u32_fields().iter().enumerate() {
+                                let Some(targets) = target_values.get(value) else {
+                                    continue;
+                                };
+                                let field_index = field_offset + 2;
+                                for (match_kind, command_index) in targets {
+                                    let key = (
+                                        usc_index,
+                                        field_index,
+                                        *match_kind,
+                                        *value,
+                                        *command_index,
+                                    );
+                                    aggregates
+                                        .entry(key)
+                                        .and_modify(|aggregate| {
+                                            aggregate.push(clique_index, clique);
+                                        })
+                                        .or_insert_with(|| {
+                                            CliqueAggregate::new(clique_index, clique)
+                                        });
+                                }
+                            }
+                        }
+
+                        for (
+                            (usc_index, field_index, match_kind, matched_value, command_index),
+                            aggregate,
+                        ) in aggregates
+                        {
+                            let Some(command) = gpu_commands.get(command_index) else {
+                                continue;
+                            };
+                            let span_duration_ns = aggregate
+                                .max_timestamp_ns
+                                .saturating_sub(aggregate.min_timestamp_ns);
+                            probes.push(XcodeMioUSCCliqueProbe {
+                                source: source.source,
+                                usc_index,
+                                field_index,
+                                data_master: None,
+                                match_kind,
+                                matched_value,
+                                command_index: command.index,
+                                function_index: command.function_index,
+                                sub_command_index: command.sub_command_index,
+                                encoder_index: command.encoder_index,
+                                pipeline_index: command.pipeline_index,
+                                function_name: command.function_name.clone(),
+                                clique_count: aggregate.clique_count,
+                                first_clique_index: aggregate.first_clique_index,
+                                last_clique_index: aggregate.last_clique_index,
+                                duration_sum_ns: aggregate.duration_sum_ns,
+                                span_duration_ns,
+                                min_duration_ns: aggregate.min_duration_ns,
+                                max_duration_ns: aggregate.max_duration_ns,
+                                min_timestamp_ns: aggregate.min_timestamp_ns,
+                                max_timestamp_ns: aggregate.max_timestamp_ns,
+                                sample_raw0: aggregate.sample.raw0,
+                                sample_raw1: aggregate.sample.raw1,
+                                sample_u32_fields: aggregate.sample.u32_fields().to_vec(),
+                                sample_u16_fields: aggregate.sample.u16_fields().to_vec(),
+                            });
+                        }
+
+                        if responds_to_selector(
+                            usc,
+                            "enumerateKickCliquesAtFunctionIndex:dataMaster:enumerator:",
+                        ) {
+                            for command_index in &command_indices {
+                                let Some(command) = gpu_commands.get(*command_index) else {
+                                    continue;
+                                };
+                                let Ok(function_index) = u32::try_from(command.function_index)
+                                else {
+                                    continue;
+                                };
+                                for data_master in function_time_data_master_candidates() {
+                                    let aggregate = Arc::new(Mutex::new(None::<CliqueAggregate>));
+                                    let callback_aggregate = Arc::clone(&aggregate);
+                                    let block =
+                                        RcBlock::new(move |clique: *const c_void, _usc: Id| {
+                                            if clique.is_null() {
+                                                return;
+                                            }
+                                            let clique =
+                                                *clique.cast::<RawGtmioUSCCliqueMetadata>();
+                                            let Ok(mut aggregate) = callback_aggregate.lock()
+                                            else {
+                                                return;
+                                            };
+                                            let next_index = aggregate
+                                                .as_ref()
+                                                .map(|aggregate| aggregate.clique_count)
+                                                .unwrap_or(0);
+                                            if let Some(aggregate) = aggregate.as_mut() {
+                                                aggregate.push(next_index, clique);
+                                            } else {
+                                                *aggregate =
+                                                    Some(CliqueAggregate::new(next_index, clique));
+                                            }
+                                        });
+                                    let block_ptr = RcBlock::as_ptr(&block).cast::<c_void>();
+                                    if send_void_u32_u16_id(
+                                        usc,
+                                        "enumerateKickCliquesAtFunctionIndex:dataMaster:enumerator:",
+                                        function_index,
+                                        data_master,
+                                        block_ptr.cast(),
+                                    )
+                                    .is_err()
+                                    {
+                                        continue;
+                                    }
+                                    let aggregate =
+                                        aggregate.lock().ok().and_then(|aggregate| *aggregate);
+                                    let Some(aggregate) = aggregate else {
+                                        continue;
+                                    };
+                                    let span_duration_ns = aggregate
+                                        .max_timestamp_ns
+                                        .saturating_sub(aggregate.min_timestamp_ns);
+                                    probes.push(XcodeMioUSCCliqueProbe {
+                                        source: source.source,
+                                        usc_index,
+                                        field_index: 999,
+                                        data_master: Some(data_master),
+                                        match_kind: "enumerate",
+                                        matched_value: function_index,
+                                        command_index: command.index,
+                                        function_index: command.function_index,
+                                        sub_command_index: command.sub_command_index,
+                                        encoder_index: command.encoder_index,
+                                        pipeline_index: command.pipeline_index,
+                                        function_name: command.function_name.clone(),
+                                        clique_count: aggregate.clique_count,
+                                        first_clique_index: aggregate.first_clique_index,
+                                        last_clique_index: aggregate.last_clique_index,
+                                        duration_sum_ns: aggregate.duration_sum_ns,
+                                        span_duration_ns,
+                                        min_duration_ns: aggregate.min_duration_ns,
+                                        max_duration_ns: aggregate.max_duration_ns,
+                                        min_timestamp_ns: aggregate.min_timestamp_ns,
+                                        max_timestamp_ns: aggregate.max_timestamp_ns,
+                                        sample_raw0: aggregate.sample.raw0,
+                                        sample_raw1: aggregate.sample.raw1,
+                                        sample_u32_fields: aggregate.sample.u32_fields().to_vec(),
+                                        sample_u16_fields: aggregate.sample.u16_fields().to_vec(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            probes.sort_by(|left, right| {
+                left.command_index
+                    .cmp(&right.command_index)
+                    .then_with(|| right.duration_sum_ns.cmp(&left.duration_sum_ns))
+                    .then_with(|| left.source.cmp(right.source))
+                    .then_with(|| left.usc_index.cmp(&right.usc_index))
+                    .then_with(|| left.field_index.cmp(&right.field_index))
+                    .then_with(|| left.match_kind.cmp(right.match_kind))
+            });
+            probes
+        }
+
+        unsafe fn decode_encoder_quad_probes(
+            &mut self,
+            trace_data: Id,
+            timeline: Option<Id>,
+            pipelines: &[XcodeMioPipeline],
+            encoders: &[XcodeMioEncoder],
+            gpu_commands: &[XcodeMioGpuCommand],
+            _timeline_pipeline_state_ids: &[u64],
+        ) -> Vec<XcodeMioEncoderQuadProbe> {
+            let Ok(quad_class) = (unsafe { lookup_class("GTMioEncoderQuadData") }) else {
+                return Vec::new();
+            };
+            let mut probes = Vec::new();
+            let mut seen = BTreeSet::new();
+            unsafe {
+                for source in function_time_trace_data_sources(trace_data, timeline) {
+                    if source.source != "mio" {
+                        continue;
+                    }
+                    for encoder in encoders {
+                        let Ok(encoder_function_index) = u32::try_from(encoder.function_index)
+                        else {
+                            continue;
+                        };
+                        for program_type in encoder_quad_program_type_candidates(None) {
+                            for options in encoder_quad_options_candidates() {
+                                if !seen.insert((
+                                    source.source,
+                                    "encoder",
+                                    encoder.index,
+                                    usize::MAX,
+                                    0_u64,
+                                    u32::MAX,
+                                    program_type,
+                                    options,
+                                )) {
+                                    continue;
+                                }
+                                let Ok(quad_data) = init_encoder_quad_for_encoder(
+                                    quad_class,
+                                    source.object,
+                                    encoder_function_index,
+                                    program_type,
+                                    options,
+                                ) else {
+                                    continue;
+                                };
+                                push_encoder_quad_probe(
+                                    &mut probes,
+                                    quad_data,
+                                    source.source,
+                                    "encoder",
+                                    Some(encoder.index),
+                                    encoder_function_index,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    program_type,
+                                    options,
+                                );
+                            }
+                        }
+                    }
+
+                    for pipeline in pipelines {
+                        let mut pipeline_candidate_seen = BTreeSet::new();
+                        let pipeline_ids = pipeline_function_time_candidates(
+                            pipeline,
+                            source.pipeline_sources,
+                            &[],
+                        );
+                        for (pipeline_id_kind, pipeline_id) in pipeline_ids {
+                            if !pipeline_candidate_seen.insert(pipeline_id) {
+                                continue;
+                            }
+                            let draw_indices =
+                                enumerate_draw_indices_for_pipeline(source.object, pipeline_id);
+                            if draw_indices.is_empty() {
+                                continue;
+                            }
+                            let sampled_draws = sample_draw_indices(&draw_indices, 8);
+
+                            for encoder in encoders {
+                                let Ok(encoder_function_index) =
+                                    u32::try_from(encoder.function_index)
+                                else {
+                                    continue;
+                                };
+                                for program_type in
+                                    encoder_quad_program_type_candidates(Some(pipeline))
+                                {
+                                    for options in encoder_quad_options_candidates() {
+                                        if !seen.insert((
+                                            source.source,
+                                            "pipeline",
+                                            encoder.index,
+                                            pipeline.index,
+                                            pipeline_id,
+                                            u32::MAX,
+                                            program_type,
+                                            options,
+                                        )) {
+                                            continue;
+                                        }
+                                        let Ok(quad_data) = init_encoder_quad_for_pipeline(
+                                            quad_class,
+                                            source.object,
+                                            encoder_function_index,
+                                            pipeline_id,
+                                            program_type,
+                                            options,
+                                        ) else {
+                                            continue;
+                                        };
+                                        push_encoder_quad_probe(
+                                            &mut probes,
+                                            quad_data,
+                                            source.source,
+                                            "pipeline",
+                                            Some(encoder.index),
+                                            encoder_function_index,
+                                            Some(pipeline.index),
+                                            Some(pipeline_id_kind),
+                                            Some(pipeline_id),
+                                            None,
+                                            None,
+                                            pipeline.function_name.clone(),
+                                            program_type,
+                                            options,
+                                        );
+                                    }
+                                }
+                            }
+
+                            for draw_index in selected_draw_indices(&draw_indices, 8) {
+                                let Some(draw_index_u32) = u32::try_from(draw_index).ok() else {
+                                    continue;
+                                };
+                                let command = command_for_enumerated_draw(gpu_commands, draw_index);
+                                let mut draw_id_candidates =
+                                    vec![("enumerated_draw", draw_index_u32)];
+                                if let Some(command) = command
+                                    && let Ok(command_index) = u32::try_from(command.index)
+                                    && command_index != draw_index_u32
+                                {
+                                    draw_id_candidates.push(("command_index", command_index));
+                                }
+                                for (draw_id_kind, draw_id) in draw_id_candidates {
+                                    for encoder in encoders {
+                                        if let Some(command) = command
+                                            && command.encoder_index != encoder.index
+                                        {
+                                            continue;
+                                        }
+                                        let Ok(encoder_function_index) =
+                                            u32::try_from(encoder.function_index)
+                                        else {
+                                            continue;
+                                        };
+                                        for program_type in
+                                            encoder_quad_program_type_candidates(Some(pipeline))
+                                        {
+                                            for options in encoder_quad_options_candidates() {
+                                                if !seen.insert((
+                                                    source.source,
+                                                    draw_id_kind,
+                                                    encoder.index,
+                                                    pipeline.index,
+                                                    pipeline_id,
+                                                    draw_id,
+                                                    program_type,
+                                                    options,
+                                                )) {
+                                                    continue;
+                                                }
+                                                let Ok(quad_data) = init_encoder_quad_for_draw(
+                                                    quad_class,
+                                                    source.object,
+                                                    encoder_function_index,
+                                                    draw_id,
+                                                    program_type,
+                                                    options,
+                                                ) else {
+                                                    continue;
+                                                };
+                                                push_encoder_quad_probe(
+                                                    &mut probes,
+                                                    quad_data,
+                                                    source.source,
+                                                    "draw",
+                                                    Some(encoder.index),
+                                                    encoder_function_index,
+                                                    Some(pipeline.index),
+                                                    Some(pipeline_id_kind),
+                                                    Some(pipeline_id),
+                                                    Some(draw_id_kind),
+                                                    Some(draw_id),
+                                                    command
+                                                        .and_then(|command| {
+                                                            command.function_name.clone()
+                                                        })
+                                                        .or_else(|| pipeline.function_name.clone()),
+                                                    program_type,
+                                                    options,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !sampled_draws.is_empty() {
+                                for probe in probes.iter_mut().rev().take_while(|probe| {
+                                    probe.source == source.source
+                                        && probe.pipeline_index == Some(pipeline.index)
+                                        && probe.pipeline_id == Some(pipeline_id)
+                                }) {
+                                    if probe.sampled_draws.is_empty() {
+                                        probe.sampled_draws = sampled_draws.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            probes.sort_by(|left, right| {
+                left.source
+                    .cmp(right.source)
+                    .then_with(|| left.mode.cmp(right.mode))
+                    .then_with(|| {
+                        left.encoder_function_index
+                            .cmp(&right.encoder_function_index)
+                    })
+                    .then_with(|| left.pipeline_index.cmp(&right.pipeline_index))
+                    .then_with(|| left.draw_index.cmp(&right.draw_index))
+                    .then_with(|| left.program_type.cmp(&right.program_type))
+                    .then_with(|| left.options.cmp(&right.options))
+            });
+            probes
+        }
+
+        unsafe fn decode_draw_execution_history_probes(
+            &mut self,
+            trace_data: Id,
+            timeline: Option<Id>,
+            pipelines: &[XcodeMioPipeline],
+            gpu_commands: &[XcodeMioGpuCommand],
+        ) -> Vec<XcodeMioDrawExecutionHistoryProbe> {
+            let Ok(history_class) = (unsafe { lookup_class("GTMioShaderExecutionHistory") }) else {
+                return Vec::new();
+            };
+            let delegate = unsafe {
+                lookup_class("GTMioShaderExecutionHistoryDefaultDelegate")
+                    .ok()
+                    .and_then(|class| send_id_allow_nil(class, "shared").ok())
+                    .unwrap_or(std::ptr::null_mut())
+            };
+            let mut probes = Vec::new();
+            let draw_indices = draw_execution_history_probe_indices(pipelines, gpu_commands);
+            unsafe {
+                for source in function_time_trace_data_sources(trace_data, timeline) {
+                    if !matches!(source.source, "mio" | "requestCostTimeline") {
+                        continue;
+                    }
+                    for command_index in &draw_indices {
+                        let Some(command) = gpu_commands.get(*command_index as usize) else {
+                            continue;
+                        };
+                        let Some(pipeline) = pipelines.get(command.pipeline_index) else {
+                            continue;
+                        };
+                        let draw_index_candidates =
+                            draw_execution_history_draw_index_candidates(command);
+                        for style in draw_execution_history_style_candidates() {
+                            for options in draw_execution_history_options_candidates() {
+                                for program_type in
+                                    encoder_quad_program_type_candidates(Some(pipeline))
+                                {
+                                    for (draw_id_kind, draw_index) in &draw_index_candidates {
+                                        let Ok(history) = new_shader_execution_history(
+                                            history_class,
+                                            source.object,
+                                            style,
+                                            options,
+                                            delegate,
+                                        ) else {
+                                            continue;
+                                        };
+                                        let trace_generated = if responds_to_selector(
+                                            source.object,
+                                            "executionHistoryForDraw:programType:delegate:progressController:",
+                                        ) {
+                                            send_void_u32_u16_id_id(
+                                                source.object,
+                                                "executionHistoryForDraw:programType:delegate:progressController:",
+                                                *draw_index,
+                                                program_type,
+                                                history,
+                                                std::ptr::null_mut(),
+                                            )
+                                            .is_ok()
+                                        } else {
+                                            false
+                                        };
+                                        push_draw_execution_history_nodes(
+                                            &mut probes,
+                                            history,
+                                            source.source,
+                                            match *draw_id_kind {
+                                                "function_index" => "trace_call.function",
+                                                _ => "trace_call.index",
+                                            },
+                                            command,
+                                            *draw_index,
+                                            style,
+                                            options,
+                                            program_type,
+                                            trace_generated,
+                                        );
+
+                                        let Ok(history) = new_shader_execution_history(
+                                            history_class,
+                                            source.object,
+                                            style,
+                                            options,
+                                            delegate,
+                                        ) else {
+                                            continue;
+                                        };
+                                        let generated = if responds_to_selector(
+                                            history,
+                                            "generateDrawIndex:programType:",
+                                        ) {
+                                            send_i8_u32_u16(
+                                                history,
+                                                "generateDrawIndex:programType:",
+                                                *draw_index,
+                                                program_type,
+                                            )
+                                            .unwrap_or(0)
+                                                != 0
+                                        } else {
+                                            false
+                                        };
+                                        push_draw_execution_history_nodes(
+                                            &mut probes,
+                                            history,
+                                            source.source,
+                                            match *draw_id_kind {
+                                                "function_index" => "hist_gen.function",
+                                                _ => "hist_gen.index",
+                                            },
+                                            command,
+                                            *draw_index,
+                                            style,
+                                            options,
+                                            program_type,
+                                            generated,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            probes.sort_by(|left, right| {
+                left.source
+                    .cmp(right.source)
+                    .then_with(|| left.mode.cmp(right.mode))
+                    .then_with(|| left.command_index.cmp(&right.command_index))
+                    .then_with(|| left.style.cmp(&right.style))
+                    .then_with(|| left.options.cmp(&right.options))
+                    .then_with(|| left.program_type.cmp(&right.program_type))
+                    .then_with(|| left.node_source.cmp(right.node_source))
+            });
+            probes
         }
 
         unsafe fn decode_timeline_cost_records(
@@ -2702,20 +5050,7 @@ mod platform {
             let draws = draws.cast::<u8>();
             let mut records = Vec::with_capacity(draw_count as usize);
             for index in 0..draw_count as usize {
-                let draw = unsafe { std::slice::from_raw_parts(draws.add(index * 44), 44) };
-                records.push(XcodeMioDrawMetadataRecord {
-                    index,
-                    raw0: read_u32(draw, 0),
-                    raw1: read_u32(draw, 4),
-                    raw2: read_u32(draw, 8),
-                    raw3: read_u32(draw, 12),
-                    raw4: read_i32(draw, 16),
-                    raw5: read_u32(draw, 20),
-                    raw6: read_u64(draw, 24),
-                    raw7: read_u32(draw, 32),
-                    raw8: read_u32(draw, 36),
-                    raw9: read_u32(draw, 40),
-                });
+                records.push(unsafe { decode_draw_metadata_record(draws, index) });
             }
             records
         }
@@ -3125,13 +5460,54 @@ mod platform {
         raw_program_type: u16,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Default)]
     #[repr(C)]
     struct RawGtmioDrawTrace {
         raw0: u64,
         raw1: u64,
         raw2: u32,
         raw3: u16,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct RawGtmioUSCCliqueMetadata {
+        raw0: u64,
+        raw1: u64,
+        raw2: u32,
+        raw3: u32,
+        raw4: u32,
+        raw5: u32,
+        raw6: u32,
+        raw7: u32,
+        raw8: u32,
+        raw9: u32,
+        raw10: u32,
+        raw11: u32,
+        raw12: u32,
+        raw13: u32,
+        raw14: u32,
+        raw15: u32,
+        raw16: u16,
+        raw17: u16,
+        raw18: u16,
+    }
+
+    impl RawGtmioUSCCliqueMetadata {
+        fn duration_ns(&self) -> u64 {
+            self.raw1.saturating_sub(self.raw0)
+        }
+
+        fn u32_fields(&self) -> [u32; 14] {
+            [
+                self.raw2, self.raw3, self.raw4, self.raw5, self.raw6, self.raw7, self.raw8,
+                self.raw9, self.raw10, self.raw11, self.raw12, self.raw13, self.raw14, self.raw15,
+            ]
+        }
+
+        fn u16_fields(&self) -> [u16; 3] {
+            [self.raw16, self.raw17, self.raw18]
+        }
     }
 
     impl RawGtmioCostInfo {
@@ -4045,6 +6421,35 @@ mod platform {
         aggregate
     }
 
+    unsafe fn decode_execution_history_node_self(node: Id) -> DecodedExecutionHistoryNode {
+        unsafe {
+            let top_cost_percentage = send_f64(node, "topCostPercentage").unwrap_or(0.0);
+            let duration_percentage = send_f64(node, "durationPercentage").unwrap_or(0.0);
+            let total_duration_ns = send_u64(node, "totalDuration").unwrap_or(0);
+            let mut cost = RawGtmioCostInfo::default();
+            let found = send_i8_u16_u64_cost_mut(
+                node,
+                "costForScope:scopeIdentifier:cost:",
+                0,
+                0,
+                &mut cost,
+            )
+            .unwrap_or(0);
+            let total_cost = if found != 0 {
+                cost.alu_cost + cost.non_alu_cost
+            } else {
+                0.0
+            };
+            DecodedExecutionHistoryNode {
+                top_cost_percentage,
+                duration_percentage,
+                total_duration_ns,
+                total_cost,
+                instruction_count: cost.instruction_count,
+            }
+        }
+    }
+
     unsafe fn decode_execution_history_node(root: Id) -> DecodedExecutionHistoryNode {
         unsafe {
             let mut best = DecodedExecutionHistoryNode::default();
@@ -4055,30 +6460,7 @@ mod platform {
                 if visited > 20_000 {
                     break;
                 }
-                let top_cost_percentage = send_f64(node, "topCostPercentage").unwrap_or(0.0);
-                let duration_percentage = send_f64(node, "durationPercentage").unwrap_or(0.0);
-                let total_duration_ns = send_u64(node, "totalDuration").unwrap_or(0);
-                let mut cost = RawGtmioCostInfo::default();
-                let found = send_i8_u16_u64_cost_mut(
-                    node,
-                    "costForScope:scopeIdentifier:cost:",
-                    0,
-                    0,
-                    &mut cost,
-                )
-                .unwrap_or(0);
-                let total_cost = if found != 0 {
-                    cost.alu_cost + cost.non_alu_cost
-                } else {
-                    0.0
-                };
-                let candidate = DecodedExecutionHistoryNode {
-                    top_cost_percentage,
-                    duration_percentage,
-                    total_duration_ns,
-                    total_cost,
-                    instruction_count: cost.instruction_count,
-                };
+                let candidate = decode_execution_history_node_self(node);
                 if candidate
                     .top_cost_percentage
                     .partial_cmp(&best.top_cost_percentage)
@@ -4146,6 +6528,1090 @@ mod platform {
         best
     }
 
+    unsafe fn function_time_trace_data_sources(
+        trace_data: Id,
+        requested_timeline: Option<Id>,
+    ) -> Vec<FunctionTimeTraceDataSource> {
+        unsafe {
+            let mut sources = Vec::new();
+            let mut seen = BTreeSet::new();
+            push_function_time_source(
+                &mut sources,
+                &mut seen,
+                trace_data,
+                "mio",
+                "mio.function_index",
+                "mio.command_index",
+                EnumFunctionTimeSources {
+                    object_id: "mio.object_id",
+                    pointer_id: "mio.pointer_id",
+                    function_index: "mio.function_index",
+                    pipeline_index: "mio.pipeline_index",
+                },
+            );
+            if let Some(timeline) = requested_timeline {
+                push_function_time_source(
+                    &mut sources,
+                    &mut seen,
+                    timeline,
+                    "requestCostTimeline",
+                    "request.function_index",
+                    "request.command_index",
+                    EnumFunctionTimeSources {
+                        object_id: "request.object_id",
+                        pointer_id: "request.pointer_id",
+                        function_index: "request.function_index",
+                        pipeline_index: "request.pipeline_index",
+                    },
+                );
+            }
+            for (selector, source, function_index_source, command_index_source, pipeline_sources) in [
+                (
+                    "costTimeline",
+                    "mio.costTimeline",
+                    "cost.function_index",
+                    "cost.command_index",
+                    EnumFunctionTimeSources {
+                        object_id: "cost.object_id",
+                        pointer_id: "cost.pointer_id",
+                        function_index: "cost.function_index",
+                        pipeline_index: "cost.pipeline_index",
+                    },
+                ),
+                (
+                    "overlappingTimeline",
+                    "mio.overlappingTimeline",
+                    "overlap.function_index",
+                    "overlap.command_index",
+                    EnumFunctionTimeSources {
+                        object_id: "overlap.object_id",
+                        pointer_id: "overlap.pointer_id",
+                        function_index: "overlap.function_index",
+                        pipeline_index: "overlap.pipeline_index",
+                    },
+                ),
+                (
+                    "nonOverlappingTimeline",
+                    "mio.nonOverlappingTimeline",
+                    "nonoverlap.function_index",
+                    "nonoverlap.command_index",
+                    EnumFunctionTimeSources {
+                        object_id: "nonoverlap.object_id",
+                        pointer_id: "nonoverlap.pointer_id",
+                        function_index: "nonoverlap.function_index",
+                        pipeline_index: "nonoverlap.pipeline_index",
+                    },
+                ),
+            ] {
+                if !responds_to_selector(trace_data, selector) {
+                    continue;
+                }
+                let Ok(object) = send_id_allow_nil(trace_data, selector) else {
+                    continue;
+                };
+                push_function_time_source(
+                    &mut sources,
+                    &mut seen,
+                    object,
+                    source,
+                    function_index_source,
+                    command_index_source,
+                    pipeline_sources,
+                );
+            }
+            sources
+        }
+    }
+
+    fn push_function_time_source(
+        sources: &mut Vec<FunctionTimeTraceDataSource>,
+        seen: &mut BTreeSet<usize>,
+        object: Id,
+        source: &'static str,
+        function_index_source: &'static str,
+        command_index_source: &'static str,
+        pipeline_sources: EnumFunctionTimeSources,
+    ) {
+        if object.is_null() || !seen.insert(object as usize) {
+            return;
+        }
+        sources.push(FunctionTimeTraceDataSource {
+            object,
+            source,
+            function_index_source,
+            command_index_source,
+            pipeline_sources,
+        });
+    }
+
+    unsafe fn push_gpu_command_function_time_source(
+        rows: &mut Vec<XcodeMioGpuCommandFunctionTime>,
+        trace_data: Id,
+        function_index_source: &'static str,
+        command_index_source: &'static str,
+        gpu_commands: &[XcodeMioGpuCommand],
+    ) {
+        for command in gpu_commands {
+            let mut candidates = Vec::with_capacity(2);
+            if let Ok(draw_index) = u32::try_from(command.function_index) {
+                candidates.push((function_index_source, draw_index));
+            }
+            if let Ok(draw_index) = u32::try_from(command.index) {
+                candidates.push((command_index_source, draw_index));
+            }
+            for (source, draw_index) in candidates {
+                let mut best_duration_ns = 0_u64;
+                let mut best_data_master = 0_u16;
+                for data_master in function_time_data_master_candidates() {
+                    let duration_ns = unsafe {
+                        send_u64_u32_u16(
+                            trace_data,
+                            "durationForDraw:dataMaster:",
+                            draw_index,
+                            data_master,
+                        )
+                    }
+                    .unwrap_or(0);
+                    if duration_ns > best_duration_ns {
+                        best_duration_ns = duration_ns;
+                        best_data_master = data_master;
+                    }
+                }
+                if best_duration_ns == 0 {
+                    continue;
+                }
+                rows.push(XcodeMioGpuCommandFunctionTime {
+                    source,
+                    command_index: command.index,
+                    function_index: command.function_index,
+                    sub_command_index: command.sub_command_index,
+                    encoder_index: command.encoder_index,
+                    pipeline_index: command.pipeline_index,
+                    function_name: command.function_name.clone(),
+                    draw_index,
+                    data_master: best_data_master,
+                    duration_ns: best_duration_ns,
+                });
+            }
+        }
+    }
+
+    unsafe fn push_enumerated_gpu_command_function_time_source(
+        rows: &mut Vec<XcodeMioGpuCommandFunctionTime>,
+        probes: &mut Vec<XcodeMioFunctionTimeProbe>,
+        source: FunctionTimeTraceDataSource,
+        pipelines: &[XcodeMioPipeline],
+        gpu_commands: &[XcodeMioGpuCommand],
+        timeline_pipeline_state_ids: &[u64],
+    ) {
+        let mut seen = BTreeSet::new();
+        for pipeline in pipelines {
+            for (target_id_kind, pipeline_state_id) in pipeline_function_time_candidates(
+                pipeline,
+                source.pipeline_sources,
+                timeline_pipeline_state_ids,
+            ) {
+                let draw_count = if unsafe {
+                    responds_to_selector(source.object, "numDrawsForPipelineState:")
+                } {
+                    unsafe {
+                        send_u64_u64(
+                            source.object,
+                            "numDrawsForPipelineState:",
+                            pipeline_state_id,
+                        )
+                    }
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let draw_indices = if unsafe {
+                    responds_to_selector(
+                        source.object,
+                        "enumerateDrawsForPipelineState:enumerator:",
+                    )
+                } {
+                    unsafe { enumerate_draw_indices_for_pipeline(source.object, pipeline_state_id) }
+                } else {
+                    Vec::new()
+                };
+                let mut best_draw_index = None;
+                let mut best_data_master = None;
+                let mut best_duration_ns = 0_u64;
+                for draw_index in draw_indices.iter().copied() {
+                    let Ok(draw_index_u32) = u32::try_from(draw_index) else {
+                        continue;
+                    };
+                    let Some((duration_ns, data_master)) =
+                        (unsafe { best_duration_for_draw(source.object, draw_index_u32) })
+                    else {
+                        continue;
+                    };
+                    if duration_ns > best_duration_ns {
+                        best_draw_index = Some(draw_index_u32);
+                        best_data_master = Some(data_master);
+                        best_duration_ns = duration_ns;
+                    }
+                    if !seen.insert((source.source, pipeline.index, draw_index_u32)) {
+                        continue;
+                    }
+                    if let Some(command) = command_for_enumerated_draw(gpu_commands, draw_index) {
+                        rows.push(XcodeMioGpuCommandFunctionTime {
+                            source: source.source,
+                            command_index: command.index,
+                            function_index: command.function_index,
+                            sub_command_index: command.sub_command_index,
+                            encoder_index: command.encoder_index,
+                            pipeline_index: command.pipeline_index,
+                            function_name: command.function_name.clone(),
+                            draw_index: draw_index_u32,
+                            data_master,
+                            duration_ns,
+                        });
+                    } else {
+                        rows.push(XcodeMioGpuCommandFunctionTime {
+                            source: source.source,
+                            command_index: usize::MAX,
+                            function_index: draw_index,
+                            sub_command_index: -1,
+                            encoder_index: usize::MAX,
+                            pipeline_index: pipeline.index,
+                            function_name: pipeline.function_name.clone(),
+                            draw_index: draw_index_u32,
+                            data_master,
+                            duration_ns,
+                        });
+                    }
+                }
+                probes.push(XcodeMioFunctionTimeProbe {
+                    source: source.source,
+                    target_kind: "pipeline",
+                    target_id_kind,
+                    target_id: pipeline_state_id,
+                    pipeline_index: Some(pipeline.index),
+                    encoder_index: None,
+                    function_name: pipeline.function_name.clone(),
+                    reported_draw_count: draw_count,
+                    enumerated_draw_count: draw_indices.len(),
+                    sampled_draws: draw_indices
+                        .iter()
+                        .filter_map(|value| u32::try_from(*value).ok())
+                        .take(8)
+                        .collect(),
+                    best_draw_index,
+                    best_data_master,
+                    best_duration_ns,
+                    kick_duration_ns: 0,
+                });
+            }
+        }
+    }
+
+    unsafe fn push_enumerated_encoder_function_time_source(
+        rows: &mut Vec<XcodeMioGpuCommandFunctionTime>,
+        probes: &mut Vec<XcodeMioFunctionTimeProbe>,
+        source: FunctionTimeTraceDataSource,
+        encoders: &[XcodeMioEncoder],
+        gpu_commands: &[XcodeMioGpuCommand],
+    ) {
+        let mut seen = BTreeSet::new();
+        for encoder in encoders {
+            for (target_id_kind, encoder_function_index) in
+                encoder_function_time_candidates(encoder)
+            {
+                let Ok(encoder_function_index_u32) = u32::try_from(encoder_function_index) else {
+                    continue;
+                };
+                let draw_count =
+                    if unsafe { responds_to_selector(source.object, "numDrawsForEncoder:") } {
+                        unsafe {
+                            send_u64_u32(
+                                source.object,
+                                "numDrawsForEncoder:",
+                                encoder_function_index_u32,
+                            )
+                        }
+                        .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                let draw_indices = if unsafe {
+                    responds_to_selector(source.object, "enumerateDrawsForEncoder:enumerator:")
+                } {
+                    unsafe {
+                        enumerate_draw_indices_for_encoder(
+                            source.object,
+                            encoder_function_index_u32,
+                        )
+                    }
+                } else {
+                    Vec::new()
+                };
+                let kick_duration_ns = unsafe {
+                    best_kick_duration_for_encoder(source.object, encoder_function_index_u32)
+                };
+                let mut best_draw_index = None;
+                let mut best_data_master = None;
+                let mut best_duration_ns = 0_u64;
+                for (draw_offset, draw_index) in draw_indices.iter().copied().enumerate() {
+                    let Ok(draw_index_u32) = u32::try_from(draw_index) else {
+                        continue;
+                    };
+                    let Some((duration_ns, data_master)) =
+                        (unsafe { best_duration_for_draw(source.object, draw_index_u32) })
+                    else {
+                        continue;
+                    };
+                    if duration_ns > best_duration_ns {
+                        best_draw_index = Some(draw_index_u32);
+                        best_data_master = Some(data_master);
+                        best_duration_ns = duration_ns;
+                    }
+                    if !seen.insert((source.source, encoder.index, draw_index_u32)) {
+                        continue;
+                    }
+                    let command =
+                        command_for_enumerated_draw(gpu_commands, draw_index).or_else(|| {
+                            gpu_commands.get(encoder.gpu_command_start_index + draw_offset)
+                        });
+                    if let Some(command) = command {
+                        rows.push(XcodeMioGpuCommandFunctionTime {
+                            source: source.source,
+                            command_index: command.index,
+                            function_index: command.function_index,
+                            sub_command_index: command.sub_command_index,
+                            encoder_index: command.encoder_index,
+                            pipeline_index: command.pipeline_index,
+                            function_name: command.function_name.clone(),
+                            draw_index: draw_index_u32,
+                            data_master,
+                            duration_ns,
+                        });
+                    } else {
+                        rows.push(XcodeMioGpuCommandFunctionTime {
+                            source: source.source,
+                            command_index: usize::MAX,
+                            function_index: draw_index,
+                            sub_command_index: -1,
+                            encoder_index: encoder.index,
+                            pipeline_index: usize::MAX,
+                            function_name: None,
+                            draw_index: draw_index_u32,
+                            data_master,
+                            duration_ns,
+                        });
+                    }
+                }
+                probes.push(XcodeMioFunctionTimeProbe {
+                    source: source.source,
+                    target_kind: "encoder",
+                    target_id_kind,
+                    target_id: encoder_function_index,
+                    pipeline_index: None,
+                    encoder_index: Some(encoder.index),
+                    function_name: None,
+                    reported_draw_count: draw_count,
+                    enumerated_draw_count: draw_indices.len(),
+                    sampled_draws: draw_indices
+                        .iter()
+                        .filter_map(|value| u32::try_from(*value).ok())
+                        .take(8)
+                        .collect(),
+                    best_draw_index,
+                    best_data_master,
+                    best_duration_ns,
+                    kick_duration_ns,
+                });
+            }
+        }
+    }
+
+    unsafe fn init_encoder_quad_for_encoder(
+        quad_class: Class,
+        trace_data: Id,
+        encoder_function_index: u32,
+        program_type: u16,
+        options: u64,
+    ) -> Result<Id> {
+        unsafe {
+            let quad_data = send_id(quad_class, "alloc")?;
+            let quad_data = send_id_id_u32_u16_u64(
+                quad_data,
+                "initWithTraceData:encoderFunctionIndex:programType:options:",
+                trace_data,
+                encoder_function_index,
+                program_type,
+                options,
+            )?;
+            build_encoder_quad_data(quad_data, trace_data, encoder_function_index);
+            Ok(quad_data)
+        }
+    }
+
+    unsafe fn init_encoder_quad_for_pipeline(
+        quad_class: Class,
+        trace_data: Id,
+        encoder_function_index: u32,
+        pipeline_id: u64,
+        program_type: u16,
+        options: u64,
+    ) -> Result<Id> {
+        unsafe {
+            let quad_data = send_id(quad_class, "alloc")?;
+            let quad_data = send_id_id_u32_u64_u16_u64(
+                quad_data,
+                "initWithTraceData:encoderFunctionIndex:pipelineStateId:programType:options:",
+                trace_data,
+                encoder_function_index,
+                pipeline_id,
+                program_type,
+                options,
+            )?;
+            build_encoder_quad_data(quad_data, trace_data, encoder_function_index);
+            Ok(quad_data)
+        }
+    }
+
+    unsafe fn init_encoder_quad_for_draw(
+        quad_class: Class,
+        trace_data: Id,
+        encoder_function_index: u32,
+        draw_index: u32,
+        program_type: u16,
+        options: u64,
+    ) -> Result<Id> {
+        unsafe {
+            let quad_data = send_id(quad_class, "alloc")?;
+            let quad_data = send_id_id_u32_u32_u16_u64(
+                quad_data,
+                "initWithTraceData:encoderFunctionIndex:drawIndex:programType:options:",
+                trace_data,
+                encoder_function_index,
+                draw_index,
+                program_type,
+                options,
+            )?;
+            build_encoder_quad_data(quad_data, trace_data, encoder_function_index);
+            Ok(quad_data)
+        }
+    }
+
+    unsafe fn build_encoder_quad_data(quad_data: Id, trace_data: Id, encoder_function_index: u32) {
+        if unsafe { responds_to_selector(quad_data, "build:encoderFunctionIndex:cliqueFilter:") } {
+            let _ = unsafe {
+                send_i8_id_u32_id(
+                    quad_data,
+                    "build:encoderFunctionIndex:cliqueFilter:",
+                    trace_data,
+                    encoder_function_index,
+                    std::ptr::null_mut(),
+                )
+            };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn push_encoder_quad_probe(
+        probes: &mut Vec<XcodeMioEncoderQuadProbe>,
+        quad_data: Id,
+        source: &'static str,
+        mode: &'static str,
+        encoder_index: Option<usize>,
+        encoder_function_index: u32,
+        pipeline_index: Option<usize>,
+        pipeline_id_kind: Option<&'static str>,
+        pipeline_id: Option<u64>,
+        draw_id_kind: Option<&'static str>,
+        draw_index: Option<u32>,
+        function_name: Option<String>,
+        program_type: u16,
+        options: u64,
+    ) {
+        unsafe {
+            let draw_count = send_u64_if_supported(quad_data, "drawCount");
+            let quad_count = send_u64_if_supported(quad_data, "quadCount");
+            let min_timestamp_ns = send_u64_if_supported(quad_data, "minTimestamp");
+            let max_timestamp_ns = send_u64_if_supported(quad_data, "maxTimestamp");
+            let duration_ns = max_timestamp_ns.saturating_sub(min_timestamp_ns);
+            let max_cost = send_f64_if_supported(quad_data, "maxCost");
+            let min_cost = send_f64_if_supported(quad_data, "minCost");
+            let sampled_draws = encoder_quad_draw_samples(quad_data, draw_count, 8);
+            if draw_count == 0
+                && quad_count == 0
+                && duration_ns == 0
+                && max_timestamp_ns == 0
+                && min_timestamp_ns == 0
+                && (!max_cost.is_finite() || max_cost == 0.0)
+                && sampled_draws.is_empty()
+            {
+                return;
+            }
+            probes.push(XcodeMioEncoderQuadProbe {
+                source,
+                mode,
+                encoder_index,
+                encoder_function_index,
+                pipeline_index,
+                pipeline_id_kind,
+                pipeline_id,
+                draw_id_kind,
+                draw_index,
+                function_name,
+                program_type,
+                options,
+                draw_count,
+                quad_count,
+                min_timestamp_ns,
+                max_timestamp_ns,
+                duration_ns,
+                max_cost,
+                min_cost,
+                sampled_draws,
+            });
+        }
+    }
+
+    unsafe fn encoder_quad_draw_samples(quad_data: Id, draw_count: u64, limit: usize) -> Vec<u32> {
+        if draw_count == 0 || limit == 0 {
+            return Vec::new();
+        }
+        if !unsafe { responds_to_selector(quad_data, "drawIndexes") } {
+            return Vec::new();
+        }
+        let Ok(draw_indexes) = (unsafe { send_ptr(quad_data, "drawIndexes") }) else {
+            return Vec::new();
+        };
+        if draw_indexes.is_null() {
+            return Vec::new();
+        }
+        let count = (draw_count as usize).min(10_000);
+        let values = unsafe { std::slice::from_raw_parts(draw_indexes.cast::<u32>(), count) };
+        values.iter().copied().take(limit).collect()
+    }
+
+    fn encoder_quad_program_type_candidates(pipeline: Option<&XcodeMioPipeline>) -> Vec<u16> {
+        let mut candidates = BTreeSet::from([0_u16, 6_u16, 8_u16, 28_u16]);
+        if let Some(pipeline) = pipeline {
+            candidates.extend(program_type_candidates(pipeline));
+        }
+        candidates.into_iter().collect()
+    }
+
+    fn encoder_quad_options_candidates() -> impl Iterator<Item = u64> {
+        0_u64..=15
+    }
+
+    fn sample_draw_indices(draw_indices: &[u64], limit: usize) -> Vec<u32> {
+        draw_indices
+            .iter()
+            .filter_map(|value| u32::try_from(*value).ok())
+            .take(limit)
+            .collect()
+    }
+
+    fn selected_draw_indices(draw_indices: &[u64], limit: usize) -> Vec<u64> {
+        if draw_indices.len() <= limit {
+            return draw_indices.to_vec();
+        }
+        let front = limit / 2;
+        let back = limit.saturating_sub(front);
+        let mut values = draw_indices.iter().copied().take(front).collect::<Vec<_>>();
+        values.extend(draw_indices.iter().copied().rev().take(back));
+        values.sort_unstable();
+        values.dedup();
+        values
+    }
+
+    fn draw_array_probe_command_indices(
+        pipelines: &[XcodeMioPipeline],
+        gpu_commands: &[XcodeMioGpuCommand],
+    ) -> Vec<usize> {
+        let mut values = BTreeSet::new();
+        for command in gpu_commands.iter().take(16) {
+            values.insert(command.index);
+        }
+        for command in gpu_commands.iter().rev().take(16) {
+            values.insert(command.index);
+        }
+
+        let mut by_pipeline = BTreeMap::<usize, Vec<usize>>::new();
+        for command in gpu_commands {
+            by_pipeline
+                .entry(command.pipeline_index)
+                .or_default()
+                .push(command.index);
+        }
+        for (pipeline_index, mut command_indices) in by_pipeline {
+            command_indices.sort_unstable();
+            command_indices.dedup();
+            let pipeline_command_count = pipelines
+                .get(pipeline_index)
+                .map(|pipeline| pipeline.gpu_command_count)
+                .unwrap_or(command_indices.len());
+            if pipeline_command_count <= 2 || command_indices.len() <= 6 {
+                values.extend(command_indices);
+                continue;
+            }
+            values.extend(command_indices.iter().copied().take(3));
+            values.extend(command_indices.iter().copied().rev().take(3));
+        }
+
+        values.into_iter().collect()
+    }
+
+    unsafe fn new_shader_execution_history(
+        history_class: Class,
+        trace_data: Id,
+        style: u32,
+        options: u32,
+        delegate: Id,
+    ) -> Result<Id> {
+        unsafe {
+            let history = send_id(history_class, "alloc")?;
+            send_id_id_u32_u32_id(
+                history,
+                "initWithTraceData:style:options:delegate:",
+                trace_data,
+                style,
+                options,
+                delegate,
+            )
+        }
+    }
+
+    fn draw_execution_history_probe_indices(
+        pipelines: &[XcodeMioPipeline],
+        gpu_commands: &[XcodeMioGpuCommand],
+    ) -> Vec<u32> {
+        let mut values = BTreeSet::new();
+        for command in gpu_commands.iter().take(16) {
+            if let Ok(index) = u32::try_from(command.index) {
+                values.insert(index);
+            }
+        }
+        for command in gpu_commands.iter().rev().take(16) {
+            if let Ok(index) = u32::try_from(command.index) {
+                values.insert(index);
+            }
+        }
+        for command in gpu_commands {
+            if pipelines
+                .get(command.pipeline_index)
+                .is_some_and(|pipeline| pipeline.gpu_command_count <= 2)
+                && let Ok(index) = u32::try_from(command.index)
+            {
+                values.insert(index);
+            }
+        }
+        values.into_iter().collect()
+    }
+
+    fn draw_execution_history_draw_index_candidates(
+        command: &XcodeMioGpuCommand,
+    ) -> Vec<(&'static str, u32)> {
+        let mut values = Vec::new();
+        let mut seen = BTreeSet::new();
+        if let Ok(index) = u32::try_from(command.index)
+            && seen.insert(index)
+        {
+            values.push(("command_index", index));
+        }
+        if let Ok(function_index) = u32::try_from(command.function_index)
+            && seen.insert(function_index)
+        {
+            values.push(("function_index", function_index));
+        }
+        values
+    }
+
+    fn draw_execution_history_style_candidates() -> impl Iterator<Item = u32> {
+        [0_u32, 1, 2, 4].into_iter()
+    }
+
+    fn draw_execution_history_options_candidates() -> impl Iterator<Item = u32> {
+        [0_u32, 1, 2, 4, 8, 15].into_iter()
+    }
+
+    unsafe fn push_draw_execution_history_nodes(
+        probes: &mut Vec<XcodeMioDrawExecutionHistoryProbe>,
+        history: Id,
+        source: &'static str,
+        mode: &'static str,
+        command: &XcodeMioGpuCommand,
+        draw_index: u32,
+        style: u32,
+        options: u32,
+        program_type: u16,
+        generated: bool,
+    ) {
+        unsafe {
+            if let Ok(node) = send_id_u32_allow_nil(history, "nodeForStyle:", style)
+                && !node.is_null()
+            {
+                push_draw_execution_history_node(
+                    probes,
+                    node,
+                    source,
+                    mode,
+                    "nodeForStyle",
+                    command,
+                    draw_index,
+                    style,
+                    options,
+                    program_type,
+                    generated,
+                    false,
+                );
+                push_draw_execution_history_node(
+                    probes,
+                    node,
+                    source,
+                    mode,
+                    "nodeForStyle.best",
+                    command,
+                    draw_index,
+                    style,
+                    options,
+                    program_type,
+                    generated,
+                    true,
+                );
+            }
+            for (selector, node_source) in [
+                ("callStack", "callStack"),
+                ("compact", "compact"),
+                ("full", "full"),
+            ] {
+                if !responds_to_selector(history, selector) {
+                    continue;
+                }
+                let Ok(node) = send_id_allow_nil(history, selector) else {
+                    continue;
+                };
+                if node.is_null() {
+                    continue;
+                }
+                push_draw_execution_history_node(
+                    probes,
+                    node,
+                    source,
+                    mode,
+                    node_source,
+                    command,
+                    draw_index,
+                    style,
+                    options,
+                    program_type,
+                    generated,
+                    false,
+                );
+                push_draw_execution_history_node(
+                    probes,
+                    node,
+                    source,
+                    mode,
+                    match node_source {
+                        "callStack" => "callStack.best",
+                        "compact" => "compact.best",
+                        "full" => "full.best",
+                        _ => "best",
+                    },
+                    command,
+                    draw_index,
+                    style,
+                    options,
+                    program_type,
+                    generated,
+                    true,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn push_draw_execution_history_node(
+        probes: &mut Vec<XcodeMioDrawExecutionHistoryProbe>,
+        node: Id,
+        source: &'static str,
+        mode: &'static str,
+        node_source: &'static str,
+        command: &XcodeMioGpuCommand,
+        draw_index: u32,
+        style: u32,
+        options: u32,
+        program_type: u16,
+        generated: bool,
+        best_descendant: bool,
+    ) {
+        let decoded = if best_descendant {
+            unsafe { decode_execution_history_node(node) }
+        } else {
+            unsafe { decode_execution_history_node_self(node) }
+        };
+        if decoded.top_cost_percentage == 0.0
+            && decoded.duration_percentage == 0.0
+            && decoded.total_duration_ns == 0
+            && decoded.total_cost == 0.0
+            && decoded.instruction_count == 0
+        {
+            return;
+        }
+        probes.push(XcodeMioDrawExecutionHistoryProbe {
+            source,
+            mode,
+            node_source,
+            command_index: command.index,
+            draw_index,
+            pipeline_index: command.pipeline_index,
+            function_name: command.function_name.clone(),
+            style,
+            options,
+            program_type,
+            generated,
+            top_cost_percentage: decoded.top_cost_percentage,
+            duration_percentage: decoded.duration_percentage,
+            total_duration_ns: decoded.total_duration_ns,
+            total_cost: decoded.total_cost,
+            instruction_count: decoded.instruction_count,
+        });
+    }
+
+    unsafe fn enumerate_draw_indices_for_pipeline(
+        trace_data: Id,
+        pipeline_state_id: u64,
+    ) -> Vec<u64> {
+        let values = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let callback_values = Arc::clone(&values);
+        let block = RcBlock::new(move |draw_index: u64| {
+            if let Ok(mut values) = callback_values.lock() {
+                values.push(draw_index);
+            }
+        });
+        let block_ptr = RcBlock::as_ptr(&block).cast::<c_void>();
+        if unsafe {
+            send_void_u64_id(
+                trace_data,
+                "enumerateDrawsForPipelineState:enumerator:",
+                pipeline_state_id,
+                block_ptr.cast(),
+            )
+        }
+        .is_err()
+        {
+            return Vec::new();
+        }
+        let mut values = values
+            .lock()
+            .map(|values| values.clone())
+            .unwrap_or_default();
+        values.sort_unstable();
+        values.dedup();
+        values
+    }
+
+    fn pipeline_function_time_candidates(
+        pipeline: &XcodeMioPipeline,
+        sources: EnumFunctionTimeSources,
+        timeline_pipeline_state_ids: &[u64],
+    ) -> Vec<(&'static str, u64)> {
+        let mut candidates = vec![
+            (sources.object_id, pipeline.object_id),
+            (sources.pointer_id, pipeline.pointer_id),
+            (sources.function_index, pipeline.function_index),
+            (sources.pipeline_index, pipeline.index as u64),
+        ];
+        let raw_ids = pipeline
+            .shader_binary_references
+            .iter()
+            .filter(|reference| reference.raw5 == 6 && reference.raw6 == 28)
+            .map(|reference| reference.raw1 as u64)
+            .collect::<BTreeSet<_>>();
+        candidates.extend(raw_ids.into_iter().map(|raw1| ("shader_binary_raw1", raw1)));
+        if let Some(pipeline_state_id) = timeline_pipeline_state_ids.get(pipeline.index) {
+            candidates.push(("timeline_pipeline_state_id", *pipeline_state_id));
+        }
+        let mut seen = BTreeSet::new();
+        candidates
+            .into_iter()
+            .filter(|candidate| seen.insert(candidate.1))
+            .collect()
+    }
+
+    fn encoder_function_time_candidates(encoder: &XcodeMioEncoder) -> Vec<(&'static str, u64)> {
+        let candidates = [
+            ("encoder.index", encoder.index as u64),
+            ("encoder.function_index", encoder.function_index),
+            (
+                "encoder.gpu_command_start_index",
+                encoder.gpu_command_start_index as u64,
+            ),
+        ];
+        let mut seen = BTreeSet::new();
+        candidates
+            .into_iter()
+            .filter(|candidate| seen.insert(candidate.1))
+            .collect()
+    }
+
+    unsafe fn enumerate_draw_indices_for_encoder(
+        trace_data: Id,
+        encoder_function_index: u32,
+    ) -> Vec<u64> {
+        let values = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let callback_values = Arc::clone(&values);
+        let block = RcBlock::new(move |draw_index: u64| {
+            if let Ok(mut values) = callback_values.lock() {
+                values.push(draw_index);
+            }
+        });
+        let block_ptr = RcBlock::as_ptr(&block).cast::<c_void>();
+        if unsafe {
+            send_void_u32_id(
+                trace_data,
+                "enumerateDrawsForEncoder:enumerator:",
+                encoder_function_index,
+                block_ptr.cast(),
+            )
+        }
+        .is_err()
+        {
+            return Vec::new();
+        }
+        let values = values
+            .lock()
+            .map(|values| values.clone())
+            .unwrap_or_default();
+        let mut seen = BTreeSet::new();
+        values
+            .into_iter()
+            .filter(|value| seen.insert(*value))
+            .collect()
+    }
+
+    fn command_for_enumerated_draw(
+        gpu_commands: &[XcodeMioGpuCommand],
+        draw_index: u64,
+    ) -> Option<&XcodeMioGpuCommand> {
+        gpu_commands
+            .iter()
+            .find(|command| command.function_index == draw_index)
+            .or_else(|| {
+                usize::try_from(draw_index).ok().and_then(|index| {
+                    gpu_commands
+                        .get(index)
+                        .filter(|command| command.index == index)
+                })
+            })
+    }
+
+    fn command_for_top_draw_track(
+        first_index: u64,
+        trace: Option<RawGtmioDrawTrace>,
+        gpu_commands: &[XcodeMioGpuCommand],
+    ) -> Option<&XcodeMioGpuCommand> {
+        trace
+            .and_then(|trace| command_for_enumerated_draw(gpu_commands, trace.raw2 as u64))
+            .or_else(|| command_for_enumerated_draw(gpu_commands, first_index))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn top_draw_track_row(
+        source: &'static str,
+        track_index: usize,
+        trace_index: usize,
+        track_id: i32,
+        first_index: u64,
+        start_timestamp_ns: u64,
+        end_timestamp_ns: u64,
+        duration_ns: u64,
+        trace_count: u64,
+        trace: RawGtmioDrawTrace,
+        command: Option<&XcodeMioGpuCommand>,
+    ) -> XcodeMioTopDrawTrack {
+        XcodeMioTopDrawTrack {
+            source,
+            track_index,
+            trace_index,
+            track_id,
+            first_index,
+            start_timestamp_ns,
+            end_timestamp_ns,
+            duration_ns,
+            trace_count,
+            trace_raw0: trace.raw0,
+            trace_raw1: trace.raw1,
+            trace_raw2: trace.raw2,
+            trace_raw3: trace.raw3,
+            trace_duration_ns: trace.raw1.saturating_sub(trace.raw0),
+            command_index: command.map(|command| command.index),
+            function_index: command.map(|command| command.function_index),
+            sub_command_index: command.map(|command| command.sub_command_index),
+            encoder_index: command.map(|command| command.encoder_index),
+            pipeline_index: command.map(|command| command.pipeline_index),
+            function_name: command.and_then(|command| command.function_name.clone()),
+        }
+    }
+
+    unsafe fn best_duration_for_draw(trace_data: Id, draw_index: u32) -> Option<(u64, u16)> {
+        let mut best_duration_ns = 0_u64;
+        let mut best_data_master = 0_u16;
+        for data_master in function_time_data_master_candidates() {
+            let duration_ns = unsafe {
+                send_u64_u32_u16(
+                    trace_data,
+                    "durationForDraw:dataMaster:",
+                    draw_index,
+                    data_master,
+                )
+            }
+            .unwrap_or(0);
+            if duration_ns > best_duration_ns {
+                best_duration_ns = duration_ns;
+                best_data_master = data_master;
+            }
+        }
+        (best_duration_ns > 0).then_some((best_duration_ns, best_data_master))
+    }
+
+    unsafe fn best_kick_duration_for_encoder(trace_data: Id, encoder_function_index: u32) -> u64 {
+        let mut best = 0_u64;
+        if unsafe { responds_to_selector(trace_data, "kickDurationForEncoder:") } {
+            best = best.max(
+                unsafe {
+                    send_u64_u32(
+                        trace_data,
+                        "kickDurationForEncoder:",
+                        encoder_function_index,
+                    )
+                }
+                .unwrap_or(0),
+            );
+        }
+        if unsafe { responds_to_selector(trace_data, "kickDurationForEncoder:dataMaster:") } {
+            for data_master in function_time_data_master_candidates() {
+                best = best.max(
+                    unsafe {
+                        send_u64_u32_u16(
+                            trace_data,
+                            "kickDurationForEncoder:dataMaster:",
+                            encoder_function_index,
+                            data_master,
+                        )
+                    }
+                    .unwrap_or(0),
+                );
+            }
+        }
+        best
+    }
+
+    fn function_time_data_master_candidates() -> impl Iterator<Item = u16> {
+        [
+            0_u16, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 28,
+        ]
+        .into_iter()
+    }
+
     unsafe fn draw_duration(timeline: Id, draw_index: u32, metadata_data_master: u16) -> u64 {
         let mut best = 0_u64;
         let mut candidates = BTreeSet::from([metadata_data_master, 0, 1, 2, 8, 28]);
@@ -4169,8 +7635,9 @@ mod platform {
     const _: () = assert!(std::mem::size_of::<RawGtmioCostInfo>() == 304);
     const _: () = assert!(std::mem::size_of::<RawGtStatistics>() == 24);
     const _: () = assert!(std::mem::size_of::<RawGtShaderProfilerTiming>() == 80);
-    const _: () = assert!(std::mem::size_of::<RawGtmioBinaryTrace>() == 40);
     const _: () = assert!(std::mem::size_of::<RawGtmioDrawTrace>() == 24);
+    const _: () = assert!(std::mem::size_of::<RawGtmioBinaryTrace>() == 40);
+    const _: () = assert!(std::mem::size_of::<RawGtmioUSCCliqueMetadata>() == 80);
 
     struct FdSilencer {
         stdout_fd: c_int,
@@ -4271,6 +7738,26 @@ mod platform {
         u16::from_ne_bytes(bytes[offset..offset + 2].try_into().expect("u16 slice"))
     }
 
+    unsafe fn decode_draw_metadata_record(
+        draws: *const u8,
+        index: usize,
+    ) -> XcodeMioDrawMetadataRecord {
+        let draw = unsafe { std::slice::from_raw_parts(draws.add(index * 44), 44) };
+        XcodeMioDrawMetadataRecord {
+            index,
+            raw0: read_u32(draw, 0),
+            raw1: read_u32(draw, 4),
+            raw2: read_u32(draw, 8),
+            raw3: read_u32(draw, 12),
+            raw4: read_i32(draw, 16),
+            raw5: read_u32(draw, 20),
+            raw6: read_u64(draw, 24),
+            raw7: read_u32(draw, 32),
+            raw8: read_u32(draw, 36),
+            raw9: read_u32(draw, 40),
+        }
+    }
+
     unsafe fn nsstring_to_string(value: Id) -> Option<String> {
         let bytes = unsafe { send_ptr(value, "UTF8String").ok()? };
         if bytes.is_null() {
@@ -4280,6 +7767,211 @@ mod platform {
             .to_str()
             .ok()
             .map(ToOwned::to_owned)
+    }
+
+    unsafe fn object_ivar(object: Id, ivar_name: &str) -> Option<Id> {
+        if object.is_null() {
+            return None;
+        }
+        let class = unsafe { object_getClass(object) };
+        if class.is_null() {
+            return None;
+        }
+        let name = CString::new(ivar_name).ok()?;
+        let ivar = unsafe { class_getInstanceVariable(class, name.as_ptr()) };
+        if ivar.is_null() || !unsafe { ivar_is_object(ivar) } {
+            return None;
+        }
+        let value = unsafe { object_getIvar(object, ivar) };
+        (!value.is_null()).then_some(value)
+    }
+
+    unsafe fn object_ivar_assume_object(object: Id, ivar_name: &str) -> Option<Id> {
+        if object.is_null() {
+            return None;
+        }
+        let class = unsafe { object_getClass(object) };
+        if class.is_null() {
+            return None;
+        }
+        let name = CString::new(ivar_name).ok()?;
+        let ivar = unsafe { class_getInstanceVariable(class, name.as_ptr()) };
+        if ivar.is_null() {
+            return None;
+        }
+        let value = unsafe { object_getIvar(object, ivar) };
+        (!value.is_null()).then_some(value)
+    }
+
+    unsafe fn ivar_is_object(ivar: Ivar) -> bool {
+        let encoding = unsafe { ivar_getTypeEncoding(ivar) };
+        if encoding.is_null() {
+            return false;
+        }
+        unsafe { CStr::from_ptr(encoding).to_bytes().first() == Some(&b'@') }
+    }
+
+    unsafe fn push_numeric_array_probe(
+        out: &mut Vec<XcodeMioPrivateNumericArray>,
+        receiver: Id,
+        selector_or_ivar: &str,
+        source: &'static str,
+    ) {
+        let value = if selector_or_ivar.starts_with('_') {
+            unsafe { object_ivar(receiver, selector_or_ivar) }
+        } else if unsafe { responds_to_selector(receiver, selector_or_ivar) } {
+            unsafe { send_id_allow_nil(receiver, selector_or_ivar).ok() }
+                .filter(|value| !value.is_null())
+        } else {
+            None
+        };
+        let Some(value) = value else {
+            return;
+        };
+        let rows = unsafe { decode_numeric_rows(value) };
+        if !rows.is_empty() {
+            out.push(XcodeMioPrivateNumericArray { source, rows });
+        }
+    }
+
+    unsafe fn push_parent_processor_numeric_probes(
+        out: &mut Vec<XcodeMioPrivateNumericArray>,
+        processor: Id,
+    ) {
+        let Some(shader_processor) =
+            (unsafe { object_ivar_assume_object(processor, "_shaderProfilerProcessor") })
+        else {
+            return;
+        };
+        unsafe {
+            push_numeric_ivar_probe(
+                out,
+                shader_processor,
+                "_effectivePerEncoderDrawKickTimes",
+                "stream_processor._shaderProfilerProcessor._effectivePerEncoderDrawKickTimes",
+            );
+            push_numeric_ivar_probe(
+                out,
+                shader_processor,
+                "_shaderProfilerFrameTimes",
+                "stream_processor._shaderProfilerProcessor._shaderProfilerFrameTimes",
+            );
+            push_numeric_array_probe(
+                out,
+                shader_processor,
+                "effectivePerEncoderDrawKickTimes",
+                "stream_processor._shaderProfilerProcessor.effectivePerEncoderDrawKickTimes",
+            );
+        }
+        if let Some(shader_profiler) =
+            unsafe { object_ivar_assume_object(shader_processor, "_shaderProfiler") }
+        {
+            unsafe {
+                push_numeric_array_probe(
+                    out,
+                    shader_profiler,
+                    "effectiveKickTimes",
+                    "stream_processor._shaderProfilerProcessor._shaderProfiler.effectiveKickTimes",
+                );
+                push_numeric_array_probe(
+                    out,
+                    shader_profiler,
+                    "averagePerDrawKickDurations",
+                    "stream_processor._shaderProfilerProcessor._shaderProfiler.averagePerDrawKickDurations",
+                );
+            }
+        }
+    }
+
+    unsafe fn push_numeric_ivar_probe(
+        out: &mut Vec<XcodeMioPrivateNumericArray>,
+        receiver: Id,
+        ivar_name: &str,
+        source: &'static str,
+    ) {
+        let Some(value) = (unsafe { object_ivar_assume_object(receiver, ivar_name) }) else {
+            return;
+        };
+        let rows = unsafe { decode_numeric_rows(value) };
+        if !rows.is_empty() {
+            out.push(XcodeMioPrivateNumericArray { source, rows });
+        }
+    }
+
+    unsafe fn decode_numeric_rows(value: Id) -> Vec<Vec<f64>> {
+        unsafe { decode_numeric_rows_at(value, 0) }
+    }
+
+    unsafe fn decode_numeric_rows_at(value: Id, depth: usize) -> Vec<Vec<f64>> {
+        if value.is_null() || depth > 8 {
+            return Vec::new();
+        }
+        if let Some(value) = unsafe { objc_number_value(value) } {
+            return vec![vec![value]];
+        }
+        if unsafe { responds_to_selector(value, "allValues") } {
+            if let Ok(values) = unsafe { send_id_allow_nil(value, "allValues") }
+                && !values.is_null()
+            {
+                let rows = unsafe { decode_numeric_rows_at(values, depth + 1) };
+                if !rows.is_empty() {
+                    return rows;
+                }
+            }
+        }
+        if !unsafe { responds_to_selector(value, "count") }
+            || !unsafe { responds_to_selector(value, "objectAtIndex:") }
+        {
+            return Vec::new();
+        }
+        let count = unsafe { send_u64(value, "count").unwrap_or(0) as usize }.min(20_000);
+        let mut rows = Vec::new();
+        let mut scalar_row = Vec::new();
+        for index in 0..count {
+            let Ok(item) = (unsafe { send_id_usize(value, "objectAtIndex:", index) }) else {
+                continue;
+            };
+            if let Some(number) = unsafe { objc_number_value(item) } {
+                scalar_row.push(number);
+                continue;
+            }
+            let nested_rows = unsafe { decode_numeric_rows_at(item, depth + 1) };
+            if nested_rows.is_empty() {
+                continue;
+            }
+            if !scalar_row.is_empty() {
+                rows.push(std::mem::take(&mut scalar_row));
+            }
+            rows.extend(nested_rows);
+        }
+        if !scalar_row.is_empty() {
+            rows.push(scalar_row);
+        }
+        rows
+    }
+
+    unsafe fn objc_number_value(value: Id) -> Option<f64> {
+        if !unsafe { is_kind_of_class(value, "NSNumber") }
+            || !unsafe { responds_to_selector(value, "doubleValue") }
+        {
+            return None;
+        }
+        unsafe { send_f64(value, "doubleValue").ok() }
+    }
+
+    unsafe fn is_kind_of_class(receiver: Id, class_name: &str) -> bool {
+        if receiver.is_null() {
+            return false;
+        }
+        let Ok(class) = (unsafe { lookup_class(class_name) }) else {
+            return false;
+        };
+        let Ok(sel) = (unsafe { selector("isKindOfClass:") }) else {
+            return false;
+        };
+        let f: extern "C" fn(Id, Sel, Class) -> i8 =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        f(receiver, sel, class) != 0
     }
 
     unsafe fn load_framework(path: &str) -> Result<()> {
@@ -4441,6 +8133,86 @@ mod platform {
         }
     }
 
+    unsafe fn send_id_id_u32_u16_u64(
+        receiver: Id,
+        sel: &str,
+        first: Id,
+        second: u32,
+        third: u16,
+        fourth: u64,
+    ) -> Result<Id> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, Id, u32, u16, u64) -> Id =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        let value = f(receiver, sel, first, second, third, fourth);
+        if value.is_null() {
+            Err(Error::InvalidInput(
+                "Objective-C message returned nil".to_owned(),
+            ))
+        } else {
+            Ok(value)
+        }
+    }
+
+    unsafe fn send_id_id_u32_u64_u16_u64(
+        receiver: Id,
+        sel: &str,
+        first: Id,
+        second: u32,
+        third: u64,
+        fourth: u16,
+        fifth: u64,
+    ) -> Result<Id> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, Id, u32, u64, u16, u64) -> Id =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        let value = f(receiver, sel, first, second, third, fourth, fifth);
+        if value.is_null() {
+            Err(Error::InvalidInput(
+                "Objective-C message returned nil".to_owned(),
+            ))
+        } else {
+            Ok(value)
+        }
+    }
+
+    unsafe fn send_id_id_u32_u32_u16_u64(
+        receiver: Id,
+        sel: &str,
+        first: Id,
+        second: u32,
+        third: u32,
+        fourth: u16,
+        fifth: u64,
+    ) -> Result<Id> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, Id, u32, u32, u16, u64) -> Id =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        let value = f(receiver, sel, first, second, third, fourth, fifth);
+        if value.is_null() {
+            Err(Error::InvalidInput(
+                "Objective-C message returned nil".to_owned(),
+            ))
+        } else {
+            Ok(value)
+        }
+    }
+
     unsafe fn send_id_u64_u16_allow_nil(
         receiver: Id,
         sel: &str,
@@ -4525,6 +8297,71 @@ mod platform {
         Ok(())
     }
 
+    unsafe fn send_void_u64_id(receiver: Id, sel: &str, first: u64, second: Id) -> Result<()> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u64, Id) =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        f(receiver, sel, first, second);
+        Ok(())
+    }
+
+    unsafe fn send_void_u32_id(receiver: Id, sel: &str, first: u32, second: Id) -> Result<()> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u32, Id) =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        f(receiver, sel, first, second);
+        Ok(())
+    }
+
+    unsafe fn send_void_u32_u16_id(
+        receiver: Id,
+        sel: &str,
+        first: u32,
+        second: u16,
+        third: Id,
+    ) -> Result<()> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u32, u16, Id) =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        f(receiver, sel, first, second, third);
+        Ok(())
+    }
+
+    unsafe fn send_void_u32_u16_id_id(
+        receiver: Id,
+        sel: &str,
+        first: u32,
+        second: u16,
+        third: Id,
+        fourth: Id,
+    ) -> Result<()> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u32, u16, Id, Id) =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        f(receiver, sel, first, second, third, fourth);
+        Ok(())
+    }
+
     unsafe fn send_void_u64_u16_id_id(
         receiver: Id,
         sel: &str,
@@ -4562,6 +8399,30 @@ mod platform {
         } else {
             0
         }
+    }
+
+    unsafe fn send_u64_u64(receiver: Id, sel: &str, arg: u64) -> Result<u64> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u64) -> u64 =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, arg))
+    }
+
+    unsafe fn send_u64_u32(receiver: Id, sel: &str, arg: u32) -> Result<u64> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u32) -> u64 =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, arg))
     }
 
     unsafe fn send_u64_u32_u16(receiver: Id, sel: &str, first: u32, second: u16) -> Result<u64> {
@@ -4621,6 +8482,36 @@ mod platform {
         Ok(f(receiver, sel, arg))
     }
 
+    unsafe fn send_i8_u32_u16(receiver: Id, sel: &str, first: u32, second: u16) -> Result<i8> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u32, u16) -> i8 =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, first, second))
+    }
+
+    unsafe fn send_i8_id_u32_id(
+        receiver: Id,
+        sel: &str,
+        first: Id,
+        second: u32,
+        third: Id,
+    ) -> Result<i8> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, Id, u32, Id) -> i8 =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, first, second, third))
+    }
+
     unsafe fn send_f64(receiver: Id, sel: &str) -> Result<f64> {
         if receiver.is_null() {
             return Err(Error::InvalidInput(format!(
@@ -4630,6 +8521,14 @@ mod platform {
         let sel = unsafe { selector(sel)? };
         let f: extern "C" fn(Id, Sel) -> f64 = unsafe { mem::transmute(objc_msgSend as *const ()) };
         Ok(f(receiver, sel))
+    }
+
+    unsafe fn send_f64_if_supported(receiver: Id, sel: &str) -> f64 {
+        if unsafe { responds_to_selector(receiver, sel) } {
+            unsafe { send_f64(receiver, sel).unwrap_or(0.0) }
+        } else {
+            0.0
+        }
     }
 
     unsafe fn send_f64_u32(receiver: Id, sel: &str, arg: u32) -> Result<f64> {
@@ -4705,6 +8604,23 @@ mod platform {
         }
         let sel = unsafe { selector(sel)? };
         let f: extern "C" fn(Id, Sel, u64, u32) -> *const c_void =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, first, second))
+    }
+
+    unsafe fn send_ptr_u64_i32(
+        receiver: Id,
+        sel: &str,
+        first: u64,
+        second: i32,
+    ) -> Result<*const c_void> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u64, i32) -> *const c_void =
             unsafe { mem::transmute(objc_msgSend as *const ()) };
         Ok(f(receiver, sel, first, second))
     }
@@ -4795,7 +8711,7 @@ mod platform {
 mod platform {
     use std::path::PathBuf;
 
-    use super::{XcodeMioReport, XcodeMioTimings};
+    use super::{XcodeMioDecodeOptions, XcodeMioReport, XcodeMioTimings};
     use crate::error::{Error, Result};
     use crate::profiler;
 
@@ -4805,6 +8721,7 @@ mod platform {
         _stream_data_path: PathBuf,
         _profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
         _timings: XcodeMioTimings,
+        _options: XcodeMioDecodeOptions,
     ) -> Result<XcodeMioReport> {
         Err(Error::Unsupported(
             "xcode-mio is only available on macOS with Xcode installed",

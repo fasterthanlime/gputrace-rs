@@ -25,6 +25,7 @@ pub mod shaders;
 pub mod timeline;
 pub mod timing;
 pub mod trace;
+pub mod xcode_command_costs;
 pub mod xcode_counters;
 pub mod xcode_mio;
 

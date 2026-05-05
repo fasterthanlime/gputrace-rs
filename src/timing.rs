@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::profiler;
 use crate::trace::TraceBundle;
+use crate::xcode_mio;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TimingReport {
@@ -17,6 +18,20 @@ pub struct TimingReport {
     pub command_buffers: Vec<CommandBufferTiming>,
     pub encoders: Vec<EncoderTiming>,
     pub kernels: Vec<KernelTiming>,
+    pub agxps_pipeline_costs: Vec<AgxpsPipelineTimingCost>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgxpsPipelineTimingCost {
+    pub name: String,
+    pub command_count: usize,
+    pub analyzer_weighted_cost: u64,
+    pub analyzer_percent: f64,
+    pub instruction_cost: u64,
+    pub instruction_percent: Option<f64>,
+    pub execution_events: u64,
+    pub matched_work_cliques: usize,
+    pub record_cliques: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +154,25 @@ pub fn report_with_profiler_summary(
     trace: &TraceBundle,
     profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
 ) -> Result<TimingReport> {
+    report_with_context(trace, profiler_summary, None)
+}
+
+pub fn report_with_context(
+    trace: &TraceBundle,
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+    xcode_mio_report: Option<&xcode_mio::XcodeMioAnalysisReport>,
+) -> Result<TimingReport> {
+    let mut report = report_without_agxps(trace, profiler_summary)?;
+    report.agxps_pipeline_costs = xcode_mio_report
+        .map(agxps_costs_from_xcode_mio)
+        .unwrap_or_default();
+    Ok(report)
+}
+
+fn report_without_agxps(
+    trace: &TraceBundle,
+    profiler_summary: Option<&profiler::ProfilerStreamDataSummary>,
+) -> Result<TimingReport> {
     if let Some(summary) = profiler_summary {
         return Ok(report_from_profiler(trace, &summary));
     }
@@ -252,7 +286,39 @@ pub fn report_with_profiler_summary(
         command_buffers: command_buffer_timings,
         encoders,
         kernels,
+        agxps_pipeline_costs: Vec::new(),
     })
+}
+
+fn agxps_costs_from_xcode_mio(
+    report: &xcode_mio::XcodeMioAnalysisReport,
+) -> Vec<AgxpsPipelineTimingCost> {
+    let mut rows = report
+        .top_pipelines
+        .iter()
+        .filter(|pipeline| pipeline.agxps_analyzer_cost > 0)
+        .map(|pipeline| AgxpsPipelineTimingCost {
+            name: pipeline
+                .function_name
+                .clone()
+                .unwrap_or_else(|| "<unknown function>".to_owned()),
+            command_count: pipeline.command_count,
+            analyzer_weighted_cost: pipeline.agxps_analyzer_cost,
+            analyzer_percent: pipeline.agxps_analyzer_cost_percent.unwrap_or(0.0),
+            instruction_cost: pipeline.agxps_trace_cost,
+            instruction_percent: pipeline.agxps_trace_cost_percent,
+            execution_events: pipeline.agxps_trace_events,
+            matched_work_cliques: pipeline.agxps_trace_matched_work_cliques,
+            record_cliques: pipeline.agxps_analyzer_record_cliques,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .analyzer_weighted_cost
+            .cmp(&left.analyzer_weighted_cost)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rows
 }
 
 fn report_from_profiler(
@@ -374,6 +440,7 @@ fn report_from_profiler(
         command_buffers: command_buffer_timings,
         encoders,
         kernels,
+        agxps_pipeline_costs: Vec::new(),
     }
 }
 
@@ -494,6 +561,7 @@ fn report_from_raw_profiler(
         command_buffers: command_buffer_rows,
         encoders: encoder_rows,
         kernels,
+        agxps_pipeline_costs: Vec::new(),
     })
 }
 
@@ -551,9 +619,15 @@ pub fn format_report(report: &TimingReport) -> String {
         out.push_str(
             "Kernel, dispatch, and encoder timing come from streamData; command-buffer rows prefer APSTimelineData spans when present.\n",
         );
-        out.push_str(
-            "Caveat: streamData's `cumulative_us` is the *dispatch-issue cadence* (the CPU-side clock that ticks each time a dispatch is enqueued), not actual GPU compute time. Apple's profiler advances it by a fixed ~µs per dispatch regardless of how long the dispatch actually runs on the GPU. Empirically a 4096-thread × 4096-iter ALU loop and a 32-thread element-wise add are both reported at the same ~6µs per dispatch. So the kernel %% column reflects dispatch *count* weighted by issue cadence, not real cost. Xcode's GPU profiler computes cost from `Profiling_f_*.raw` USC sample streams (compressed nibble-packed sample data — a separate decode that gputrace-rs doesn't yet implement); use Xcode's Performance tab if you need actual per-kernel cost.\n\n",
-        );
+        if report.agxps_pipeline_costs.is_empty() {
+            out.push_str(
+                "Caveat: streamData's `cumulative_us` is the *dispatch-issue cadence* (the CPU-side clock that ticks each time a dispatch is enqueued), not actual GPU compute time. Apple's profiler advances it by a fixed ~µs per dispatch regardless of how long the dispatch actually runs on the GPU. So the kernel %% column below reflects dispatch *count* weighted by issue cadence, not real cost. No AGXPS analyzer-weighted pipeline costs were available for this run.\n\n",
+            );
+        } else {
+            out.push_str(
+                "AGXPS pipeline candidates below come from Xcode's private timing analyzer over Profiling_f_*.raw. `Ana %` is analyzer-weighted clique duration; `W1 %` is the instruction-stats word1 aggregate. Neither is exact Xcode UI parity on the validated non-synthetic trace yet. The streamData kernel table remains dispatch-cadence timing, not real GPU cost.\n\n",
+            );
+        }
         if kernel_percent_denominator_ns(&report.kernels, report.total_duration_ns)
             > report.total_duration_ns
         {
@@ -574,6 +648,26 @@ pub fn format_report(report: &TimingReport) -> String {
         report.encoder_count,
         report.dispatch_count
     ));
+    if !report.agxps_pipeline_costs.is_empty() {
+        out.push_str("AGXPS pipeline cost candidates:\n");
+        out.push_str(&format!(
+            "{:<42} {:>5} {:>9} {:>9} {:>14} {:>10} {:>10}\n",
+            "Name", "Cmds", "Ana %", "W1 %", "Weighted Cost", "Events", "Cliques"
+        ));
+        for row in report.agxps_pipeline_costs.iter().take(20) {
+            out.push_str(&format!(
+                "{:<42} {:>5} {:>8.3}% {:>8} {:>14} {:>10} {:>10}\n",
+                truncate(&row.name, 42),
+                row.command_count,
+                row.analyzer_percent,
+                format_optional_percent(row.instruction_percent),
+                row.analyzer_weighted_cost,
+                row.execution_events,
+                row.record_cliques,
+            ));
+        }
+        out.push('\n');
+    }
     if !report.kernels.is_empty() {
         out.push_str("Kernels:\n");
         out.push_str(&format!(
@@ -683,6 +777,13 @@ fn truncate(value: &str, width: usize) -> String {
     format!("{}...", &value[..keep])
 }
 
+fn format_optional_percent(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.3}%"))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
 fn escape_csv(value: &str) -> String {
     if value.contains([',', '"', '\n']) {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -723,6 +824,7 @@ mod tests {
                 p95_duration_ns: 60,
                 p99_duration_ns: 60,
             }],
+            agxps_pipeline_costs: Vec::new(),
         };
         let csv = format_csv(&report);
         assert!(csv.contains("p50_duration_ns"));
@@ -807,6 +909,7 @@ mod tests {
                 p95_duration_ns: 1_000,
                 p99_duration_ns: 1_000,
             }],
+            agxps_pipeline_costs: Vec::new(),
         };
 
         let text = format_report(&report);
@@ -814,6 +917,37 @@ mod tests {
         assert!(text.contains("APSTimelineData"));
         assert!(text.contains("Duration ns"));
         assert!(text.contains("P95 ns"));
+    }
+
+    #[test]
+    fn formats_agxps_pipeline_costs() {
+        let report = TimingReport {
+            synthetic: false,
+            source: "streamData".into(),
+            total_duration_ns: 1_500,
+            command_buffer_count: 1,
+            encoder_count: 0,
+            dispatch_count: 2,
+            command_buffers: Vec::new(),
+            encoders: Vec::new(),
+            kernels: Vec::new(),
+            agxps_pipeline_costs: vec![AgxpsPipelineTimingCost {
+                name: "hot_kernel".into(),
+                command_count: 2,
+                analyzer_weighted_cost: 90,
+                analyzer_percent: 90.0,
+                instruction_cost: 50,
+                instruction_percent: Some(50.0),
+                execution_events: 123,
+                matched_work_cliques: 7,
+                record_cliques: 11,
+            }],
+        };
+
+        let text = format_report(&report);
+        assert!(text.contains("AGXPS pipeline cost candidates"));
+        assert!(text.contains("hot_kernel"));
+        assert!(text.contains("90.000%"));
     }
 
     #[test]
@@ -851,6 +985,7 @@ mod tests {
                 p95_duration_ns: 450,
                 p99_duration_ns: 450,
             }],
+            agxps_pipeline_costs: Vec::new(),
         };
 
         let text = format_report(&report);

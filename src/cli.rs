@@ -31,6 +31,7 @@ use crate::shaders;
 use crate::timeline;
 use crate::timing;
 use crate::trace::{RecordType, TraceBundle};
+use crate::xcode_command_costs;
 use crate::xcode_counters;
 use crate::xcode_mio;
 
@@ -116,6 +117,11 @@ enum CommandSet {
     )]
     Profile(ProfileArgs),
     Version(VersionArgs),
+    #[command(
+        about = "Compare pasted Xcode GPU Commands costs against AGXPS candidates",
+        long_about = "Compare pasted Xcode GPU Commands costs against AGXPS candidates.\n\nPass a tab-delimited table copied from Xcode's Counters > GPU Commands > Compute Kernel view. The command groups Xcode's per-command Execution Cost by pipeline address, maps those addresses through Xcode MIO topology, then reports error metrics for the AGXPS analyzer-weighted and instruction-stats W1 candidate costs."
+    )]
+    XcodeCommandCosts(XcodeCommandCostsArgs),
     XcodeCounters(XcodeCountersArgs),
 }
 
@@ -448,6 +454,17 @@ struct XcodeCountersArgs {
 }
 
 #[derive(Debug, Args)]
+struct XcodeCommandCostsArgs {
+    trace: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    table: PathBuf,
+    #[arg(short, long, default_value = "summary")]
+    format: String,
+    #[arg(long)]
+    top: Option<usize>,
+}
+
+#[derive(Debug, Args)]
 struct ProfilerArgs {
     path: PathBuf,
     #[arg(short, long, default_value = "text")]
@@ -470,6 +487,8 @@ struct TimingProfilerArgs {
     verbose: bool,
     #[arg(long, default_value_t = false)]
     json: bool,
+    #[arg(long, default_value_t = false)]
+    agxps: bool,
 }
 
 #[derive(Debug, Args)]
@@ -555,6 +574,8 @@ struct TimingArgs {
     trace: PathBuf,
     #[arg(short, long, default_value = "text")]
     format: String,
+    #[arg(long, default_value_t = false)]
+    agxps: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1049,7 +1070,18 @@ pub fn run() -> Result<()> {
         }
         CommandSet::Timing(args) => {
             let trace = TraceBundle::open(args.trace)?;
-            let report = timing::report(&trace)?;
+            let report = if args.agxps {
+                let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+                let xcode_mio_summary =
+                    xcode_mio::agxps_analysis_report(&trace, profiler_summary.as_ref()).ok();
+                timing::report_with_context(
+                    &trace,
+                    profiler_summary.as_ref(),
+                    xcode_mio_summary.as_ref(),
+                )?
+            } else {
+                timing::report(&trace)?
+            };
             match args.format.as_str() {
                 "text" | "table" => print!("{}", timing::format_report(&report)),
                 "csv" => print!("{}", timing::format_csv(&report)),
@@ -1059,7 +1091,18 @@ pub fn run() -> Result<()> {
         }
         CommandSet::TimingProfiler(args) => {
             let trace = TraceBundle::open(args.trace)?;
-            let report = timing::report(&trace)?;
+            let report = if args.agxps {
+                let profiler_summary = profiler::stream_data_summary(&trace.path).ok();
+                let xcode_mio_summary =
+                    xcode_mio::agxps_analysis_report(&trace, profiler_summary.as_ref()).ok();
+                timing::report_with_context(
+                    &trace,
+                    profiler_summary.as_ref(),
+                    xcode_mio_summary.as_ref(),
+                )?
+            } else {
+                timing::report(&trace)?
+            };
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1347,6 +1390,21 @@ pub fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&info)?);
             } else {
                 println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            }
+        }
+        CommandSet::XcodeCommandCosts(args) => {
+            let trace = TraceBundle::open(args.trace)?;
+            let report = xcode_command_costs::compare(&trace, args.table)?;
+            match args.format.as_str() {
+                "summary" | "text" | "table" => {
+                    print!("{}", xcode_command_costs::format_summary(&report, args.top))
+                }
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => {
+                    return Err(crate::Error::Unsupported(
+                        "unknown xcode-command-costs format",
+                    ));
+                }
             }
         }
         CommandSet::XcodeCounters(args) => {
