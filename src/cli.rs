@@ -175,7 +175,7 @@ struct ReportArgs {
     #[arg(
         short,
         long,
-        help = "Directory to create/update with markdown report files; defaults to <trace>-report"
+        help = "Directory to create/update with markdown report files; defaults to <trace>/gputrace-report"
     )]
     output: Option<PathBuf>,
     #[arg(
@@ -1593,12 +1593,16 @@ fn default_profile_output(trace_path: &Path) -> PathBuf {
 }
 
 fn default_report_output(trace_path: &Path) -> PathBuf {
-    let parent = trace_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = trace_path
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .unwrap_or("trace");
-    parent.join(format!("{stem}-report"))
+    if trace_path.is_dir() {
+        trace_path.join("gputrace-report")
+    } else {
+        let parent = trace_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = trace_path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or("trace");
+        parent.join(format!("{stem}-report"))
+    }
 }
 
 fn embedded_profile_output(trace_path: &Path) -> PathBuf {

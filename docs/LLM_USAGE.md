@@ -6,11 +6,9 @@ Use the public workflow. Do not start from internal subcommands.
 gputrace report /abs/path/input.gputrace
 ```
 
-If profiler data is missing, `report` profiles the trace automatically and caches
-the result inside the `.gputrace` bundle. Then it writes a Markdown report next
-to the trace unless `--output` is provided.
+If profiler data is missing, `report` profiles the trace automatically. By default, both the profiler cache and Markdown report live inside the `.gputrace` bundle unless `--output` is provided.
 
-Read `/abs/path/input-report/index.md` first. Follow links from that file only
+Read `/abs/path/input.gputrace/gputrace-report/index.md` first. Follow links from that file only
 when needed.
 
 Rules for agents:

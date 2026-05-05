@@ -11,7 +11,7 @@ gputrace report /abs/path/input.gputrace
 
 If the trace already contains cached profiler data, `report` reuses it. If not,
 it prints a line saying it is profiling, runs Apple's headless `MTLReplayer.app`,
-stores the profiler data inside the `.gputrace` bundle, then writes the report.
+stores both the profiler data and the Markdown report inside the `.gputrace` bundle.
 
 Internal subcommands still exist for tests and reverse engineering, but they are
 not part of normal use.
@@ -46,7 +46,7 @@ By default, this writes:
 
 ```text
 /abs/path/input.gputrace/gputrace-profile/input.gpuprofiler_raw/
-/abs/path/input-report/
+/abs/path/input.gputrace/gputrace-report/
 ```
 
 Use `--output` only when you want the Markdown report somewhere else:
