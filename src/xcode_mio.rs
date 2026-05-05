@@ -21,6 +21,7 @@ pub struct XcodeMioReport {
     pub cost_record_count: usize,
     pub gpu_time_ns: u64,
     pub cost_timeline: Option<XcodeMioCostTimeline>,
+    pub timeline_candidates: Vec<XcodeMioTimelineCandidate>,
     pub timeline_binary_count: usize,
     pub timeline_binaries: Vec<XcodeMioTimelineBinary>,
     pub timeline_pipeline_state_ids: Vec<u64>,
@@ -70,6 +71,7 @@ pub struct XcodeMioPipeline {
     pub shader_tracks: Vec<XcodeMioPipelineShaderTrack>,
     pub shader_binaries: Vec<XcodeMioPipelineShaderBinary>,
     pub shader_binary_costs: Vec<XcodeMioPipelineShaderBinaryCost>,
+    pub agxps_trace_costs: Vec<XcodeMioPipelineAgxpsTraceCost>,
     pub shader_profiler_costs: Vec<XcodeMioPipelineShaderProfilerCost>,
     pub execution_history: Vec<XcodeMioPipelineExecutionHistory>,
     pub shader_binary_references: Vec<XcodeMioPipelineShaderBinaryReference>,
@@ -109,6 +111,20 @@ pub struct XcodeMioPipelineShaderProfilerCost {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioPipelineAgxpsTraceCost {
+    pub source: &'static str,
+    pub shader_address: u64,
+    pub work_shader_address: u64,
+    pub command_count: usize,
+    pub record_cliques: u64,
+    pub matched_work_cliques: usize,
+    pub duration_ns: u64,
+    pub execution_events: u64,
+    pub stats_word0: u64,
+    pub stats_word1: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct XcodeMioPipelineCounter {
     pub name: String,
     pub value: f64,
@@ -130,6 +146,25 @@ pub struct XcodeMioTimelineBinary {
     pub instruction_nonzero_record_count: u64,
     pub instruction_total_cost: f64,
     pub instruction_total_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct XcodeMioTimelineCandidate {
+    pub source: &'static str,
+    pub draw_count: usize,
+    pub pipeline_state_count: usize,
+    pub cost_record_count: usize,
+    pub gpu_time_ns: u64,
+    pub global_gpu_time_ns: u64,
+    pub timeline_duration_ns: u64,
+    pub total_clique_cost: u64,
+    pub gpu_cost: f64,
+    pub gpu_cost_instruction_count: u64,
+    pub timeline_binary_count: usize,
+    pub shader_binary_info_count: usize,
+    pub nonzero_cost_records: usize,
+    pub decoded_total_cost: f64,
+    pub decoded_instruction_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -352,6 +387,10 @@ pub struct XcodeMioPipelineAnalysis {
     pub shader_profiler_cost_percent: Option<f64>,
     pub shader_binary_cost: f64,
     pub shader_binary_cost_percent: Option<f64>,
+    pub agxps_trace_cost: u64,
+    pub agxps_trace_cost_percent: Option<f64>,
+    pub agxps_trace_events: u64,
+    pub agxps_trace_matched_work_cliques: usize,
     pub execution_top_cost_percent: Option<f64>,
     pub execution_duration_percent: Option<f64>,
     pub execution_total_cost: Option<f64>,
@@ -436,6 +475,12 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
         .map(|cost| cost.total_cost)
         .filter(|value| value.is_finite() && *value > 0.0)
         .sum::<f64>();
+    let agxps_trace_cost_denominator = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| pipeline.agxps_trace_costs.iter())
+        .map(|cost| cost.stats_word1)
+        .sum::<u64>();
     let timeline_binaries_by_index = report
         .timeline_binaries
         .iter()
@@ -463,6 +508,21 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
                 .map(|cost| cost.total_cost)
                 .filter(|value| value.is_finite())
                 .sum::<f64>();
+            let agxps_trace_cost = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.stats_word1)
+                .sum::<u64>();
+            let agxps_trace_events = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.execution_events)
+                .sum::<u64>();
+            let agxps_trace_matched_work_cliques = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.matched_work_cliques)
+                .sum::<usize>();
             let best_execution = pipeline.execution_history.iter().max_by(|left, right| {
                 left.top_cost_percentage
                     .partial_cmp(&right.top_cost_percentage)
@@ -524,6 +584,9 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
             if shader_binary_cost > 0.0 {
                 metric_sources.push("xcode-shader-binary-cost".to_owned());
             }
+            if agxps_trace_cost > 0 {
+                metric_sources.push("agxps-timing-trace".to_owned());
+            }
             if best_execution.is_some_and(|history| {
                 history.top_cost_percentage > 0.0
                     || history.duration_percentage > 0.0
@@ -574,6 +637,12 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
                 shader_binary_cost_percent: (shader_binary_cost_denominator > 0.0
                     && shader_binary_cost > 0.0)
                     .then(|| shader_binary_cost * 100.0 / shader_binary_cost_denominator),
+                agxps_trace_cost,
+                agxps_trace_cost_percent: (agxps_trace_cost_denominator > 0
+                    && agxps_trace_cost > 0)
+                    .then(|| agxps_trace_cost as f64 * 100.0 / agxps_trace_cost_denominator as f64),
+                agxps_trace_events,
+                agxps_trace_matched_work_cliques,
                 execution_top_cost_percent: best_execution
                     .map(|history| history.top_cost_percentage),
                 execution_duration_percent: best_execution
@@ -635,12 +704,12 @@ pub fn format_analysis_report(report: &XcodeMioAnalysisReport) -> String {
         report.timings.final_metadata_ms,
     ));
     out.push_str(&format!(
-        "{:<42} {:>5} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8}\n",
-        "Function", "Cmds", "Cmd %", "Bins", "ExecBin", "Time %", "TL Cost", "Exec %"
+        "{:<42} {:>5} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8}\n",
+        "Function", "Cmds", "Cmd %", "Bins", "ExecBin", "AGXPS %", "Time %", "TL Cost", "Exec %"
     ));
     for pipeline in report.top_pipelines.iter().take(25) {
         out.push_str(&format!(
-            "{:<42} {:>5} {:>6.2}% {:>7} {:>7} {:>7} {:>7} {:>7}\n",
+            "{:<42} {:>5} {:>6.2}% {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
             truncate(
                 pipeline
                     .function_name
@@ -652,6 +721,7 @@ pub fn format_analysis_report(report: &XcodeMioAnalysisReport) -> String {
             pipeline.command_percent,
             pipeline.unique_timeline_binary_count,
             pipeline.executable_shader_binary_reference_count,
+            format_optional_percent(pipeline.agxps_trace_cost_percent),
             format_optional_percent(pipeline.xcode_time_percent),
             format_optional_percent(pipeline.timeline_cost_percent),
             format_optional_percent(pipeline.execution_top_cost_percent),
@@ -673,6 +743,7 @@ fn elapsed_ms(start: Instant) -> f64 {
 fn pipeline_rank_score(pipeline: &XcodeMioPipelineAnalysis) -> f64 {
     [
         pipeline.execution_top_cost_percent,
+        pipeline.agxps_trace_cost_percent,
         pipeline.shader_profiler_cost_percent,
         pipeline.timeline_cost_percent,
         pipeline.timeline_duration_percent,
@@ -730,6 +801,28 @@ pub fn format_report(report: &XcodeMioReport) -> String {
         ));
         out.push('\n');
     } else {
+        out.push('\n');
+    }
+    if !report.timeline_candidates.is_empty() {
+        out.push_str("timeline candidates:\n");
+        for candidate in &report.timeline_candidates {
+            out.push_str(&format!(
+                "  {:<28} draws={:<4} pipelines={:<3} costs={:<4} gpu={:>7.3} ms global={:>7.3} ms clique_cost={} gpu_cost={:.3} instr={} binaries={} shader_info={} nonzero_costs={} decoded_cost={:.3}\n",
+                candidate.source,
+                candidate.draw_count,
+                candidate.pipeline_state_count,
+                candidate.cost_record_count,
+                candidate.gpu_time_ns as f64 / 1_000_000.0,
+                candidate.global_gpu_time_ns as f64 / 1_000_000.0,
+                candidate.total_clique_cost,
+                candidate.gpu_cost,
+                candidate.gpu_cost_instruction_count,
+                candidate.timeline_binary_count,
+                candidate.shader_binary_info_count,
+                candidate.nonzero_cost_records,
+                candidate.decoded_total_cost,
+            ));
+        }
         out.push('\n');
     }
     if report.timeline_binary_count > 0 || !report.shader_binary_info.is_empty() {
@@ -827,6 +920,74 @@ pub fn format_report(report: &XcodeMioReport) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("  {:<56} {}\n", name, counters));
+        }
+        out.push('\n');
+    }
+    let mut agxps_trace_costs = report
+        .pipelines
+        .iter()
+        .filter(|pipeline| !pipeline.agxps_trace_costs.is_empty())
+        .collect::<Vec<_>>();
+    agxps_trace_costs.sort_by(|left, right| {
+        let left_cost = left
+            .agxps_trace_costs
+            .iter()
+            .map(|cost| cost.stats_word1)
+            .sum::<u64>();
+        let right_cost = right
+            .agxps_trace_costs
+            .iter()
+            .map(|cost| cost.stats_word1)
+            .sum::<u64>();
+        right_cost
+            .cmp(&left_cost)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    let agxps_trace_denominator = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| pipeline.agxps_trace_costs.iter())
+        .map(|cost| cost.stats_word1)
+        .sum::<u64>();
+    if agxps_trace_denominator > 0 {
+        out.push_str("Pipelines by AGXPS timing-trace instruction stats:\n");
+        for pipeline in agxps_trace_costs.iter().take(20) {
+            let name = pipeline
+                .function_name
+                .as_deref()
+                .unwrap_or("<unknown function>");
+            let total_cost = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.stats_word1)
+                .sum::<u64>();
+            let total_events = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.execution_events)
+                .sum::<u64>();
+            let matched_cliques = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.matched_work_cliques)
+                .sum::<usize>();
+            let command_count = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.command_count)
+                .sum::<usize>();
+            let pct = 100.0 * total_cost as f64 / agxps_trace_denominator as f64;
+            let top = pipeline
+                .agxps_trace_costs
+                .iter()
+                .max_by_key(|cost| cost.stats_word1);
+            let top_address = top
+                .map(|cost| format!("0x{:x}", cost.shader_address))
+                .unwrap_or_else(|| "-".to_owned());
+            out.push_str(&format!(
+                "  {:>6.2}% w1={:>12} events={:>9} cliques={:>7} cmds={:>4} {:<56} top_esl={}\n",
+                pct, total_cost, total_events, matched_cliques, command_count, name, top_address,
+            ));
         }
         out.push('\n');
     }
@@ -1256,21 +1417,23 @@ pub fn format_report(report: &XcodeMioReport) -> String {
 #[cfg(target_os = "macos")]
 mod platform {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
+    use std::fs;
     use std::mem;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use super::{
         XcodeMioBinaryTrace, XcodeMioCostTimeline, XcodeMioDecodedCostRecord,
         XcodeMioDrawMetadataRecord, XcodeMioDrawTimelineRecord, XcodeMioGpuCommand,
-        XcodeMioPipeline, XcodeMioPipelineCounter, XcodeMioPipelineExecutionHistory,
-        XcodeMioPipelineProfilerTiming, XcodeMioPipelineScopeCost, XcodeMioPipelineShaderBinary,
-        XcodeMioPipelineShaderBinaryCost, XcodeMioPipelineShaderBinaryReference,
-        XcodeMioPipelineShaderProfilerCost, XcodeMioPipelineShaderStat,
-        XcodeMioPipelineShaderTrack, XcodeMioReport, XcodeMioShaderBinaryInfo,
-        XcodeMioTimelineBinary, XcodeMioTimings, elapsed_ms,
+        XcodeMioPipeline, XcodeMioPipelineAgxpsTraceCost, XcodeMioPipelineCounter,
+        XcodeMioPipelineExecutionHistory, XcodeMioPipelineProfilerTiming,
+        XcodeMioPipelineScopeCost, XcodeMioPipelineShaderBinary, XcodeMioPipelineShaderBinaryCost,
+        XcodeMioPipelineShaderBinaryReference, XcodeMioPipelineShaderProfilerCost,
+        XcodeMioPipelineShaderStat, XcodeMioPipelineShaderTrack, XcodeMioReport,
+        XcodeMioShaderBinaryInfo, XcodeMioTimelineBinary, XcodeMioTimelineCandidate,
+        XcodeMioTimings, elapsed_ms,
     };
     use crate::error::{Error, Result};
     use crate::profiler;
@@ -1398,6 +1561,7 @@ mod platform {
                 shader_tracks: Vec::new(),
                 shader_binaries: Vec::new(),
                 shader_binary_costs: Vec::new(),
+                agxps_trace_costs: Vec::new(),
                 shader_profiler_costs: Vec::new(),
                 execution_history: Vec::new(),
                 shader_binary_references: Vec::new(),
@@ -1498,6 +1662,7 @@ mod platform {
                     (None, None)
                 }
             };
+        let timeline_candidates = unsafe { runtime.timeline_candidates(mio, cost_timeline_object) };
         timings.cost_timeline_request_ms = elapsed_ms(cost_request_start);
         let mut decoded_cost_records = Vec::new();
         let mut draw_timeline_records = Vec::new();
@@ -1519,6 +1684,11 @@ mod platform {
                 &decoded_commands,
                 &mut decoded_pipelines,
             );
+            if let Err(error) =
+                decode_agxps_timing_trace_costs(&profiler_directory, &mut decoded_pipelines)
+            {
+                warnings.push(format!("AGXPS timing-trace probe failed: {error}"));
+            }
             decoded_cost_records = unsafe { runtime.decode_timeline_cost_records(timeline) };
             draw_timeline_records = unsafe { runtime.decode_draw_timeline_records(timeline) };
             draw_metadata_records = unsafe { runtime.decode_draw_metadata_records(timeline) };
@@ -1579,6 +1749,7 @@ mod platform {
             cost_record_count,
             gpu_time_ns,
             cost_timeline,
+            timeline_candidates,
             timeline_binary_count,
             timeline_binaries,
             timeline_pipeline_state_ids,
@@ -1743,6 +1914,96 @@ mod platform {
                     gpu_cost_instruction_count,
                 },
             }))
+        }
+
+        unsafe fn timeline_candidates(
+            &mut self,
+            mio: Id,
+            requested_timeline: Option<Id>,
+        ) -> Vec<XcodeMioTimelineCandidate> {
+            let mut seen = BTreeSet::<usize>::new();
+            let mut candidates = Vec::new();
+
+            if let Some(timeline) = requested_timeline
+                && seen.insert(timeline as usize)
+                && let Some(candidate) =
+                    unsafe { self.describe_timeline("requestCostTimeline", timeline) }
+            {
+                candidates.push(candidate);
+            }
+
+            for (source, selector) in [
+                ("mio.costTimeline", "costTimeline"),
+                ("mio.overlappingTimeline", "overlappingTimeline"),
+                ("mio.nonOverlappingTimeline", "nonOverlappingTimeline"),
+            ] {
+                if !unsafe { responds_to_selector(mio, selector) } {
+                    continue;
+                }
+                let Ok(timeline) = (unsafe { send_id_allow_nil(mio, selector) }) else {
+                    continue;
+                };
+                if timeline.is_null() || !seen.insert(timeline as usize) {
+                    continue;
+                }
+                if let Some(candidate) = unsafe { self.describe_timeline(source, timeline) } {
+                    candidates.push(candidate);
+                }
+            }
+
+            candidates
+        }
+
+        unsafe fn describe_timeline(
+            &mut self,
+            source: &'static str,
+            timeline: Id,
+        ) -> Option<XcodeMioTimelineCandidate> {
+            if timeline.is_null() {
+                return None;
+            }
+            let cost_records = unsafe { self.decode_timeline_cost_records(timeline) };
+            let nonzero_cost_records = cost_records
+                .iter()
+                .filter(|record| {
+                    record.total_cost.is_finite() && record.total_cost > 0.0
+                        || record.instruction_count > 0
+                })
+                .count();
+            let decoded_total_cost = cost_records
+                .iter()
+                .map(|record| record.total_cost)
+                .filter(|value| value.is_finite())
+                .sum::<f64>();
+            let decoded_instruction_count = cost_records
+                .iter()
+                .map(|record| record.instruction_count)
+                .sum::<u64>();
+            let (gpu_cost, gpu_cost_instruction_count) = unsafe { decode_gpu_cost(timeline) };
+
+            Some(XcodeMioTimelineCandidate {
+                source,
+                draw_count: unsafe { send_u64_if_supported(timeline, "drawCount") as usize },
+                pipeline_state_count: unsafe {
+                    send_u64_if_supported(timeline, "pipelineStateCount") as usize
+                },
+                cost_record_count: unsafe { send_u64_if_supported(timeline, "costCount") as usize },
+                gpu_time_ns: unsafe { send_u64_if_supported(timeline, "gpuTime") },
+                global_gpu_time_ns: unsafe { send_u64_if_supported(timeline, "globalGPUTime") },
+                timeline_duration_ns: unsafe {
+                    send_u64_if_supported(timeline, "timelineDuration")
+                },
+                total_clique_cost: unsafe { send_u64_if_supported(timeline, "totalCliqueCost") },
+                gpu_cost,
+                gpu_cost_instruction_count,
+                timeline_binary_count: unsafe { self.timeline_binary_count(timeline) },
+                shader_binary_info_count: unsafe {
+                    send_u64_if_supported(timeline, "shaderBinaryInfoCount") as usize
+                },
+                nonzero_cost_records,
+                decoded_total_cost,
+                decoded_instruction_count,
+            })
         }
 
         unsafe fn decode_pipeline_private_costs(
@@ -2933,6 +3194,416 @@ mod platform {
         }
     }
 
+    fn decode_agxps_timing_trace_costs(
+        profiler_directory: &Path,
+        pipelines: &mut [XcodeMioPipeline],
+    ) -> Result<()> {
+        let address_to_pipeline = pipelines
+            .iter()
+            .enumerate()
+            .flat_map(|(pipeline_index, pipeline)| {
+                pipeline
+                    .shader_binary_references
+                    .iter()
+                    .filter(|reference| reference.raw5 == 6 && reference.raw6 == 28)
+                    .map(move |reference| (reference.address, pipeline_index))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if address_to_pipeline.is_empty() {
+            return Ok(());
+        }
+
+        let paths = profiling_raw_paths(profiler_directory)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let loaded = agxps_sys::load()
+            .map_err(|error| Error::InvalidInput(format!("agxps load failed: {error}")))?;
+        let generation = u32_env("AGXPS_GEN", 16);
+        let variant = u32_env("AGXPS_VARIANT", 3);
+        let rev = u32_env("AGXPS_REV", 1);
+        let mut groups = BTreeMap::<(usize, u64), XcodeMioPipelineAgxpsTraceCost>::new();
+
+        for path in paths {
+            let bytes = fs::read(&path)?;
+            let raw = unsafe { parse_agxps_profile(&loaded, generation, variant, rev, &bytes) }?;
+            let records = unsafe { agxps_timing_records(&loaded, raw.profile_data) }?;
+            let relevant_records = records
+                .into_iter()
+                .filter_map(|record| {
+                    let pipeline_index = address_to_pipeline
+                        .get(&record.esl_shader_address)
+                        .copied()?;
+                    Some(AgxpsPipelineTimingRecord {
+                        pipeline_index,
+                        record,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if relevant_records.is_empty() {
+                continue;
+            }
+
+            for record in &relevant_records {
+                let entry = agxps_trace_group(&mut groups, record);
+                entry.command_count += 1;
+                entry.record_cliques = entry
+                    .record_cliques
+                    .saturating_add(record.record.work_cliques);
+                entry.duration_ns = entry
+                    .duration_ns
+                    .saturating_add(record.record.duration_ns());
+            }
+
+            let work = unsafe { agxps_work_cliques(&loaded, raw.profile_data) }?;
+            for index in 0..work.traces.len() {
+                if work.missing_ends[index] != 0 {
+                    continue;
+                }
+                let start_ns = unsafe {
+                    (loaded.api.get_system_timestamp)(raw.profile_data, work.starts[index])
+                };
+                let end_ns = unsafe {
+                    (loaded.api.get_system_timestamp)(raw.profile_data, work.ends[index])
+                };
+                let Some(record_index) =
+                    find_agxps_timing_record(&relevant_records, start_ns, end_ns)
+                else {
+                    continue;
+                };
+                let record = &relevant_records[record_index];
+                let entry = agxps_trace_group(&mut groups, record);
+                entry.matched_work_cliques += 1;
+                entry.execution_events = entry.execution_events.saturating_add(unsafe {
+                    (loaded.api.instruction_trace_get_execution_events_num)(
+                        raw.profile_data,
+                        work.traces[index],
+                    )
+                });
+                let stats = unsafe {
+                    (loaded.api.instruction_trace_get_instruction_stats)(
+                        raw.gpu,
+                        raw.profile_data,
+                        work.traces[index],
+                    )
+                };
+                entry.stats_word0 = entry.stats_word0.saturating_add(stats.words[0]);
+                entry.stats_word1 = entry.stats_word1.saturating_add(stats.words[1]);
+            }
+
+            let _ = raw;
+        }
+
+        for ((pipeline_index, _), cost) in groups {
+            if let Some(pipeline) = pipelines.get_mut(pipeline_index) {
+                pipeline.agxps_trace_costs.push(cost);
+            }
+        }
+        for pipeline in pipelines {
+            pipeline.agxps_trace_costs.sort_by(|left, right| {
+                right
+                    .stats_word1
+                    .cmp(&left.stats_word1)
+                    .then_with(|| left.shader_address.cmp(&right.shader_address))
+            });
+        }
+
+        Ok(())
+    }
+
+    fn profiling_raw_paths(profiler_directory: &Path) -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(profiler_directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.starts_with("Profiling_f_") && name.ends_with(".raw") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn u32_env(name: &str, default: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn agxps_trace_group<'a>(
+        groups: &'a mut BTreeMap<(usize, u64), XcodeMioPipelineAgxpsTraceCost>,
+        record: &AgxpsPipelineTimingRecord,
+    ) -> &'a mut XcodeMioPipelineAgxpsTraceCost {
+        groups
+            .entry((record.pipeline_index, record.record.esl_shader_address))
+            .or_insert_with(|| XcodeMioPipelineAgxpsTraceCost {
+                source: "agxps-timing-trace",
+                shader_address: record.record.esl_shader_address,
+                work_shader_address: record.record.work_shader_address,
+                command_count: 0,
+                record_cliques: 0,
+                matched_work_cliques: 0,
+                duration_ns: 0,
+                execution_events: 0,
+                stats_word0: 0,
+                stats_word1: 0,
+            })
+    }
+
+    unsafe fn parse_agxps_profile(
+        loaded: &agxps_sys::LoadedApi,
+        generation: u32,
+        variant: u32,
+        rev: u32,
+        bytes: &[u8],
+    ) -> Result<AgxpsRawProfile> {
+        let api = &loaded.api;
+        let gpu = unsafe { (api.gpu_create)(generation, variant, rev, false) };
+        if gpu.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "agxps_gpu_create({generation}, {variant}, {rev}) failed"
+            )));
+        }
+
+        let descriptor = agxps_sys::AgxpsApsDescriptor::defaults_for(gpu);
+        let parser = unsafe { (api.parser_create)(&descriptor) };
+        if parser.is_null() {
+            return Err(Error::InvalidInput(
+                "agxps_aps_parser_create returned NULL".to_owned(),
+            ));
+        }
+
+        let mut out = vec![0u8; 4096];
+        let profile_data = unsafe {
+            (api.parser_parse)(
+                parser,
+                bytes.as_ptr(),
+                bytes.len() as c_long,
+                agxps_sys::APS_PROFILING_TYPE_USC_SAMPLES,
+                out.as_mut_ptr().cast(),
+            )
+        };
+        let err_code = u64::from_le_bytes(out[..8].try_into().unwrap());
+        if err_code != 0 {
+            let message = unsafe {
+                let ptr = (api.parse_error_string)(err_code);
+                if ptr.is_null() {
+                    "(null)".to_owned()
+                } else {
+                    CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                }
+            };
+            return Err(Error::InvalidInput(format!(
+                "agxps parser error {err_code}: {message}"
+            )));
+        }
+
+        let _ = parser;
+        Ok(AgxpsRawProfile { gpu, profile_data })
+    }
+
+    unsafe fn agxps_timing_records(
+        loaded: &agxps_sys::LoadedApi,
+        profile_data: agxps_sys::AgxpsApsProfileData,
+    ) -> Result<Vec<AgxpsTimingRecord>> {
+        const KIND: u32 = 1;
+        let api = &loaded.api;
+        let analyzer = unsafe { (api.timing_analyzer_create)(KIND) };
+        if analyzer.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "agxps_aps_timing_analyzer_create({KIND}) returned NULL"
+            )));
+        }
+        unsafe {
+            (api.timing_analyzer_process_usc)(analyzer, profile_data);
+            (api.timing_analyzer_finish)(analyzer);
+        }
+        let count = unsafe { (api.timing_analyzer_get_num_commands)(analyzer, KIND) } as usize;
+        let result = unsafe { agxps_fetch_timing_records(loaded, analyzer, count) };
+        unsafe { (api.timing_analyzer_destroy)(analyzer) };
+        result
+    }
+
+    unsafe fn agxps_fetch_timing_records(
+        loaded: &agxps_sys::LoadedApi,
+        analyzer: agxps_sys::AgxpsApsTimingAnalyzer,
+        count: usize,
+    ) -> Result<Vec<AgxpsTimingRecord>> {
+        const KIND: u32 = 1;
+        let api = &loaded.api;
+        let mut starts = vec![0u64; count];
+        let mut ends = vec![0u64; count];
+        let mut work_shaders = vec![0u64; count];
+        let mut esl_shaders = vec![0u64; count];
+        let mut cliques = vec![0u64; count];
+        if count > 0 {
+            let ok = unsafe {
+                (api.timing_analyzer_get_work_start)(
+                    analyzer,
+                    KIND,
+                    starts.as_mut_ptr(),
+                    0,
+                    count as u64,
+                ) != 0
+                    && (api.timing_analyzer_get_work_end)(
+                        analyzer,
+                        KIND,
+                        ends.as_mut_ptr(),
+                        0,
+                        count as u64,
+                    ) != 0
+                    && (api.timing_analyzer_get_work_shader_address)(
+                        analyzer,
+                        KIND,
+                        work_shaders.as_mut_ptr(),
+                        0,
+                        count as u64,
+                    ) != 0
+                    && (api.timing_analyzer_get_esl_shader_address)(
+                        analyzer,
+                        KIND,
+                        esl_shaders.as_mut_ptr(),
+                        0,
+                        count as u64,
+                    ) != 0
+                    && (api.timing_analyzer_get_num_work_cliques)(
+                        analyzer,
+                        KIND,
+                        cliques.as_mut_ptr(),
+                        0,
+                        count as u64,
+                    ) != 0
+            };
+            if !ok {
+                return Err(Error::InvalidInput(
+                    "AGXPS timing-analyzer range getter failed".to_owned(),
+                ));
+            }
+        }
+
+        Ok((0..count)
+            .map(|index| AgxpsTimingRecord {
+                start_ns: starts[index],
+                end_ns: ends[index],
+                work_shader_address: work_shaders[index],
+                esl_shader_address: esl_shaders[index],
+                work_cliques: cliques[index],
+            })
+            .collect())
+    }
+
+    unsafe fn agxps_work_cliques(
+        loaded: &agxps_sys::LoadedApi,
+        profile_data: agxps_sys::AgxpsApsProfileData,
+    ) -> Result<AgxpsWorkCliques> {
+        let api = &loaded.api;
+        let count = unsafe { (api.get_work_cliques_num)(profile_data) } as usize;
+        let mut starts = vec![0u64; count];
+        let mut ends = vec![0u64; count];
+        let mut missing_ends = vec![0u8; count];
+        let mut traces = vec![0u64; count];
+        if count > 0 {
+            let ok = unsafe {
+                (api.get_work_clique_start)(profile_data, starts.as_mut_ptr(), 0, count as u64) != 0
+                    && (api.get_work_clique_end)(profile_data, ends.as_mut_ptr(), 0, count as u64)
+                        != 0
+                    && (api.get_work_clique_missing_end)(
+                        profile_data,
+                        missing_ends.as_mut_ptr(),
+                        0,
+                        count as u64,
+                    ) != 0
+                    && (api.get_work_clique_instruction_trace)(
+                        profile_data,
+                        traces.as_mut_ptr(),
+                        0,
+                        count as u64,
+                    ) != 0
+            };
+            if !ok {
+                return Err(Error::InvalidInput(
+                    "AGXPS work-clique range getter failed".to_owned(),
+                ));
+            }
+        }
+        Ok(AgxpsWorkCliques {
+            starts,
+            ends,
+            missing_ends,
+            traces,
+        })
+    }
+
+    fn find_agxps_timing_record(
+        records: &[AgxpsPipelineTimingRecord],
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<usize> {
+        let mut best = None;
+        for (index, record) in records.iter().enumerate() {
+            let timing = record.record;
+            let contains_range = timing.start_ns <= start_ns && end_ns <= timing.end_ns;
+            let contains_start = timing.start_ns <= start_ns && start_ns <= timing.end_ns;
+            let overlaps = timing.start_ns <= end_ns && start_ns <= timing.end_ns;
+            if !contains_range && !contains_start && !overlaps {
+                continue;
+            }
+            let rank = if contains_range {
+                0
+            } else if contains_start {
+                1
+            } else {
+                2
+            };
+            let duration = timing.duration_ns();
+            if best
+                .map(|(_, best_rank, best_duration)| (rank, duration) < (best_rank, best_duration))
+                .unwrap_or(true)
+            {
+                best = Some((index, rank, duration));
+            }
+        }
+        best.map(|(index, _, _)| index)
+    }
+
+    struct AgxpsRawProfile {
+        gpu: agxps_sys::AgxpsGpu,
+        profile_data: agxps_sys::AgxpsApsProfileData,
+    }
+
+    #[derive(Clone, Copy)]
+    struct AgxpsTimingRecord {
+        start_ns: u64,
+        end_ns: u64,
+        work_shader_address: u64,
+        esl_shader_address: u64,
+        work_cliques: u64,
+    }
+
+    impl AgxpsTimingRecord {
+        fn duration_ns(self) -> u64 {
+            self.end_ns.saturating_sub(self.start_ns)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct AgxpsPipelineTimingRecord {
+        pipeline_index: usize,
+        record: AgxpsTimingRecord,
+    }
+
+    struct AgxpsWorkCliques {
+        starts: Vec<u64>,
+        ends: Vec<u64>,
+        missing_ends: Vec<u8>,
+        traces: Vec<agxps_sys::AgxpsApsCliqueInstructionTrace>,
+    }
+
     fn attach_shader_binary_references(
         shader_binary_info: &[XcodeMioShaderBinaryInfo],
         timeline_binaries: &[XcodeMioTimelineBinary],
@@ -3727,6 +4398,14 @@ mod platform {
         let sel = unsafe { selector(sel)? };
         let f: extern "C" fn(Id, Sel) -> u64 = unsafe { mem::transmute(objc_msgSend as *const ()) };
         Ok(f(receiver, sel))
+    }
+
+    unsafe fn send_u64_if_supported(receiver: Id, sel: &str) -> u64 {
+        if unsafe { responds_to_selector(receiver, sel) } {
+            unsafe { send_u64(receiver, sel).unwrap_or(0) }
+        } else {
+            0
+        }
     }
 
     unsafe fn send_u64_u32_u16(receiver: Id, sel: &str, first: u32, second: u16) -> Result<u64> {

@@ -48,6 +48,17 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub type AgxpsGpu = *mut c_void;
 pub type AgxpsApsParser = *mut c_void;
 pub type AgxpsApsProfileData = *mut c_void;
+pub type AgxpsStats = *mut c_void;
+pub type AgxpsApsTimingAnalyzer = *mut c_void;
+pub type AgxpsApsCliqueInstructionTrace = u64;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AgxpsApsInstructionStats {
+    pub words: [u64; 14],
+}
+
+const _: () = assert!(std::mem::size_of::<AgxpsApsInstructionStats>() == 0x70);
 
 /// 0x68-byte descriptor passed to `agxps_aps_parser_create`. The
 /// non-zero fields are values empirically known to satisfy the per-GPU
@@ -107,9 +118,16 @@ pub type FnParserParse = unsafe extern "C" fn(
 ) -> AgxpsApsProfileData;
 pub type FnProfileDataDestroy = unsafe extern "C" fn(AgxpsApsProfileData);
 pub type FnGetCount = unsafe extern "C" fn(AgxpsApsProfileData) -> c_uint;
+pub type FnGetCount64 = unsafe extern "C" fn(AgxpsApsProfileData) -> u64;
 pub type FnGetU64Range = unsafe extern "C" fn(
     pd: AgxpsApsProfileData,
     out: *mut u64,
+    start_idx: u64,
+    count: u64,
+) -> c_int;
+pub type FnGetU32Range = unsafe extern "C" fn(
+    pd: AgxpsApsProfileData,
+    out: *mut u32,
     start_idx: u64,
     count: u64,
 ) -> c_int;
@@ -183,6 +201,56 @@ pub type FnObfuscatedName = unsafe extern "C" fn(readable: *const c_char) -> *co
 /// `agxps_counter_get_ident(const char* obfuscated_or_readable) -> agxps_counter_ident_t`.
 pub type FnCounterGetIdent = unsafe extern "C" fn(name: *const c_char) -> c_uint;
 
+/// `agxps_aps_kick_time_stats_create(pd, timestamp_kind, start_kind, end_kind, filter_block)`.
+///
+/// `timestamp_kind`: 0 = system timestamp, 1 = USC timestamp. `start_kind` /
+/// `end_kind`: 0 = kick start, 1 = kick end. `filter_block` only needs a block
+/// invoke pointer at offset `0x10`; the wrapper calls it synchronously as
+/// `bool invoke(block)`.
+pub type FnKickTimeStatsCreate = unsafe extern "C" fn(
+    pd: AgxpsApsProfileData,
+    timestamp_kind: c_uint,
+    start_kind: c_uint,
+    end_kind: c_uint,
+    filter_block: *mut c_void,
+) -> AgxpsStats;
+
+pub type FnKickTimeStatsCreateSampled = unsafe extern "C" fn(
+    pd: AgxpsApsProfileData,
+    timestamp_kind: c_uint,
+    start_kind: c_uint,
+    end_kind: c_uint,
+    sample_count: u64,
+    sample_limit: u64,
+    filter_block: *mut c_void,
+) -> AgxpsStats;
+
+pub type FnStatsDestroy = unsafe extern "C" fn(stats: AgxpsStats);
+pub type FnStatsValue = unsafe extern "C" fn(stats: AgxpsStats) -> f64;
+pub type FnTimestampValue =
+    unsafe extern "C" fn(pd: AgxpsApsProfileData, packed_timestamp: u64) -> u64;
+pub type FnInstructionTraceCount =
+    unsafe extern "C" fn(pd: AgxpsApsProfileData, trace: AgxpsApsCliqueInstructionTrace) -> u64;
+pub type FnInstructionTraceStats = unsafe extern "C" fn(
+    gpu: AgxpsGpu,
+    pd: AgxpsApsProfileData,
+    trace: AgxpsApsCliqueInstructionTrace,
+) -> AgxpsApsInstructionStats;
+pub type FnTimingAnalyzerCreate = unsafe extern "C" fn(kind: u32) -> AgxpsApsTimingAnalyzer;
+pub type FnTimingAnalyzerDestroy = unsafe extern "C" fn(analyzer: AgxpsApsTimingAnalyzer);
+pub type FnTimingAnalyzerProcessUsc =
+    unsafe extern "C" fn(analyzer: AgxpsApsTimingAnalyzer, pd: AgxpsApsProfileData);
+pub type FnTimingAnalyzerFinish = unsafe extern "C" fn(analyzer: AgxpsApsTimingAnalyzer);
+pub type FnTimingAnalyzerCount =
+    unsafe extern "C" fn(analyzer: AgxpsApsTimingAnalyzer, kind: u32) -> u64;
+pub type FnTimingAnalyzerU64Range = unsafe extern "C" fn(
+    analyzer: AgxpsApsTimingAnalyzer,
+    kind: u32,
+    out: *mut u64,
+    start_idx: u64,
+    count: u64,
+) -> c_int;
+
 /// Resolved function-pointer table. All fields are non-null on success
 /// (we treat any missing symbol as a hard load error).
 pub struct AgxpsApi {
@@ -206,6 +274,12 @@ pub struct AgxpsApi {
     pub get_synchronized_timestamps: FnGetU64Range,
     pub get_synchronized_timestamps_num: FnGetCount,
     pub get_operating_frequencies: FnGetU64Range,
+    pub get_work_cliques_num: FnGetCount64,
+    pub get_work_clique_start: FnGetU64Range,
+    pub get_work_clique_end: FnGetU64Range,
+    pub get_work_clique_kick_id: FnGetU32Range,
+    pub get_work_clique_missing_end: FnGetU8Range,
+    pub get_work_clique_instruction_trace: FnGetU64Range,
     pub get_counter_names: FnGetCounterNames,
     pub get_counter_values: FnGetCounterValues,
     pub get_counter_values_num: FnGetCounterValuesNum,
@@ -216,6 +290,42 @@ pub struct AgxpsApi {
     pub deobfuscate_name: FnDeobfuscateName,
     pub obfuscated_name: FnObfuscatedName,
     pub counter_get_ident: FnCounterGetIdent,
+    pub kick_time_stats_create: FnKickTimeStatsCreate,
+    pub kick_time_stats_create_sampled: FnKickTimeStatsCreateSampled,
+    pub stats_destroy: FnStatsDestroy,
+    pub stats_min: FnStatsValue,
+    pub stats_max: FnStatsValue,
+    pub stats_mean: FnStatsValue,
+    pub stats_median: FnStatsValue,
+    pub stats_q1: FnStatsValue,
+    pub stats_q3: FnStatsValue,
+    pub stats_iqr: FnStatsValue,
+    pub get_system_timestamp: FnTimestampValue,
+    pub get_usc_timestamp: FnTimestampValue,
+    pub instruction_trace_get_pc_advances_num: FnInstructionTraceCount,
+    pub instruction_trace_get_init_pcs_num: FnInstructionTraceCount,
+    pub instruction_trace_get_thread_execution_changes_num: FnInstructionTraceCount,
+    pub instruction_trace_get_timestamp_references_num: FnInstructionTraceCount,
+    pub instruction_trace_get_execution_events_num: FnInstructionTraceCount,
+    pub instruction_trace_get_instruction_stats: FnInstructionTraceStats,
+    pub timing_analyzer_create: FnTimingAnalyzerCreate,
+    pub timing_analyzer_destroy: FnTimingAnalyzerDestroy,
+    pub timing_analyzer_process_usc: FnTimingAnalyzerProcessUsc,
+    pub timing_analyzer_finish: FnTimingAnalyzerFinish,
+    pub timing_analyzer_get_num_commands: FnTimingAnalyzerCount,
+    pub timing_analyzer_get_num_discarded_work_cliques: FnTimingAnalyzerCount,
+    pub timing_analyzer_get_work_start: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_work_end: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_work_shader_address: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_esl_start: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_esl_shader_address: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_work_cliques_average_duration: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_work_cliques_min_duration: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_work_cliques_max_duration: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_work_cliques_stddev_duration: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_num_work_cliques: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_num_uscs: FnTimingAnalyzerU64Range,
+    pub timing_analyzer_get_kick_software_id: FnTimingAnalyzerU64Range,
     pub parse_error_string: FnParseErrorString,
 }
 
@@ -273,6 +383,21 @@ pub fn load() -> Result<LoadedApi> {
             handle,
             "agxps_aps_profile_data_get_operating_frequencies",
         )?,
+        get_work_cliques_num: load_sym(handle, "agxps_aps_profile_data_get_work_cliques_num")?,
+        get_work_clique_start: load_sym(handle, "agxps_aps_profile_data_get_work_clique_start")?,
+        get_work_clique_end: load_sym(handle, "agxps_aps_profile_data_get_work_clique_end")?,
+        get_work_clique_kick_id: load_sym(
+            handle,
+            "agxps_aps_profile_data_get_work_clique_kick_id",
+        )?,
+        get_work_clique_missing_end: load_sym(
+            handle,
+            "agxps_aps_profile_data_get_work_clique_missing_end",
+        )?,
+        get_work_clique_instruction_trace: load_sym(
+            handle,
+            "agxps_aps_profile_data_get_work_clique_instruction_trace",
+        )?,
         get_counter_names: load_sym(handle, "agxps_aps_profile_data_get_counter_names")?,
         get_counter_values: load_sym(handle, "agxps_aps_profile_data_get_counter_values")?,
         get_counter_values_num: load_sym(handle, "agxps_aps_profile_data_get_counter_values_num")?,
@@ -295,6 +420,96 @@ pub fn load() -> Result<LoadedApi> {
         deobfuscate_name: load_sym(handle, "agxps_counter_deobfuscate_name")?,
         obfuscated_name: load_sym(handle, "agxps_counter_obfuscated_name")?,
         counter_get_ident: load_sym(handle, "agxps_counter_get_ident")?,
+        kick_time_stats_create: load_sym(handle, "agxps_aps_kick_time_stats_create")?,
+        kick_time_stats_create_sampled: load_sym(
+            handle,
+            "agxps_aps_kick_time_stats_create_sampled",
+        )?,
+        stats_destroy: load_sym(handle, "agxps_stats_destroy")?,
+        stats_min: load_sym(handle, "agxps_stats_min")?,
+        stats_max: load_sym(handle, "agxps_stats_max")?,
+        stats_mean: load_sym(handle, "agxps_stats_mean")?,
+        stats_median: load_sym(handle, "agxps_stats_median")?,
+        stats_q1: load_sym(handle, "agxps_stats_q1")?,
+        stats_q3: load_sym(handle, "agxps_stats_q3")?,
+        stats_iqr: load_sym(handle, "agxps_stats_iqr")?,
+        get_system_timestamp: load_sym(handle, "agxps_aps_profile_data_get_system_timestamp")?,
+        get_usc_timestamp: load_sym(handle, "agxps_aps_profile_data_get_usc_timestamp")?,
+        instruction_trace_get_pc_advances_num: load_sym(
+            handle,
+            "agxps_aps_clique_instruction_trace_get_pc_advances_num",
+        )?,
+        instruction_trace_get_init_pcs_num: load_sym(
+            handle,
+            "agxps_aps_clique_instruction_trace_get_init_pcs_num",
+        )?,
+        instruction_trace_get_thread_execution_changes_num: load_sym(
+            handle,
+            "agxps_aps_clique_instruction_trace_get_thread_execution_changes_num",
+        )?,
+        instruction_trace_get_timestamp_references_num: load_sym(
+            handle,
+            "agxps_aps_clique_instruction_trace_get_timestamp_references_num",
+        )?,
+        instruction_trace_get_execution_events_num: load_sym(
+            handle,
+            "agxps_aps_clique_instruction_trace_get_execution_events_num",
+        )?,
+        instruction_trace_get_instruction_stats: load_sym(
+            handle,
+            "agxps_aps_clique_instruction_trace_get_instruction_stats",
+        )?,
+        timing_analyzer_create: load_sym(handle, "agxps_aps_timing_analyzer_create")?,
+        timing_analyzer_destroy: load_sym(handle, "agxps_aps_timing_analyzer_destroy")?,
+        timing_analyzer_process_usc: load_sym(handle, "agxps_aps_timing_analyzer_process_usc")?,
+        timing_analyzer_finish: load_sym(handle, "agxps_aps_timing_analyzer_finish")?,
+        timing_analyzer_get_num_commands: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_num_commands",
+        )?,
+        timing_analyzer_get_num_discarded_work_cliques: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_num_discarded_work_cliques",
+        )?,
+        timing_analyzer_get_work_start: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_work_start",
+        )?,
+        timing_analyzer_get_work_end: load_sym(handle, "agxps_aps_timing_analyzer_get_work_end")?,
+        timing_analyzer_get_work_shader_address: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_work_shader_address",
+        )?,
+        timing_analyzer_get_esl_start: load_sym(handle, "agxps_aps_timing_analyzer_get_esl_start")?,
+        timing_analyzer_get_esl_shader_address: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_esl_shader_address",
+        )?,
+        timing_analyzer_get_work_cliques_average_duration: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_work_cliques_average_duration",
+        )?,
+        timing_analyzer_get_work_cliques_min_duration: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_work_cliques_min_duration",
+        )?,
+        timing_analyzer_get_work_cliques_max_duration: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_work_cliques_max_duration",
+        )?,
+        timing_analyzer_get_work_cliques_stddev_duration: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_work_cliques_stddev_duration",
+        )?,
+        timing_analyzer_get_num_work_cliques: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_num_work_cliques",
+        )?,
+        timing_analyzer_get_num_uscs: load_sym(handle, "agxps_aps_timing_analyzer_get_num_uscs")?,
+        timing_analyzer_get_kick_software_id: load_sym(
+            handle,
+            "agxps_aps_timing_analyzer_get_kick_software_id",
+        )?,
         parse_error_string: load_sym(handle, "agxps_aps_parse_error_type_to_string")?,
     };
 

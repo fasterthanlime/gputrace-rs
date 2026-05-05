@@ -19,6 +19,7 @@ dependencies = [
 name = "agxps-sys"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "thiserror",
 ]
 
@@ -318,6 +319,7 @@ dependencies = [
 name = "gputrace-rs"
 version = "0.1.0"
 dependencies = [
+ "agxps-sys",
  "block2",
  "clap",
  "csv",

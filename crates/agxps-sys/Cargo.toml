@@ -8,6 +8,7 @@ description = "FFI bindings to the agxps_aps_* sample-decoder API bundled in Xco
 path = "src/lib.rs"
 
 [dependencies]
+block2 = "0.6"
 thiserror = "2.0"
 
 [[example]]
@@ -21,3 +22,7 @@ path = "examples/probe_obfuscation.rs"
 [[example]]
 name = "probe_rde_importer"
 path = "examples/probe_rde_importer.rs"
+
+[[example]]
+name = "probe_kick_stats"
+path = "examples/probe_kick_stats.rs"

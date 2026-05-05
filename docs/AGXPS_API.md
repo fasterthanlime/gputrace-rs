@@ -387,33 +387,66 @@ because the kick *lifetime* (event start → event end) includes wait
 windows, cross-kick synchronization, and any overlap with parallel
 kicks on other cores.
 
-To match Xcode's per-pipeline numbers we still need either:
+`agxps_aps_kick_time_stats_create_sampled` is callable from Rust with
+a real Objective-C block filter, but it is also lifetime-shaped. It
+does not expose Xcode's ALU/compute-cost metric by itself.
 
-- A per-kick **counter value** (e.g. ALU active cycles). Both the
-  index-based and counter-ident-based value getters are bound, but
-  USC profile data still returns empty vectors, and the exported
-  `Counters_f_*.raw` files are not RDE counter streams.
-- Or `agxps_aps_kick_time_stats_create_sampled`, which is what Xcode
-  itself uses. Disassembly shows it builds a stack descriptor with
-  vtable/function-pointer callbacks and calls a generic
-  `agxps_stats_create` engine — callable from Rust only after the
-  descriptor layout and internal vtable constants are mapped.
+### Useful path: timing analyzer ESL address + instruction stats
+
+The high-value path is `agxps_aps_timing_analyzer_*`, not
+`Counters_f_*.raw`:
+
+1. Parse every `Profiling_f_*.raw` as USC samples (`profile_type =
+   0x21`).
+2. Feed each parsed profile into
+   `agxps_aps_timing_analyzer_process_usc` + `finish`.
+3. Fetch command records with:
+   - `get_work_start`
+   - `get_work_end`
+   - `get_work_shader_address`
+   - `get_esl_shader_address`
+   - `get_num_work_cliques`
+   - `get_kick_software_id`
+4. Use `get_esl_shader_address`, not `get_work_shader_address`, to
+   bridge into MIO. The ESL address exactly matches
+   `shaderBinaryInfo.raw2` for executable shader-binary references
+   (`raw5 == 6 && raw6 == 28`).
+5. Join work cliques to timing-analyzer command spans by system-time
+   overlap, then call
+   `agxps_aps_clique_instruction_trace_get_instruction_stats`.
+
+In the sample trace, `xcode-mio` now filters analyzer records to ESL
+addresses present in MIO's executable shader-binary references and
+aggregates `instruction_stats.words[1]`:
+
+```text
+Pipelines by AGXPS timing-trace instruction stats:
+   98.91% w1=  1308837836 events=  9539685 cliques= 410372 cmds= 100 heavy_alu
+    1.09% w1=    14479123 events=    43087 cliques=   1359 cmds=   5 light_add
+```
+
+That is the first route that gives a real per-pipeline split from the
+raw exported profile directory. Internal profiler/runtime shader rows
+also appear in the timing-analyzer output (`0x100013a0000`,
+`0x100013a0140`, etc.), but they are excluded because they are not
+present in MIO's user-pipeline executable shader-binary references.
+
+Observed `AgxpsApsInstructionStats` layout is 14 `u64` words. On this
+fixture, only `words[0]` and `words[1]` are materially nonzero. We use
+`words[1]` as the cost weight because it gives the most Xcode-like
+heavy/light split; the exact semantic name of that field still needs
+RE.
 
 ## Open questions / next steps
 
-1. **No `kick_end` or `kick_duration` in the VM build.** Per-kick
-   GPU time has to be computed from neighbor kick starts (`end[i] =
-   start[i+1]`), or from ranges of `usc_timestamps` falling between
-   kicks, or from a function we haven't found yet. The host's richer
-   build has `agxps_aps_kick_time_stats_create_sampled` which probably
-   does this for us — testable on the host directly via Xcode-loaded
-   GTShaderProfiler.
+1. **Name `AgxpsApsInstructionStats.words[0/1]`.** The timing-trace
+   join works, but the exact semantic labels for the two nonzero
+   fields are still unknown.
 
-2. **Bridging `kick_software_id` → kernel name.** The high 16 bits
-   of `swid` look like they identify a pipeline/clique. Need to
-   correlate against streamData's pipeline IDs or
-   `pipelineStateInfoData` to confirm. Likely a hash of
-   `pipeline_address` or `pipeline_id`.
+2. **Reduce integrated runtime.** The current `xcode-mio` integration
+   walks all work cliques and calls the private stats getter for each
+   matched clique. It is accurate enough for RE, but should be cached
+   or made opt-in if it becomes too slow on large captures.
 
 3. **`get_counter_*` virtual dispatch.** The counter-value getters
    call into a vtable on the parser. Need to either decode the vtable
@@ -438,19 +471,17 @@ To match Xcode's per-pipeline numbers we still need either:
 
 ## Implications for gputrace-rs
 
-We can write a Rust FFI binding that:
-1. `dlopen`s `GPUToolsReplay.framework` on macOS
-2. Resolves `agxps_*` symbols by raw offset (they're not exported
-   in the dyld trie; need to use `GPUToolsReplay`'s framework slide
-   + known offsets, or `dlsym_aware_addr` tricks)
-3. Calls `parser_create`/`parser_parse` per-Profiling_f file
-4. Iterates kicks and aggregates per-pipeline cost
+The Xcode-rich path now uses the exported agxps symbols from
+`GTShaderProfiler.framework` directly:
 
-The only remaining piece is symbol resolution — the agxps_aps_*
-symbols are global text symbols but not in the export trie. Options:
-- Parse the LC_SYMTAB ourselves (works without entitlements)
-- Use private `dyld_get_image_symbol_by_offset` via a small bootstrap
-- Use Mach-O parsing on the cached binary header
+1. `dlopen` GTShaderProfiler via `agxps-sys`.
+2. Parse every `Profiling_f_*.raw`.
+3. Run the timing analyzer.
+4. Match timing-analyzer ESL shader addresses to MIO
+   `shaderBinaryInfo.raw2`.
+5. Aggregate work-clique instruction stats per pipeline.
 
-Once that's done, the rest of the FFI is straightforward — all
-calls are plain C ABI with simple types.
+The no-Xcode fallback still cannot do this through
+`GPUToolsReplay.framework` without extra symbol-resolution work: the
+same agxps text exists there, but the needed symbols are not exported
+in the dyld trie.
