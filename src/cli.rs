@@ -28,6 +28,7 @@ use crate::profiler;
 use crate::replay_service;
 use crate::report;
 use crate::shaders;
+use crate::synth_bench;
 use crate::timeline;
 use crate::timing;
 use crate::trace::{RecordType, TraceBundle};
@@ -168,6 +169,12 @@ enum CommandSet {
     XcodeCostScan(XcodeCostScanArgs),
     #[command(hide = true)]
     XcodeCounters(XcodeCountersArgs),
+    #[command(
+        hide = true,
+        about = "Capture a synthetic workload with one dispatch per pipeline",
+        long_about = "Capture a synthetic workload with one dispatch per pipeline.\n\nGenerates 16 compute kernels with distinct unrolled FMA loop counts and threadgroup grid sizes, dispatches each once under MTLCaptureManager, and writes a .gputrace at the requested path. Used to reverse-engineer per-command counter records: with one command per pipeline Xcode has nothing to aggregate, so any per-command integer in the GPU Commands tab maps to exactly one stored record.\n\nRequires METAL_CAPTURE_ENABLED=1 in the environment."
+    )]
+    SynthBench(SynthBenchArgs),
 }
 
 #[derive(Debug, Args)]
@@ -544,6 +551,30 @@ struct XcodeCostScanArgs {
     format: String,
     #[arg(long)]
     top: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct SynthBenchArgs {
+    #[arg(help = "Output .gputrace path to create")]
+    output: PathBuf,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Comma-separated FMA loop counts per kernel"
+    )]
+    iterations: Vec<u32>,
+    #[arg(
+        long = "tg-counts",
+        value_delimiter = ',',
+        help = "Comma-separated threadgroup counts per kernel"
+    )]
+    threadgroup_counts: Vec<u32>,
+    #[arg(
+        long,
+        default_value_t = synth_bench::DEFAULT_THREADS_PER_GROUP,
+        help = "Threads per threadgroup (Apple SIMD width is 32)"
+    )]
+    threads_per_group: u32,
 }
 
 #[derive(Debug, Args)]
@@ -1520,6 +1551,27 @@ pub fn run() -> Result<()> {
                 "json" => println!("{}", serde_json::to_string_pretty(&report)?),
                 _ => return Err(crate::Error::Unsupported("unknown xcode-counters format")),
             }
+        }
+        CommandSet::SynthBench(args) => {
+            let iterations = if args.iterations.is_empty() {
+                synth_bench::DEFAULT_ITERATIONS.to_vec()
+            } else {
+                args.iterations
+            };
+            let threadgroup_counts = if args.threadgroup_counts.is_empty() {
+                synth_bench::DEFAULT_THREADGROUP_COUNTS.to_vec()
+            } else {
+                args.threadgroup_counts
+            };
+            let options = synth_bench::SynthBenchOptions {
+                output: args.output,
+                iterations,
+                threadgroup_counts,
+                threads_per_group: args.threads_per_group,
+            };
+            let plan = synth_bench::run(&options)?;
+            print!("{}", synth_bench::format_plan(&plan));
+            println!("\nWrote .gputrace to {}", options.output.display());
         }
     }
     Ok(())
