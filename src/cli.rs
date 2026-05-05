@@ -32,6 +32,7 @@ use crate::timeline;
 use crate::timing;
 use crate::trace::{RecordType, TraceBundle};
 use crate::xcode_command_costs;
+use crate::xcode_cost_scan;
 use crate::xcode_counters;
 use crate::xcode_mio;
 
@@ -159,6 +160,12 @@ enum CommandSet {
         long_about = "Compare pasted Xcode GPU Commands costs against AGXPS candidates.\n\nPass a tab-delimited table copied from Xcode's Counters > GPU Commands > Compute Kernel view. The command groups Xcode's per-command Execution Cost by pipeline address, maps those addresses through Xcode MIO topology, then reports error metrics for the AGXPS analyzer-weighted and instruction-stats W1 candidate costs."
     )]
     XcodeCommandCosts(XcodeCommandCostsArgs),
+    #[command(
+        hide = true,
+        about = "Scan profiler raw files for Xcode UI cost numbers",
+        long_about = "Scan profiler raw files for Xcode UI cost numbers.\n\nMemory-maps every file in a .gpuprofiler_raw directory and scans in parallel for approximate little-endian f32/f64 encodings of Xcode Execution Cost percentages. Pass --table with a tab-delimited Xcode GPU Commands table to search for all copied Execution Cost values."
+    )]
+    XcodeCostScan(XcodeCostScanArgs),
     #[command(hide = true)]
     XcodeCounters(XcodeCountersArgs),
 }
@@ -497,6 +504,42 @@ struct XcodeCommandCostsArgs {
     trace: PathBuf,
     #[arg(long, value_name = "PATH")]
     table: PathBuf,
+    #[arg(short, long, default_value = "summary")]
+    format: String,
+    #[arg(long)]
+    top: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct XcodeCostScanArgs {
+    #[arg(help = "Input .gpuprofiler_raw directory")]
+    profiler: PathBuf,
+    #[arg(long, value_name = "PATH", help = "Pasted Xcode GPU Commands table")]
+    table: Option<PathBuf>,
+    #[arg(
+        long = "target",
+        value_name = "PERCENT",
+        help = "Additional Xcode UI percentage to scan for"
+    )]
+    targets: Vec<f64>,
+    #[arg(
+        long = "no-defaults",
+        default_value_t = false,
+        help = "Do not include built-in comparison targets"
+    )]
+    no_defaults: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Scan every byte offset instead of aligned words"
+    )]
+    unaligned: bool,
+    #[arg(
+        long,
+        default_value_t = 3,
+        help = "Maximum hits retained per target per file"
+    )]
+    max_hits_per_target: usize,
     #[arg(short, long, default_value = "summary")]
     format: String,
     #[arg(long)]
@@ -1442,6 +1485,23 @@ pub fn run() -> Result<()> {
                         "unknown xcode-command-costs format",
                     ));
                 }
+            }
+        }
+        CommandSet::XcodeCostScan(args) => {
+            let report = xcode_cost_scan::scan(&xcode_cost_scan::XcodeCostScanOptions {
+                profiler_dir: args.profiler,
+                table: args.table,
+                targets: args.targets,
+                include_defaults: !args.no_defaults,
+                unaligned: args.unaligned,
+                max_hits_per_target: args.max_hits_per_target,
+            })?;
+            match args.format.as_str() {
+                "summary" | "text" | "table" => {
+                    print!("{}", xcode_cost_scan::format_summary(&report, args.top))
+                }
+                "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                _ => return Err(crate::Error::Unsupported("unknown xcode-cost-scan format")),
             }
         }
         CommandSet::XcodeCounters(args) => {
