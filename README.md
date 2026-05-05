@@ -52,6 +52,11 @@ and parity tests; everything they expose is already in the report directory.
 
 Run `gputrace <command> --help` for the exact flags of any command.
 
+For coding agents working on GPU cost/timing internals, start with
+`docs/AGENT_GUIDE.md`. It explains which commands are product paths, which are
+Xcode oracle helpers, and which private-framework paths are known dead ends or
+blocked RE.
+
 ## Scope
 
 Included in this Rust port:

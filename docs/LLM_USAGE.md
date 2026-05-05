@@ -4,6 +4,10 @@ This guide is for coding agents or analysis agents using `gputrace` as a local
 tool. Single-trace work is always: profile, then report, then read the
 markdown directory.
 
+For GPU cost/timing work, read `docs/AGENT_GUIDE.md` first. It separates the
+stable product path from Xcode oracle commands and private-framework RE
+commands.
+
 ## Basic Rules
 
 - Use absolute trace paths.
