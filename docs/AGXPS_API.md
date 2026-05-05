@@ -293,12 +293,46 @@ length 0:
 
 Conclusion: USC profile data (parsed with `profile_type=0x21` from
 `Profiling_f_*.raw`) ships counter *metadata* (12 named counter
-slots) but no actual counter values. The values are stored in
-`Counters_f_*.raw`, which `agxps_aps_parser_parse` rejects with
-"tile start while a tile was still active" regardless of which
-`profile_type` we try (0x10, 0x20, 0x21, 0x22, 0x40, 0x100). That
-file format probably needs a different agxps entry point we haven't
-identified.
+slots) but no actual counter values. Hardware counter samples for the
+exported bundle are not exposed through this profile-data object.
+
+### `Counters_f_*.raw` is not Xcode's RDE counter stream
+
+The file name is misleading. In the sample bundle, the `streamData`
+metadata labels `Counters_f_*.raw` as `Source=APS_USC` and
+`SourceIndex=5`, the same USC source family as `Profiling_f_*.raw`.
+The RDE/BMPR hardware-counter data is instead embedded in
+`streamData` `APSCounterData` entries as `ShaderProfilerData` blobs
+whose payload starts with `GPRWCNTR`.
+
+That matches Xcode's private importer behavior:
+
+```text
+cargo run -p agxps-sys --example probe_rde_importer -- \
+  /tmp/gputrace-sample/sample-perfdata/sample.gpuprofiler_raw/Counters_f_0.raw
+
+AGXPCTR2 occurrences: 0
+CTRSAMPL occurrences: 0
+GPRWCNTR occurrences: 0
+direct RDE-record-shaped chains (static scan): 0
+_parseAGXBlock(full file): 0
+parseRDEBuffer(candidate slices): 0 successful guesses
+```
+
+Running that across all 20 `Counters_f_*.raw` files gives the same
+result. `agxps_aps_parser_parse` also rejects those files with
+"tile start while a tile was still active" for every tested
+`profile_type` (0x10, 0x20, 0x21, 0x22, 0x40, 0x100), but the more
+important finding is that `XRGPUATRCImporter` does not recognize them
+as AGX `CTRSAMPL` blocks or direct RDE buffers either.
+
+So the useful hardware-counter route is the one `gputrace raw-counters`
+already follows: decode `streamData`'s `APSCounterData`/`GPRWCNTR`
+payloads. That gives pass/source/ring and encoder-sample aggregates.
+It does **not** by itself give per-dispatch/per-pipeline cost. In the
+sample trace there is only one encoder sample row for the whole
+encoder, so it cannot distinguish the five `light_add` dispatches from
+the five `heavy_alu` dispatches.
 
 ### Counter names are obfuscated; map needs RE
 
@@ -357,7 +391,8 @@ To match Xcode's per-pipeline numbers we still need either:
 
 - A per-kick **counter value** (e.g. ALU active cycles). Both the
   index-based and counter-ident-based value getters are bound, but
-  USC profile data still returns empty vectors.
+  USC profile data still returns empty vectors, and the exported
+  `Counters_f_*.raw` files are not RDE counter streams.
 - Or `agxps_aps_kick_time_stats_create_sampled`, which is what Xcode
   itself uses. Disassembly shows it builds a stack descriptor with
   vtable/function-pointer callbacks and calls a generic

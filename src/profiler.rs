@@ -631,11 +631,14 @@ fn coverage_group(
             vec![
                 "legacy Counters_f_* metric extraction exists for a subset of known counters"
                     .to_owned(),
-                "streamData APSCounterData path is decoded separately".to_owned(),
+                "streamData APSCounterData/GPRWCNTR path is decoded separately".to_owned(),
+                "XRGPUATRCImporter does not recognize exported Counters_f_* files as RDE streams"
+                    .to_owned(),
             ],
             vec![
-                "prove record layouts for every Counters_f_* payload".to_owned(),
                 "join sampled counters to dispatch/shader windows when timestamps line up"
+                    .to_owned(),
+                "map the remaining APS_USC Counters_f_* payload semantics if they prove useful"
                     .to_owned(),
             ],
         ),
@@ -1906,18 +1909,12 @@ pub(crate) fn find_profiler_directory(path: &Path) -> Option<PathBuf> {
         return Some(adjacent);
     }
 
-    if let Some(landing) = system_landing_zone_for(path)
-        && landing.is_dir()
-    {
-        return Some(landing);
-    }
-
     let metadata = fs::metadata(path).ok()?;
     if !metadata.is_dir() {
-        return None;
+        return system_landing_zone_for(path).filter(|landing| landing.is_dir());
     }
 
-    fs::read_dir(path)
+    let nested = fs::read_dir(path)
         .ok()?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
@@ -1927,7 +1924,8 @@ pub(crate) fn find_profiler_directory(path: &Path) -> Option<PathBuf> {
                     .extension()
                     .and_then(|ext| ext.to_str())
                     .is_some_and(|ext| ext == "gpuprofiler_raw")
-        })
+        });
+    nested.or_else(|| system_landing_zone_for(path).filter(|landing| landing.is_dir()))
 }
 
 /// Xcode 26.x writes profile output to `/private/tmp/com.apple.gputools.profiling/`

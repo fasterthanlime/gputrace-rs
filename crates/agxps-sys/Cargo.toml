@@ -17,3 +17,7 @@ path = "examples/decode_profiling.rs"
 [[example]]
 name = "probe_obfuscation"
 path = "examples/probe_obfuscation.rs"
+
+[[example]]
+name = "probe_rde_importer"
+path = "examples/probe_rde_importer.rs"

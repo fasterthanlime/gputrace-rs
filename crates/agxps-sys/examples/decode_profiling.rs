@@ -140,8 +140,8 @@ fn main() {
     println!(
         "  total counter values across all 12 indices: {total_values} \
          (USC profile data only ships counter metadata, not values — \
-         actual values live in `Counters_f_*.raw` which uses a different \
-         parser path)",
+         hardware counter samples are exported through streamData \
+         `APSCounterData`/`GPRWCNTR` payloads, not this profile-data path)",
     );
     println!(
         "  (counter names below are still obfuscated SHA-256 hashes; the \

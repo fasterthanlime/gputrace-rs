@@ -772,7 +772,8 @@ pub fn raw_counters_report(trace: &TraceBundle) -> crate::Result<RawCountersRepo
             .any(|group| group.group_kind == "sample_group")
     {
         warnings.push(
-            "raw counter sample timestamps did not overlap profiler dispatch tick windows; \
+            "raw counters are present as streamData GPRWCNTR sample-group/encoder aggregates, \
+             but their timestamps did not overlap profiler dispatch tick windows; \
              dispatch-level derived counters are unavailable for this bundle"
                 .to_owned(),
         );
