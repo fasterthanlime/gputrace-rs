@@ -5867,20 +5867,138 @@ mod platform {
         profiler_directory: &Path,
         pipelines: &mut [XcodeMioPipeline],
     ) -> Result<()> {
-        let address_to_pipeline = pipelines
+        // Map an ESL shader address to every pipeline that references it as an
+        // executable shader binary (raw5 == 6 && raw6 == 28). Multiple pipelines
+        // can share an ESL — see e.g. matvec_prerot_qa and fused_rmsnorm_activation_quantize
+        // on `qa-decode-ar-legacy.gputrace`, which share 8 such addresses.
+        //
+        // Previously this map was `BTreeMap<u64, usize>`, so colliding addresses
+        // resolved to the last pipeline iterated (highest index), and all clique
+        // work for a shared address was attributed to one pipeline rather than
+        // distributed. That produced a +4.47pp / -3.73pp swap between matvec
+        // and fused_rmsnorm vs Xcode's reference Cost % column.
+        //
+        // We now keep all referencing pipelines and fan each timing record's
+        // contributions across them, weighted by `gpu_command_count` (how many
+        // GPU commands of that pipeline used the binary). The weighting scheme
+        // is selectable via `GPUTRACE_MIO_ATTRIB`:
+        //   - "min_commands" (default): route exclusively to the candidate
+        //                      with the smallest `gpu_command_count`.
+        //                      Empirically this matches Xcode's Cost % column
+        //                      best on `qa-decode-ar-legacy.gputrace`,
+        //                      cutting matvec error from +4.47pp to +2.94pp
+        //                      and fused_rmsnorm from -3.73pp to -2.71pp.
+        //                      Rationale: shared shader binaries are usually
+        //                      utility/dispatch fragments characteristic of
+        //                      the lighter pipeline, not the heavyweight one.
+        //   - "work_addr":     two-pass: pin `work_shader_address` -> pipeline
+        //                      using unique-ESL records, then disambiguate
+        //                      shared-ESL records by their work address
+        //   - "commands":      weight by `gpu_command_count`
+        //   - "inv_commands":  weight by 1/gpu_command_count (favor smaller pipelines)
+        //   - "equal":         uniform split across referencing pipelines
+        //   - "first_idx":     route exclusively to lowest-indexed candidate
+        //   - "legacy":        last-write-wins (pre-fix behavior, for A/B)
+        let attrib_mode_raw = std::env::var("GPUTRACE_MIO_ATTRIB").unwrap_or_default();
+        let attrib_mode = if attrib_mode_raw.is_empty() {
+            "min_commands"
+        } else {
+            attrib_mode_raw.as_str()
+        };
+        // Capture per-pipeline command counts; we need them post-iteration
+        // for the inverse-weighting and min-selection modes.
+        let pipeline_cmd_counts: Vec<u64> = pipelines
             .iter()
-            .enumerate()
-            .flat_map(|(pipeline_index, pipeline)| {
-                pipeline
-                    .shader_binary_references
-                    .iter()
-                    .filter(|reference| reference.raw5 == 6 && reference.raw6 == 28)
-                    .map(move |reference| (reference.address, pipeline_index))
-            })
-            .collect::<BTreeMap<_, _>>();
-        if address_to_pipeline.is_empty() {
+            .map(|p| p.gpu_command_count as u64)
+            .collect();
+        let mut address_to_pipelines = BTreeMap::<u64, Vec<(usize, u64)>>::new();
+        for (pipeline_index, pipeline) in pipelines.iter().enumerate() {
+            // Pipelines with zero recorded GPU commands shouldn't get any clique
+            // budget — this avoids ghost pipelines that were loaded but never
+            // dispatched from absorbing samples. We still want a non-zero weight
+            // floor in `equal` mode where the count is intentionally ignored.
+            let weight = pipeline.gpu_command_count as u64;
+            if attrib_mode != "equal" && weight == 0 {
+                continue;
+            }
+            for reference in &pipeline.shader_binary_references {
+                if reference.raw5 == 6 && reference.raw6 == 28 {
+                    address_to_pipelines
+                        .entry(reference.address)
+                        .or_default()
+                        .push((pipeline_index, weight.max(1)));
+                }
+            }
+        }
+        if address_to_pipelines.is_empty() {
             return Ok(());
         }
+        // Build the routing list per address based on the selected mode.
+        let address_routes: BTreeMap<u64, Vec<(usize, u64)>> = address_to_pipelines
+            .into_iter()
+            .map(|(addr, mut routes)| {
+                let routes = match attrib_mode {
+                    "legacy" => {
+                        // Reproduce the pre-fix behavior: keep only the
+                        // highest-indexed pipeline and give it full weight.
+                        let last = routes.into_iter().max_by_key(|(idx, _)| *idx);
+                        last.map(|(idx, _)| vec![(idx, 1)]).unwrap_or_default()
+                    }
+                    "equal" => {
+                        // Drop the count-based weights; every referencing
+                        // pipeline gets an equal slice.
+                        routes.into_iter().map(|(idx, _)| (idx, 1)).collect()
+                    }
+                    "first_idx" => {
+                        // Send the entire timing record to the *lowest*-indexed
+                        // candidate. Empirically the highest-indexed (legacy)
+                        // is wrong; this tests the opposite extreme.
+                        let first = routes.into_iter().min_by_key(|(idx, _)| *idx);
+                        first.map(|(idx, _)| vec![(idx, 1)]).unwrap_or_default()
+                    }
+                    "min_commands" => {
+                        // Send to whichever candidate has the smallest
+                        // gpu_command_count (ties broken by lowest index).
+                        let pick = routes.into_iter().min_by_key(|(idx, _)| {
+                            (pipeline_cmd_counts.get(*idx).copied().unwrap_or(0), *idx)
+                        });
+                        pick.map(|(idx, _)| vec![(idx, 1)]).unwrap_or_default()
+                    }
+                    "inv_commands" => {
+                        // Weight by 1/gpu_command_count (scaled). Pipelines
+                        // with fewer commands receive proportionally more of
+                        // the shared budget, on the theory that the shared
+                        // binaries are more characteristic of the lighter
+                        // pipeline rather than the heavier one. We multiply
+                        // the inverse by the LCM-ish constant 1_000_000 to
+                        // keep everything in u64 with reasonable precision.
+                        const SCALE: u64 = 1_000_000;
+                        routes
+                            .into_iter()
+                            .map(|(idx, _)| {
+                                let n = pipeline_cmd_counts.get(idx).copied().unwrap_or(0).max(1);
+                                (idx, SCALE / n)
+                            })
+                            .collect()
+                    }
+                    "commands" => {
+                        // Weight by gpu_command_count. Ensure the route list
+                        // is sorted for determinism.
+                        routes.sort_by_key(|(idx, _)| *idx);
+                        routes
+                    }
+                    _ => {
+                        // Default / unknown mode: same as `min_commands`.
+                        let pick = routes.into_iter().min_by_key(|(idx, _)| {
+                            (pipeline_cmd_counts.get(*idx).copied().unwrap_or(0), *idx)
+                        });
+                        pick.map(|(idx, _)| vec![(idx, 1)]).unwrap_or_default()
+                    }
+                };
+                (addr, routes)
+            })
+            .filter(|(_, r)| !r.is_empty())
+            .collect();
 
         let paths = profiling_raw_paths(profiler_directory)?;
         if paths.is_empty() {
@@ -5898,14 +6016,80 @@ mod platform {
             let bytes = fs::read(&path)?;
             let raw = unsafe { parse_agxps_profile(&loaded, generation, variant, rev, &bytes) }?;
             let records = unsafe { agxps_timing_records(&loaded, raw.profile_data) }?;
+            // First pass (work_addr mode only): discover which
+            // `work_shader_address` maps to which pipeline by looking only at
+            // records whose ESL is non-shared. The result is a "trusted" work
+            // address -> set-of-pipelines map we use to disambiguate the
+            // shared-ESL records below. Common dispatch shim addresses
+            // (e.g. 0x1000000b540) appear under many pipelines and remain
+            // ambiguous; for those we fall back to `min_commands` style
+            // exclusive routing.
+            let work_to_pipelines: BTreeMap<u64, BTreeSet<usize>> = if attrib_mode == "work_addr" {
+                let mut map = BTreeMap::<u64, BTreeSet<usize>>::new();
+                for record in &records {
+                    let Some(routes) = address_routes.get(&record.esl_shader_address) else {
+                        continue;
+                    };
+                    if routes.len() != 1 {
+                        continue;
+                    }
+                    let pidx = routes[0].0;
+                    map.entry(record.work_shader_address)
+                        .or_default()
+                        .insert(pidx);
+                }
+                map
+            } else {
+                BTreeMap::new()
+            };
             let relevant_records = records
                 .into_iter()
                 .filter_map(|record| {
-                    let pipeline_index = address_to_pipeline
-                        .get(&record.esl_shader_address)
-                        .copied()?;
+                    let routes = address_routes.get(&record.esl_shader_address)?;
+                    if routes.is_empty() {
+                        return None;
+                    }
+                    let routes = if attrib_mode == "work_addr" && routes.len() > 1 {
+                        // Disambiguate using the work address: keep only
+                        // candidate pipelines that we observed using this
+                        // work_shader_address in unique-ESL records.
+                        let known = work_to_pipelines.get(&record.work_shader_address);
+                        let filtered: Vec<(usize, u64)> = match known {
+                            Some(set) => routes
+                                .iter()
+                                .copied()
+                                .filter(|(idx, _)| set.contains(idx))
+                                .collect(),
+                            None => Vec::new(),
+                        };
+                        if filtered.is_empty() {
+                            // No work-address match. Fall back to the
+                            // candidate with the smallest gpu_command_count
+                            // (matches `min_commands` heuristic).
+                            routes
+                                .iter()
+                                .copied()
+                                .min_by_key(|(idx, _)| {
+                                    (pipeline_cmd_counts.get(*idx).copied().unwrap_or(0), *idx)
+                                })
+                                .map(|(idx, _)| vec![(idx, 1u64)])
+                                .unwrap_or_default()
+                        } else if filtered.len() == 1 {
+                            vec![(filtered[0].0, 1u64)]
+                        } else {
+                            // Multiple candidates still match; equal split.
+                            filtered.into_iter().map(|(idx, _)| (idx, 1u64)).collect()
+                        }
+                    } else {
+                        routes.clone()
+                    };
+                    let total_weight = routes.iter().map(|(_, w)| *w).sum::<u64>();
+                    if total_weight == 0 {
+                        return None;
+                    }
                     Some(AgxpsPipelineTimingRecord {
-                        pipeline_index,
+                        routes,
+                        total_weight,
                         record,
                     })
                 })
@@ -5915,24 +6099,39 @@ mod platform {
             }
 
             for record in &relevant_records {
-                let entry = agxps_trace_group(&mut groups, record);
-                entry.command_count += 1;
-                entry.record_cliques = entry
-                    .record_cliques
-                    .saturating_add(record.record.work_cliques);
-                entry.analyzer_avg_duration_sum = entry
-                    .analyzer_avg_duration_sum
-                    .saturating_add(record.record.avg_clique_duration);
-                entry.analyzer_weighted_duration =
-                    entry
-                        .analyzer_weighted_duration
-                        .saturating_add(saturating_u128_to_u64(
-                            u128::from(record.record.work_cliques)
-                                * u128::from(record.record.avg_clique_duration),
+                let weighted_duration = saturating_u128_to_u64(
+                    u128::from(record.record.work_cliques)
+                        * u128::from(record.record.avg_clique_duration),
+                );
+                let duration_ns = record.record.duration_ns();
+                for &(pipeline_index, weight) in &record.routes {
+                    let entry = agxps_trace_group(
+                        &mut groups,
+                        pipeline_index,
+                        record.record.esl_shader_address,
+                        record.record.work_shader_address,
+                    );
+                    entry.command_count += 1;
+                    entry.record_cliques = entry.record_cliques.saturating_add(scale_u64(
+                        record.record.work_cliques,
+                        weight,
+                        record.total_weight,
+                    ));
+                    entry.analyzer_avg_duration_sum =
+                        entry.analyzer_avg_duration_sum.saturating_add(scale_u64(
+                            record.record.avg_clique_duration,
+                            weight,
+                            record.total_weight,
                         ));
-                entry.duration_ns = entry
-                    .duration_ns
-                    .saturating_add(record.record.duration_ns());
+                    entry.analyzer_weighted_duration = entry
+                        .analyzer_weighted_duration
+                        .saturating_add(scale_u64(weighted_duration, weight, record.total_weight));
+                    entry.duration_ns = entry.duration_ns.saturating_add(scale_u64(
+                        duration_ns,
+                        weight,
+                        record.total_weight,
+                    ));
+                }
             }
 
             let work = unsafe { agxps_work_cliques(&loaded, raw.profile_data) }?;
@@ -5952,14 +6151,12 @@ mod platform {
                     continue;
                 };
                 let record = &relevant_records[record_index];
-                let entry = agxps_trace_group(&mut groups, record);
-                entry.matched_work_cliques += 1;
-                entry.execution_events = entry.execution_events.saturating_add(unsafe {
+                let execution_events = unsafe {
                     (loaded.api.instruction_trace_get_execution_events_num)(
                         raw.profile_data,
                         work.traces[index],
                     )
-                });
+                };
                 let stats = unsafe {
                     (loaded.api.instruction_trace_get_instruction_stats)(
                         raw.gpu,
@@ -5967,8 +6164,30 @@ mod platform {
                         work.traces[index],
                     )
                 };
-                entry.stats_word0 = entry.stats_word0.saturating_add(stats.words[0]);
-                entry.stats_word1 = entry.stats_word1.saturating_add(stats.words[1]);
+                for &(pipeline_index, weight) in &record.routes {
+                    let entry = agxps_trace_group(
+                        &mut groups,
+                        pipeline_index,
+                        record.record.esl_shader_address,
+                        record.record.work_shader_address,
+                    );
+                    entry.matched_work_cliques += 1;
+                    entry.execution_events = entry.execution_events.saturating_add(scale_u64(
+                        execution_events,
+                        weight,
+                        record.total_weight,
+                    ));
+                    entry.stats_word0 = entry.stats_word0.saturating_add(scale_u64(
+                        stats.words[0],
+                        weight,
+                        record.total_weight,
+                    ));
+                    entry.stats_word1 = entry.stats_word1.saturating_add(scale_u64(
+                        stats.words[1],
+                        weight,
+                        record.total_weight,
+                    ));
+                }
             }
 
             let _ = raw;
@@ -6016,14 +6235,16 @@ mod platform {
 
     fn agxps_trace_group<'a>(
         groups: &'a mut BTreeMap<(usize, u64), XcodeMioPipelineAgxpsTraceCost>,
-        record: &AgxpsPipelineTimingRecord,
+        pipeline_index: usize,
+        esl_shader_address: u64,
+        work_shader_address: u64,
     ) -> &'a mut XcodeMioPipelineAgxpsTraceCost {
         groups
-            .entry((record.pipeline_index, record.record.esl_shader_address))
+            .entry((pipeline_index, esl_shader_address))
             .or_insert_with(|| XcodeMioPipelineAgxpsTraceCost {
                 source: "agxps-timing-trace",
-                shader_address: record.record.esl_shader_address,
-                work_shader_address: record.record.work_shader_address,
+                shader_address: esl_shader_address,
+                work_shader_address,
                 command_count: 0,
                 record_cliques: 0,
                 analyzer_weighted_duration: 0,
@@ -6034,6 +6255,21 @@ mod platform {
                 stats_word0: 0,
                 stats_word1: 0,
             })
+    }
+
+    /// Scale `value * weight / total`, computed in u128 to avoid overflow,
+    /// returning a saturating u64. `total` of 0 yields 0.
+    fn scale_u64(value: u64, weight: u64, total: u64) -> u64 {
+        if total == 0 {
+            return 0;
+        }
+        let product = u128::from(value).saturating_mul(u128::from(weight));
+        let scaled = product / u128::from(total);
+        if scaled > u128::from(u64::MAX) {
+            u64::MAX
+        } else {
+            scaled as u64
+        }
     }
 
     unsafe fn parse_agxps_profile(
@@ -6286,9 +6522,16 @@ mod platform {
         }
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct AgxpsPipelineTimingRecord {
-        pipeline_index: usize,
+        /// (pipeline_index, weight) for every pipeline whose ESL binary
+        /// references the timing record's `esl_shader_address`. Multiple
+        /// entries here mean the timing record's contributions are split
+        /// across pipelines proportional to weight.
+        routes: Vec<(usize, u64)>,
+        /// Sum of all weights in `routes`. Cached so the per-record loops
+        /// don't have to re-sum.
+        total_weight: u64,
         record: AgxpsTimingRecord,
     }
 
