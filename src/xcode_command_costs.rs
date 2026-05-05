@@ -544,6 +544,8 @@ mod tests {
             agxps_trace_cost_percent: w1,
             agxps_trace_events: 0,
             agxps_trace_matched_work_cliques: 0,
+            agxps_trace_duration_ns: 0,
+            agxps_trace_duration_percent: None,
             agxps_analyzer_cost: 0,
             agxps_analyzer_cost_percent: analyzer,
             agxps_analyzer_avg_duration_sum: 0,

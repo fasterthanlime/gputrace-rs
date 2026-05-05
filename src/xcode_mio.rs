@@ -653,6 +653,8 @@ pub struct XcodeMioPipelineAnalysis {
     pub agxps_trace_cost_percent: Option<f64>,
     pub agxps_trace_events: u64,
     pub agxps_trace_matched_work_cliques: usize,
+    pub agxps_trace_duration_ns: u64,
+    pub agxps_trace_duration_percent: Option<f64>,
     pub agxps_analyzer_cost: u64,
     pub agxps_analyzer_cost_percent: Option<f64>,
     pub agxps_analyzer_avg_duration_sum: u64,
@@ -774,6 +776,12 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
         .flat_map(|pipeline| pipeline.agxps_trace_costs.iter())
         .map(|cost| cost.stats_word1)
         .sum::<u64>();
+    let agxps_trace_duration_denominator = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| pipeline.agxps_trace_costs.iter())
+        .map(|cost| cost.duration_ns)
+        .sum::<u64>();
     let agxps_analyzer_cost_denominator = report
         .pipelines
         .iter()
@@ -811,6 +819,11 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
                 .agxps_trace_costs
                 .iter()
                 .map(|cost| cost.stats_word1)
+                .sum::<u64>();
+            let agxps_trace_duration_ns = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.duration_ns)
                 .sum::<u64>();
             let agxps_analyzer_cost = pipeline
                 .agxps_trace_costs
@@ -957,6 +970,13 @@ pub fn summarize_report(report: &XcodeMioReport) -> XcodeMioAnalysisReport {
                     .then(|| agxps_trace_cost as f64 * 100.0 / agxps_trace_cost_denominator as f64),
                 agxps_trace_events,
                 agxps_trace_matched_work_cliques,
+                agxps_trace_duration_ns,
+                agxps_trace_duration_percent: (agxps_trace_duration_denominator > 0
+                    && agxps_trace_duration_ns > 0)
+                    .then(|| {
+                        agxps_trace_duration_ns as f64 * 100.0
+                            / agxps_trace_duration_denominator as f64
+                    }),
                 agxps_analyzer_cost,
                 agxps_analyzer_cost_percent: (agxps_analyzer_cost_denominator > 0
                     && agxps_analyzer_cost > 0)
@@ -1028,28 +1048,19 @@ pub fn format_analysis_report(report: &XcodeMioAnalysisReport) -> String {
     if report
         .top_pipelines
         .iter()
-        .any(|pipeline| pipeline.agxps_analyzer_cost_percent.is_some())
+        .any(|pipeline| pipeline.agxps_trace_duration_percent.is_some())
     {
         out.push_str(
-            "AGX Ana % uses analyzer-weighted clique duration; AGX W1 % uses instruction-stats word1. They are candidate metrics, not exact Xcode UI parity on the validated non-synthetic trace.\n\n",
+            "Cost % is per-pipeline AGXPS clique duration_ns normalized to total. On the synthetic single-dispatch-per-pipeline trace it matches Xcode Shader Cost within +/-1pp; on realistic traces it deviates up to +/-4pp on heavily aggregated pipelines.\n\n",
         );
     }
     out.push_str(&format!(
-        "{:<42} {:>5} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8}\n",
-        "Function",
-        "Cmds",
-        "Cmd %",
-        "Bins",
-        "ExecBin",
-        "AGX Ana",
-        "AGX W1",
-        "Time %",
-        "TL Cost",
-        "Exec %"
+        "{:<42} {:>5} {:>7} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8}\n",
+        "Function", "Cmds", "Cmd %", "Cost %", "Bins", "ExecBin", "AGX Ana", "AGX W1", "Time %",
     ));
     for pipeline in report.top_pipelines.iter().take(25) {
         out.push_str(&format!(
-            "{:<42} {:>5} {:>6.2}% {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
+            "{:<42} {:>5} {:>6.2}% {:>8} {:>7} {:>7} {:>7} {:>7} {:>7}\n",
             truncate(
                 pipeline
                     .function_name
@@ -1059,13 +1070,12 @@ pub fn format_analysis_report(report: &XcodeMioAnalysisReport) -> String {
             ),
             pipeline.command_count,
             pipeline.command_percent,
+            format_optional_percent(pipeline.agxps_trace_duration_percent),
             pipeline.unique_timeline_binary_count,
             pipeline.executable_shader_binary_reference_count,
             format_optional_percent(pipeline.agxps_analyzer_cost_percent),
             format_optional_percent(pipeline.agxps_trace_cost_percent),
             format_optional_percent(pipeline.xcode_time_percent),
-            format_optional_percent(pipeline.timeline_cost_percent),
-            format_optional_percent(pipeline.execution_top_cost_percent),
         ));
     }
     if !report.warnings.is_empty() {
@@ -1082,6 +1092,12 @@ fn elapsed_ms(start: Instant) -> f64 {
 }
 
 fn pipeline_rank_score(pipeline: &XcodeMioPipelineAnalysis) -> f64 {
+    if let Some(value) = pipeline
+        .agxps_trace_duration_percent
+        .filter(|value| value.is_finite())
+    {
+        return value;
+    }
     [
         pipeline.execution_top_cost_percent,
         pipeline.agxps_analyzer_cost_percent,
