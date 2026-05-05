@@ -429,6 +429,42 @@ uses the timing analyzer's per-command aggregates directly. It is not
 yet proven to be Xcode's exact "compute cost" denominator, but it is
 the strongest current candidate for a fast, per-pipeline signal.
 
+Xcode ground truth from the same trace's **Counters → GPU Commands →
+Compute Kernel** table is per-dispatch `Execution Cost`:
+
+```text
+light#0   0.098%   heavy#0  19.421%
+light#1   0.053%   heavy#1  20.245%
+light#2   0.011%   heavy#2  19.582%
+light#3   0.049%   heavy#3  20.513%
+light#4   0.040%   heavy#4  19.987%
+
+pipeline totals:
+heavy_alu  99.75%
+light_add   0.25%
+```
+
+Sorting MIO executable ESL shader addresses ascending gives the same
+interleaved dispatch order as Xcode's GPU Commands table:
+
+```text
+0x...b8000 light#0
+0x...b80c0 heavy#0
+0x...b8180 light#1
+0x...b8240 heavy#1
+...
+0x...b8600 light#4
+0x...b86c0 heavy#4
+```
+
+The current `xcode-mio --format raw-text` report prints this as
+`AGXPS timing rows by ESL shader address`. On the sample, analyzer
+weighted duration is close for the heavy rows but undercounts the tiny
+light rows by roughly an order of magnitude. The `w1` instruction-stat
+join catches more light work in aggregate, but is noisier per dispatch
+and over-attributes `light#0`/`light#4`. Do not treat either metric as
+exact Xcode `Execution Cost` yet.
+
 The older, heavier route is still useful for RE: join work cliques to
 timing-analyzer command spans by system-time overlap, then call
 `agxps_aps_clique_instruction_trace_get_instruction_stats`.

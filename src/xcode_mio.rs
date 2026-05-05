@@ -1066,6 +1066,53 @@ pub fn format_report(report: &XcodeMioReport) -> String {
         }
         out.push('\n');
     }
+    let agxps_event_denominator = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| pipeline.agxps_trace_costs.iter())
+        .map(|cost| cost.execution_events)
+        .sum::<u64>();
+    let mut agxps_rows = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| {
+            pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(move |cost| (pipeline, cost))
+        })
+        .collect::<Vec<_>>();
+    agxps_rows.sort_by(|(left_pipeline, left_cost), (right_pipeline, right_cost)| {
+        left_cost
+            .shader_address
+            .cmp(&right_cost.shader_address)
+            .then_with(|| left_pipeline.index.cmp(&right_pipeline.index))
+    });
+    if !agxps_rows.is_empty() {
+        out.push_str("AGXPS timing rows by ESL shader address:\n");
+        out.push_str(
+            "  row analyzer%      w1%   events% analyzer_weighted           w1     events cmds rec_cliques matched function      esl_shader\n",
+        );
+        for (row_index, (pipeline, cost)) in agxps_rows.iter().enumerate().take(80) {
+            let name = pipeline.function_name.as_deref().unwrap_or("<unknown>");
+            let analyzer_pct =
+                percent_u64(cost.analyzer_weighted_duration, agxps_analyzer_denominator);
+            let w1_pct = percent_u64(cost.stats_word1, agxps_trace_denominator);
+            let events_pct = percent_u64(cost.execution_events, agxps_event_denominator);
+            out.push_str(&format!(
+                "  {row:>3} {analyzer_pct:>8.4}% {w1_pct:>8.4}% {events_pct:>8.4}% {weighted:>17} {w1:>12} {events:>10} {cmds:>4} {cliques:>11} {matched:>7} {name:<13} 0x{address:x}\n",
+                row = row_index,
+                weighted = cost.analyzer_weighted_duration,
+                w1 = cost.stats_word1,
+                events = cost.execution_events,
+                cmds = cost.command_count,
+                cliques = cost.record_cliques,
+                matched = cost.matched_work_cliques,
+                address = cost.shader_address,
+            ));
+        }
+        out.push('\n');
+    }
     let mut shader_binary_costs = report
         .pipelines
         .iter()
@@ -1487,6 +1534,14 @@ pub fn format_report(report: &XcodeMioReport) -> String {
     }
 
     out
+}
+
+fn percent_u64(value: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        100.0 * value as f64 / denominator as f64
+    }
 }
 
 #[cfg(target_os = "macos")]
