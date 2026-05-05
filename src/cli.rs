@@ -38,7 +38,7 @@ use crate::xcode_mio;
 #[derive(Debug, Parser)]
 #[command(name = "gputrace")]
 #[command(version)]
-#[command(about = "Tools for parsing, analyzing, diffing, and automating GPU traces")]
+#[command(about = "Profile an Apple Metal .gputrace and write a GPU analysis report")]
 pub struct Cli {
     #[command(subcommand)]
     command: CommandSet,
@@ -46,24 +46,33 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandSet {
+    #[command(hide = true)]
     Stats(TracePath),
+    #[command(hide = true)]
     Analyze(TracePath),
     #[command(
-        about = "Write a one-shot markdown report directory for a trace",
-        long_about = "Write a one-shot markdown report directory for a trace.\n\nThis opens the trace once from the CLI, runs the retained offline analyzers, reuses the Xcode MIO private-framework summary across analysis/insights, and writes agent-readable Markdown files into the output directory."
+        about = "Profile if needed, then write a Markdown report directory",
+        long_about = "Profile if needed, then write a Markdown report directory.\n\nThis is the public command. It takes the original .gputrace bundle, reuses cached profiler data inside the bundle when present, otherwise profiles the trace with MTLReplayer, then writes the report."
     )]
     Report(ReportArgs),
+    #[command(hide = true)]
     AnalyzeUsage(AnalyzeUsageArgs),
+    #[command(hide = true)]
     ApiCalls(ApiCallsArgs),
+    #[command(hide = true)]
     ClearBuffers(ClearBuffersArgs),
+    #[command(hide = true)]
     Dump(DumpArgs),
+    #[command(hide = true)]
     DumpRecords(DumpRecordsArgs),
     #[command(
+        hide = true,
         about = "Export offline counter/profile rows from a trace bundle",
         long_about = "Export offline counter/profile rows from a trace bundle.\n\nRows combine streamData/profile dispatch timing and decoded APS counter sample rows when present. Legacy raw-counter fallback rows are only emitted when richer profiler/APS rows are unavailable. JSON includes APS-derived metric_metadata with Xcode counter graph units/groups/visibility. No Xcode Counters.csv is required; use xcode-counters for explicit CSV exports."
     )]
     ExportCounters(ExportCountersArgs),
     #[command(
+        hide = true,
         about = "Decode raw APS counter data from a profiler bundle",
         long_about = "Decode raw APS counter data from a profiler bundle.\n\nReads .gpuprofiler_raw/streamData directly, decodes APSCounterData/GPRWCNTR schemas, exposes APS trace-id and program-address mappings, scans Profiling_f_* payloads for address-derived shader hits, maps raw hashes through installed AGX Metal catalogs, and runs local Apple *-derived.js formulas where the trace exposes matching raw variables. This is independent of Xcode Counters.csv."
     )]
@@ -72,45 +81,72 @@ enum CommandSet {
     RawCounterProbe(RawCounterProbeArgs),
     #[command(hide = true)]
     ProfilingAddressProbe(ProfilingAddressProbeArgs),
-    #[command(alias = "perfcounters-validate")]
+    #[command(alias = "perfcounters-validate", hide = true)]
     ValidateCounters(ValidateCountersArgs),
+    #[command(hide = true)]
     Fences(FencesArgs),
+    #[command(hide = true)]
     Mtlb(MtlbArgs),
+    #[command(hide = true)]
     MtlbInventory(MtlbPathArgs),
+    #[command(hide = true)]
     MtlbStats(MtlbPathArgs),
+    #[command(hide = true)]
     MtlbFunctions(MtlbFunctionsArgs),
+    #[command(hide = true)]
     Profiler(ProfilerArgs),
     #[command(
+        hide = true,
         about = "Decode Xcode private MIO shader-profiler topology",
         long_about = "Decode Xcode private MIO shader-profiler topology.\n\nThis macOS-only command loads Xcode's private GTShaderProfiler framework and asks it to process the exported streamData. It reports the structured GPU command, encoder, and pipeline topology that Xcode derives from the regular .gpuprofiler_raw export. Cost timeline bytes are not mislabeled as Xcode Cost; unresolved cost records remain exposed as counts until their layout is fully mapped."
     )]
     XcodeMio(XcodeMioArgs),
     #[command(
+        hide = true,
         about = "Report profiler bundle byte and decoder coverage",
         long_about = "Report profiler bundle byte and decoder coverage.\n\nThis is an end-user coverage/worklist report for Xcode-exported .gpuprofiler_raw bundles. It groups streamData, Profiling_f_*, Counters_f_*, Timeline_f_*, and other raw files by bytes and marks which families are decoded semantically, only decoded heuristically, or still opaque."
     )]
     ProfilerCoverage(ProfilerCoverageArgs),
+    #[command(hide = true)]
     Timeline(TimelineArgs),
+    #[command(hide = true)]
     Kernels(KernelsArgs),
+    #[command(hide = true)]
     Encoders(EncodersArgs),
+    #[command(hide = true)]
     Dependencies(DependenciesArgs),
+    #[command(hide = true)]
     Shaders(ShadersArgs),
+    #[command(hide = true)]
     ShaderSource(ShaderSourceArgs),
+    #[command(hide = true)]
     ShaderHotspots(ShaderHotspotsArgs),
+    #[command(hide = true)]
     Correlate(CorrelateArgs),
+    #[command(hide = true)]
     Timing(TimingArgs),
     #[command(hide = true)]
     TimingProfiler(TimingProfilerArgs),
+    #[command(hide = true)]
     CommandBuffers(CommandBuffersArgs),
+    #[command(hide = true)]
     BufferAccess(BufferAccessArgs),
+    #[command(hide = true)]
     Tree(TreeArgs),
+    #[command(hide = true)]
     Graph(GraphArgs),
+    #[command(hide = true)]
     Buffers(BuffersArgs),
+    #[command(hide = true)]
     BufferTimeline(BufferTimelineArgs),
+    #[command(hide = true)]
     Insights(InsightsArgs),
+    #[command(hide = true)]
     Diff(DiffArgs),
+    #[command(hide = true)]
     Markdown(MarkdownArgs),
     #[command(
+        hide = true,
         alias = "capture-profile",
         about = "Profile an existing .gputrace headlessly via MTLReplayer.app",
         long_about = "Profile an existing .gputrace headlessly via MTLReplayer.app.\n\nDirectly invokes the Apple-shipped MTLReplayer.app CLI (no Xcode UI, no Accessibility permission required) and waits for it to write the .gpuprofiler_raw bundle. The exact invocation is:\n\n  open -W -a /System/Library/CoreServices/MTLReplayer.app \\\n    --args -CLI <trace> -collectProfilerData --all -runningInCI -verbose --output <dir>\n\nMTLReplayer.app is launched through `open` (LaunchServices) because Apple's trust cache puts a launch constraint on the binary that only LaunchServices satisfies. `-CLI` is the gating flag that puts MTLReplayer in headless mode (otherwise it idles as the GTDisplayService companion). `-collectProfilerData --all` is what drives the actual per-draw replay/profile loop."
@@ -118,10 +154,12 @@ enum CommandSet {
     Profile(ProfileArgs),
     Version(VersionArgs),
     #[command(
+        hide = true,
         about = "Compare pasted Xcode GPU Commands costs against AGXPS candidates",
         long_about = "Compare pasted Xcode GPU Commands costs against AGXPS candidates.\n\nPass a tab-delimited table copied from Xcode's Counters > GPU Commands > Compute Kernel view. The command groups Xcode's per-command Execution Cost by pipeline address, maps those addresses through Xcode MIO topology, then reports error metrics for the AGXPS analyzer-weighted and instruction-stats W1 candidate costs."
     )]
     XcodeCommandCosts(XcodeCommandCostsArgs),
+    #[command(hide = true)]
     XcodeCounters(XcodeCountersArgs),
 }
 
@@ -132,16 +170,17 @@ struct TracePath {
 
 #[derive(Debug, Args)]
 struct ReportArgs {
-    #[arg(help = "Input .gputrace bundle to analyze")]
+    #[arg(help = "Input .gputrace bundle to profile/analyze")]
     trace: PathBuf,
     #[arg(
         short,
         long,
-        help = "Directory to create/update with markdown report files"
+        help = "Directory to create/update with markdown report files; defaults to <trace>-report"
     )]
-    output: PathBuf,
+    output: Option<PathBuf>,
     #[arg(
         long,
+        hide = true,
         value_name = "DIR",
         help = "Override the .gpuprofiler_raw directory (sets GPUTRACE_PROFILER_DIR for this run). Useful when streamData lives somewhere other than next to the trace, e.g. /private/tmp/com.apple.gputools.profiling/<stem>_stream.gpuprofiler_raw or a directory produced by `MTLReplayer -CLI ... --output X`"
     )]
@@ -681,19 +720,11 @@ pub fn run() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         CommandSet::Report(args) => {
-            if let Some(profiler) = &args.profiler {
-                // SAFETY: single-threaded CLI startup; downstream code reads this env var via
-                // `find_profiler_directory` to resolve a non-default profiler directory.
-                unsafe {
-                    std::env::set_var("GPUTRACE_PROFILER_DIR", profiler);
-                }
-            }
-            let report = report::generate(
-                &args.trace,
-                &report::ReportOptions {
-                    output_dir: args.output,
-                },
-            )?;
+            ensure_report_profiler(&args)?;
+            let output_dir = args
+                .output
+                .unwrap_or_else(|| default_report_output(&args.trace));
+            let report = report::generate(&args.trace, &report::ReportOptions { output_dir })?;
             println!(
                 "Wrote {} markdown files to {} in {:.1} ms",
                 report.files.len(),
@@ -1558,12 +1589,82 @@ fn validate_diff_by(by: Option<&str>) -> Result<()> {
 }
 
 fn default_profile_output(trace_path: &Path) -> PathBuf {
+    embedded_profile_output(trace_path)
+}
+
+fn default_report_output(trace_path: &Path) -> PathBuf {
     let parent = trace_path.parent().unwrap_or_else(|| Path::new("."));
     let stem = trace_path
         .file_stem()
         .and_then(OsStr::to_str)
         .unwrap_or("trace");
-    parent.join(format!("{stem}-perfdata"))
+    parent.join(format!("{stem}-report"))
+}
+
+fn embedded_profile_output(trace_path: &Path) -> PathBuf {
+    if trace_path.is_dir() {
+        trace_path.join("gputrace-profile")
+    } else {
+        let parent = trace_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = trace_path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or("trace");
+        parent.join(format!("{stem}-profile-cache"))
+    }
+}
+
+fn ensure_report_profiler(args: &ReportArgs) -> Result<()> {
+    if let Some(profiler) = &args.profiler {
+        set_profiler_dir(profiler);
+        return Ok(());
+    }
+
+    if let Some(existing) = profiler::find_profiler_directory(&args.trace)
+        && existing.join("streamData").is_file()
+    {
+        set_profiler_dir(&existing);
+        return Ok(());
+    }
+
+    let output_dir = embedded_profile_output(&args.trace);
+    println!(
+        "No profiler data found; profiling now into {}",
+        output_dir.display()
+    );
+    let profile = replay_service::profile(&replay_service::ProfileOptions {
+        trace: args.trace.clone(),
+        output_dir: output_dir.clone(),
+        stdout_log: None,
+        stderr_log: None,
+    })?;
+    let Some(raw_dir) = profile.gpuprofiler_raw else {
+        return Err(crate::Error::InvalidInput(format!(
+            "MTLReplayer exited but no .gpuprofiler_raw directory was produced under {}",
+            output_dir.display()
+        )));
+    };
+    if !profile.has_stream_data {
+        return Err(crate::Error::InvalidInput(format!(
+            "MTLReplayer exited but no streamData was produced under {}",
+            raw_dir.display()
+        )));
+    }
+    println!(
+        "Profiled trace in {:.1} ms; using {}",
+        profile.elapsed_ms,
+        raw_dir.display()
+    );
+    set_profiler_dir(&raw_dir);
+    Ok(())
+}
+
+fn set_profiler_dir(path: &Path) {
+    // SAFETY: single-threaded CLI startup; downstream code reads this env var via
+    // `find_profiler_directory` to resolve the chosen profiler directory.
+    unsafe {
+        std::env::set_var("GPUTRACE_PROFILER_DIR", path);
+    }
 }
 
 fn resolve_diff_inputs(args: DiffArgs) -> Result<(PathBuf, PathBuf, Option<String>)> {

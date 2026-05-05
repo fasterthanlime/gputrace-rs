@@ -1914,6 +1914,10 @@ pub(crate) fn find_profiler_directory(path: &Path) -> Option<PathBuf> {
         return system_landing_zone_for(path).filter(|landing| landing.is_dir());
     }
 
+    if let Some(embedded) = embedded_landing_zone_for(path).filter(|landing| landing.is_dir()) {
+        return Some(embedded);
+    }
+
     let nested = fs::read_dir(path)
         .ok()?
         .filter_map(|entry| entry.ok())
@@ -1926,6 +1930,15 @@ pub(crate) fn find_profiler_directory(path: &Path) -> Option<PathBuf> {
                     .is_some_and(|ext| ext == "gpuprofiler_raw")
         });
     nested.or_else(|| system_landing_zone_for(path).filter(|landing| landing.is_dir()))
+}
+
+fn embedded_landing_zone_for(trace_path: &Path) -> Option<PathBuf> {
+    let stem = trace_path.file_stem()?.to_str()?;
+    Some(
+        trace_path
+            .join("gputrace-profile")
+            .join(format!("{stem}.gpuprofiler_raw")),
+    )
 }
 
 /// Xcode 26.x writes profile output to `/private/tmp/com.apple.gputools.profiling/`
