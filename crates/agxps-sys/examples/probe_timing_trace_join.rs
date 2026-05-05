@@ -39,7 +39,8 @@ fn main() {
     });
     println!("framework: {}", loaded.framework_path);
 
-    let mut groups = BTreeMap::<(u16, u64), ShaderGroup>::new();
+    let mut work_groups = BTreeMap::<(u16, u64), ShaderGroup>::new();
+    let mut esl_groups = BTreeMap::<(u16, u64), ShaderGroup>::new();
     let mut totals = Totals::default();
     for path in &paths {
         let bytes = fs::read(path).unwrap_or_else(|error| {
@@ -61,14 +62,26 @@ fn main() {
                 eprintln!("work cliques {path}: {error}");
                 process::exit(1);
             });
+        let esl = unsafe { fetch_esl_cliques(&loaded, raw.profile_data) }.unwrap_or_else(|error| {
+            eprintln!("esl cliques {path}: {error}");
+            process::exit(1);
+        });
 
         let mut file_matched = 0usize;
+        let mut file_esl_matched = 0usize;
         let mut file_missing = 0usize;
         let mut file_unmatched = 0usize;
 
         totals.commands += records.len();
         for record in &records {
-            let group = groups
+            let group = work_groups
+                .entry((record.prefix(), record.esl_shader_address))
+                .or_default();
+            group.commands += 1;
+            group.work_shader_address = record.shader_address;
+            group.record_cliques += record.work_cliques;
+            group.duration_ns += record.duration_ns();
+            let group = esl_groups
                 .entry((record.prefix(), record.esl_shader_address))
                 .or_default();
             group.commands += 1;
@@ -96,40 +109,61 @@ fn main() {
             };
 
             let record = records[record_idx];
-            let group = groups
+            let group = work_groups
                 .entry((record.prefix(), record.esl_shader_address))
                 .or_default();
             group.work_shader_address = record.shader_address;
             group.matched_work_cliques += 1;
-            let events = unsafe {
-                (loaded.api.instruction_trace_get_execution_events_num)(
-                    raw.profile_data,
-                    work.traces[idx],
-                )
-            };
-            group.execution_events += events;
-            let stats = unsafe {
-                (loaded.api.instruction_trace_get_instruction_stats)(
-                    raw.gpu,
-                    raw.profile_data,
-                    work.traces[idx],
-                )
-            };
-            for (dst, src) in group.stats_words.iter_mut().zip(stats.words) {
-                *dst += src as u128;
-            }
+            *group
+                .work_esl_id_counts
+                .entry(work.esl_ids[idx])
+                .or_default() += 1;
+            *group
+                .work_clique_id_counts
+                .entry(work.clique_ids[idx])
+                .or_default() += 1;
+            unsafe { accumulate_trace(&loaded, &raw, work.traces[idx], group) };
             totals.matched_work_cliques += 1;
             file_matched += 1;
         }
 
+        for idx in 0..esl.traces.len() {
+            totals.esl_cliques += 1;
+            if esl.missing_ends[idx] != 0 {
+                totals.missing_esl_cliques += 1;
+                continue;
+            }
+
+            let start_ns =
+                unsafe { (loaded.api.get_system_timestamp)(raw.profile_data, esl.starts[idx]) };
+            let end_ns =
+                unsafe { (loaded.api.get_system_timestamp)(raw.profile_data, esl.ends[idx]) };
+            let Some(record_idx) = find_record(&records, start_ns, end_ns) else {
+                totals.unmatched_esl_cliques += 1;
+                continue;
+            };
+
+            let record = records[record_idx];
+            let group = esl_groups
+                .entry((record.prefix(), record.esl_shader_address))
+                .or_default();
+            group.work_shader_address = record.shader_address;
+            group.matched_work_cliques += 1;
+            unsafe { accumulate_trace(&loaded, &raw, esl.traces[idx], group) };
+            totals.matched_esl_cliques += 1;
+            file_esl_matched += 1;
+        }
+
         println!(
-            "file: {path} bytes={} commands={} work_cliques={} matched={} unmatched={} missing={}",
+            "file: {path} bytes={} commands={} work_cliques={} matched={} unmatched={} missing={} esl_cliques={} esl_matched={}",
             bytes.len(),
             records.len(),
             work.traces.len(),
             file_matched,
             file_unmatched,
             file_missing,
+            esl.traces.len(),
+            file_esl_matched,
         );
         let _ = raw;
     }
@@ -143,7 +177,19 @@ fn main() {
         totals.unmatched_work_cliques,
         totals.missing_work_cliques,
     );
+    println!(
+        "  esl_cliques={} matched={} unmatched={} missing={}",
+        totals.esl_cliques,
+        totals.matched_esl_cliques,
+        totals.unmatched_esl_cliques,
+        totals.missing_esl_cliques,
+    );
 
+    print_groups("work-clique timestamp join", work_groups);
+    print_groups("esl-clique timestamp join", esl_groups);
+}
+
+fn print_groups(label: &str, groups: BTreeMap<(u16, u64), ShaderGroup>) {
     let total_duration = groups.values().map(|group| group.duration_ns).sum::<u64>();
     let total_record_cliques = groups
         .values()
@@ -162,9 +208,9 @@ fn main() {
         .map(|group| group.stats_words[1])
         .sum::<u128>();
 
-    println!("\njoined by timing prefix + ESL shader address:");
+    println!("\n{label}:");
     println!(
-        "  prefix  esl_shader          work_shader         cmds  rec_cliques matched  duration_ns dur_share  events ev_share        w0 w0_share        w1 w1_share"
+        "  prefix  esl_shader          work_shader         cmds  rec_cliques matched  duration_ns dur_share  events ev_share        w0 w0_share        w1 w1_share  top_work_esl_ids  top_clique_ids"
     );
     for ((prefix, shader_address), group) in groups {
         let duration_share = share_u64(group.duration_ns, total_duration);
@@ -172,7 +218,7 @@ fn main() {
         let w0_share = share_u128(group.stats_words[0], total_w0);
         let w1_share = share_u128(group.stats_words[1], total_w1);
         println!(
-            "  {prefix}  0x{shader_address:016x} 0x{work_shader:016x} {commands:>5} {rec_cliques:>12} {matched:>7} {duration:>12} {duration_share:>8.3}% {events:>7} {event_share:>8.3}% {w0:>9} {w0_share:>8.3}% {w1:>9} {w1_share:>8.3}%",
+            "  {prefix}  0x{shader_address:016x} 0x{work_shader:016x} {commands:>5} {rec_cliques:>12} {matched:>7} {duration:>12} {duration_share:>8.3}% {events:>7} {event_share:>8.3}% {w0:>9} {w0_share:>8.3}% {w1:>9} {w1_share:>8.3}%  {top_esl_ids}  {top_clique_ids}",
             prefix = format_prefix(prefix),
             work_shader = group.work_shader_address,
             commands = group.commands,
@@ -182,6 +228,8 @@ fn main() {
             events = group.execution_events,
             w0 = group.stats_words[0],
             w1 = group.stats_words[1],
+            top_esl_ids = format_top_esl_ids(&group.work_esl_id_counts),
+            top_clique_ids = format_top_clique_ids(&group.work_clique_id_counts),
         );
     }
 
@@ -195,6 +243,10 @@ struct Totals {
     matched_work_cliques: usize,
     unmatched_work_cliques: usize,
     missing_work_cliques: usize,
+    esl_cliques: usize,
+    matched_esl_cliques: usize,
+    unmatched_esl_cliques: usize,
+    missing_esl_cliques: usize,
 }
 
 #[derive(Default)]
@@ -206,6 +258,8 @@ struct ShaderGroup {
     matched_work_cliques: usize,
     execution_events: u64,
     stats_words: [u128; 14],
+    work_esl_id_counts: BTreeMap<u64, usize>,
+    work_clique_id_counts: BTreeMap<u8, usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +288,15 @@ struct RawProfile {
 }
 
 struct WorkCliques {
+    starts: Vec<u64>,
+    ends: Vec<u64>,
+    esl_ids: Vec<u64>,
+    clique_ids: Vec<u8>,
+    missing_ends: Vec<u8>,
+    traces: Vec<agxps_sys::AgxpsApsCliqueInstructionTrace>,
+}
+
+struct EslCliques {
     starts: Vec<u64>,
     ends: Vec<u64>,
     missing_ends: Vec<u8>,
@@ -393,12 +456,22 @@ unsafe fn fetch_work_cliques(
     let n = unsafe { (api.get_work_cliques_num)(profile_data) } as usize;
     let mut starts = vec![0u64; n];
     let mut ends = vec![0u64; n];
+    let mut esl_ids = vec![0u64; n];
+    let mut clique_ids = vec![0u8; n];
     let mut missing_ends = vec![0u8; n];
     let mut traces = vec![0u64; n];
     if n > 0 {
         let ok = unsafe {
             (api.get_work_clique_start)(profile_data, starts.as_mut_ptr(), 0, n as u64) != 0
                 && (api.get_work_clique_end)(profile_data, ends.as_mut_ptr(), 0, n as u64) != 0
+                && (api.get_work_clique_esl_id)(profile_data, esl_ids.as_mut_ptr(), 0, n as u64)
+                    != 0
+                && (api.get_work_clique_clique_id)(
+                    profile_data,
+                    clique_ids.as_mut_ptr(),
+                    0,
+                    n as u64,
+                ) != 0
                 && (api.get_work_clique_missing_end)(
                     profile_data,
                     missing_ends.as_mut_ptr(),
@@ -419,9 +492,67 @@ unsafe fn fetch_work_cliques(
     Ok(WorkCliques {
         starts,
         ends,
+        esl_ids,
+        clique_ids,
         missing_ends,
         traces,
     })
+}
+
+unsafe fn fetch_esl_cliques(
+    loaded: &agxps_sys::LoadedApi,
+    profile_data: agxps_sys::AgxpsApsProfileData,
+) -> Result<EslCliques, String> {
+    let api = &loaded.api;
+    let n = unsafe { (api.get_esl_cliques_num)(profile_data) } as usize;
+    let mut starts = vec![0u64; n];
+    let mut ends = vec![0u64; n];
+    let mut missing_ends = vec![0u8; n];
+    let mut traces = vec![0u64; n];
+    if n > 0 {
+        let ok = unsafe {
+            (api.get_esl_clique_start)(profile_data, starts.as_mut_ptr(), 0, n as u64) != 0
+                && (api.get_esl_clique_end)(profile_data, ends.as_mut_ptr(), 0, n as u64) != 0
+                && (api.get_esl_clique_missing_end)(
+                    profile_data,
+                    missing_ends.as_mut_ptr(),
+                    0,
+                    n as u64,
+                ) != 0
+                && (api.get_esl_clique_instruction_trace)(
+                    profile_data,
+                    traces.as_mut_ptr(),
+                    0,
+                    n as u64,
+                ) != 0
+        };
+        if !ok {
+            return Err("esl-clique range getter failed".to_owned());
+        }
+    }
+    Ok(EslCliques {
+        starts,
+        ends,
+        missing_ends,
+        traces,
+    })
+}
+
+unsafe fn accumulate_trace(
+    loaded: &agxps_sys::LoadedApi,
+    raw: &RawProfile,
+    trace: agxps_sys::AgxpsApsCliqueInstructionTrace,
+    group: &mut ShaderGroup,
+) {
+    let events =
+        unsafe { (loaded.api.instruction_trace_get_execution_events_num)(raw.profile_data, trace) };
+    group.execution_events += events;
+    let stats = unsafe {
+        (loaded.api.instruction_trace_get_instruction_stats)(raw.gpu, raw.profile_data, trace)
+    };
+    for (dst, src) in group.stats_words.iter_mut().zip(stats.words) {
+        *dst += src as u128;
+    }
 }
 
 fn find_record(records: &[TimingRecord], start_ns: u64, end_ns: u64) -> Option<usize> {
@@ -469,4 +600,38 @@ fn share_u128(value: u128, total: u128) -> f64 {
 
 fn format_prefix(prefix: u16) -> String {
     format!("0x{prefix:04x}")
+}
+
+fn format_top_esl_ids(counts: &BTreeMap<u64, usize>) -> String {
+    if counts.is_empty() {
+        return "-".to_owned();
+    }
+    let mut rows = counts.iter().collect::<Vec<_>>();
+    rows.sort_by(|(left_id, left_count), (right_id, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    rows.into_iter()
+        .take(3)
+        .map(|(id, count)| format!("0x{id:x}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_top_clique_ids(counts: &BTreeMap<u8, usize>) -> String {
+    if counts.is_empty() {
+        return "-".to_owned();
+    }
+    let mut rows = counts.iter().collect::<Vec<_>>();
+    rows.sort_by(|(left_id, left_count), (right_id, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    rows.into_iter()
+        .take(3)
+        .map(|(id, count)| format!("0x{id:x}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }

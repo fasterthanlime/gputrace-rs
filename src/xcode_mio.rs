@@ -117,6 +117,8 @@ pub struct XcodeMioPipelineAgxpsTraceCost {
     pub work_shader_address: u64,
     pub command_count: usize,
     pub record_cliques: u64,
+    pub analyzer_weighted_duration: u64,
+    pub analyzer_avg_duration_sum: u64,
     pub matched_work_cliques: usize,
     pub duration_ns: u64,
     pub execution_events: u64,
@@ -961,6 +963,11 @@ pub fn format_report(report: &XcodeMioReport) -> String {
                 .iter()
                 .map(|cost| cost.stats_word1)
                 .sum::<u64>();
+            let analyzer_weighted = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.analyzer_weighted_duration)
+                .sum::<u64>();
             let total_events = pipeline
                 .agxps_trace_costs
                 .iter()
@@ -985,8 +992,76 @@ pub fn format_report(report: &XcodeMioReport) -> String {
                 .map(|cost| format!("0x{:x}", cost.shader_address))
                 .unwrap_or_else(|| "-".to_owned());
             out.push_str(&format!(
-                "  {:>6.2}% w1={:>12} events={:>9} cliques={:>7} cmds={:>4} {:<56} top_esl={}\n",
-                pct, total_cost, total_events, matched_cliques, command_count, name, top_address,
+                "  {:>6.2}% w1={:>12} analyzer_weighted={:>12} events={:>9} cliques={:>7} cmds={:>4} {:<56} top_esl={}\n",
+                pct,
+                total_cost,
+                analyzer_weighted,
+                total_events,
+                matched_cliques,
+                command_count,
+                name,
+                top_address,
+            ));
+        }
+        out.push('\n');
+    }
+    let agxps_analyzer_denominator = report
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| pipeline.agxps_trace_costs.iter())
+        .map(|cost| cost.analyzer_weighted_duration)
+        .sum::<u64>();
+    if agxps_analyzer_denominator > 0 {
+        let mut pipelines = report
+            .pipelines
+            .iter()
+            .filter(|pipeline| {
+                pipeline
+                    .agxps_trace_costs
+                    .iter()
+                    .any(|cost| cost.analyzer_weighted_duration > 0)
+            })
+            .collect::<Vec<_>>();
+        pipelines.sort_by(|left, right| {
+            let left_cost = left
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.analyzer_weighted_duration)
+                .sum::<u64>();
+            let right_cost = right
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.analyzer_weighted_duration)
+                .sum::<u64>();
+            right_cost
+                .cmp(&left_cost)
+                .then_with(|| left.index.cmp(&right.index))
+        });
+        out.push_str("Pipelines by AGXPS timing-analyzer clique duration:\n");
+        for pipeline in pipelines.iter().take(20) {
+            let name = pipeline
+                .function_name
+                .as_deref()
+                .unwrap_or("<unknown function>");
+            let weighted = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.analyzer_weighted_duration)
+                .sum::<u64>();
+            let avg_sum = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.analyzer_avg_duration_sum)
+                .sum::<u64>();
+            let record_cliques = pipeline
+                .agxps_trace_costs
+                .iter()
+                .map(|cost| cost.record_cliques)
+                .sum::<u64>();
+            let pct = 100.0 * weighted as f64 / agxps_analyzer_denominator as f64;
+            out.push_str(&format!(
+                "  {:>6.3}% weighted={:>12} avg_sum={:>10} rec_cliques={:>7} {:<56}\n",
+                pct, weighted, avg_sum, record_cliques, name,
             ));
         }
         out.push('\n');
@@ -3251,6 +3326,16 @@ mod platform {
                 entry.record_cliques = entry
                     .record_cliques
                     .saturating_add(record.record.work_cliques);
+                entry.analyzer_avg_duration_sum = entry
+                    .analyzer_avg_duration_sum
+                    .saturating_add(record.record.avg_clique_duration);
+                entry.analyzer_weighted_duration =
+                    entry
+                        .analyzer_weighted_duration
+                        .saturating_add(saturating_u128_to_u64(
+                            u128::from(record.record.work_cliques)
+                                * u128::from(record.record.avg_clique_duration),
+                        ));
                 entry.duration_ns = entry
                     .duration_ns
                     .saturating_add(record.record.duration_ns());
@@ -3347,6 +3432,8 @@ mod platform {
                 work_shader_address: record.record.work_shader_address,
                 command_count: 0,
                 record_cliques: 0,
+                analyzer_weighted_duration: 0,
+                analyzer_avg_duration_sum: 0,
                 matched_work_cliques: 0,
                 duration_ns: 0,
                 execution_events: 0,
@@ -3440,6 +3527,7 @@ mod platform {
         let mut ends = vec![0u64; count];
         let mut work_shaders = vec![0u64; count];
         let mut esl_shaders = vec![0u64; count];
+        let mut avg_durations = vec![0u64; count];
         let mut cliques = vec![0u64; count];
         if count > 0 {
             let ok = unsafe {
@@ -3471,6 +3559,13 @@ mod platform {
                         0,
                         count as u64,
                     ) != 0
+                    && (api.timing_analyzer_get_work_cliques_average_duration)(
+                        analyzer,
+                        KIND,
+                        avg_durations.as_mut_ptr(),
+                        0,
+                        count as u64,
+                    ) != 0
                     && (api.timing_analyzer_get_num_work_cliques)(
                         analyzer,
                         KIND,
@@ -3492,9 +3587,14 @@ mod platform {
                 end_ns: ends[index],
                 work_shader_address: work_shaders[index],
                 esl_shader_address: esl_shaders[index],
+                avg_clique_duration: avg_durations[index],
                 work_cliques: cliques[index],
             })
             .collect())
+    }
+
+    fn saturating_u128_to_u64(value: u128) -> u64 {
+        value.min(u128::from(u64::MAX)) as u64
     }
 
     unsafe fn agxps_work_cliques(
@@ -3582,6 +3682,7 @@ mod platform {
         end_ns: u64,
         work_shader_address: u64,
         esl_shader_address: u64,
+        avg_clique_duration: u64,
         work_cliques: u64,
     }
 

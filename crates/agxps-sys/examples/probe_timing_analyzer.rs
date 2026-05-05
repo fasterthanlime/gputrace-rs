@@ -129,14 +129,20 @@ fn main() {
         group.work_cliques += record.work_cliques;
         group.duration_ns += record.duration_ns();
         group.num_uscs += record.num_uscs;
+        group.weighted_clique_duration +=
+            u128::from(record.work_cliques) * u128::from(record.avg_clique_duration);
     }
     let total_duration = groups.values().map(|group| group.duration_ns).sum::<u64>();
     let total_cliques = groups.values().map(|group| group.work_cliques).sum::<u64>();
 
     println!("\ngrouped by kick software-id high16 + shader address:");
     println!(
-        "  prefix  shader_address      commands   cliques     uscs  clique_share  duration_ns  duration_share"
+        "  prefix  shader_address      commands   cliques     uscs  clique_share  duration_ns  duration_share  weighted_clique  weighted_share"
     );
+    let total_weighted = groups
+        .values()
+        .map(|group| group.weighted_clique_duration)
+        .sum::<u128>();
     for ((prefix, shader_address), group) in groups {
         let clique_share = if total_cliques > 0 {
             100.0 * group.work_cliques as f64 / total_cliques as f64
@@ -148,13 +154,55 @@ fn main() {
         } else {
             0.0
         };
+        let weighted_share = if total_weighted > 0 {
+            100.0 * group.weighted_clique_duration as f64 / total_weighted as f64
+        } else {
+            0.0
+        };
         println!(
-            "  {prefix}  0x{shader_address:016x}  {commands:>8} {cliques:>9} {uscs:>8}  {clique_share:>10.4}% {duration:>12}  {duration_share:>12.4}%",
+            "  {prefix}  0x{shader_address:016x}  {commands:>8} {cliques:>9} {uscs:>8}  {clique_share:>10.4}% {duration:>12}  {duration_share:>12.4}% {weighted:>16} {weighted_share:>13.6}%",
             prefix = format_prefix(prefix),
             commands = group.commands,
             cliques = group.work_cliques,
             uscs = group.num_uscs,
             duration = group.duration_ns,
+            weighted = group.weighted_clique_duration,
+        );
+    }
+
+    let mut esl_groups = BTreeMap::<(u16, u64), Group>::new();
+    for record in &all_records {
+        let group = esl_groups
+            .entry((record.prefix(), record.esl_shader_address))
+            .or_default();
+        group.commands += 1;
+        group.work_cliques += record.work_cliques;
+        group.duration_ns += record.duration_ns();
+        group.num_uscs += record.num_uscs;
+        group.weighted_clique_duration +=
+            u128::from(record.work_cliques) * u128::from(record.avg_clique_duration);
+    }
+    let total_weighted = esl_groups
+        .values()
+        .map(|group| group.weighted_clique_duration)
+        .sum::<u128>();
+    println!("\ngrouped by kick software-id high16 + ESL shader address:");
+    println!(
+        "  prefix  esl_shader          commands   cliques  duration_ns  weighted_clique  weighted_share"
+    );
+    for ((prefix, shader_address), group) in esl_groups {
+        let weighted_share = if total_weighted > 0 {
+            100.0 * group.weighted_clique_duration as f64 / total_weighted as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  {prefix}  0x{shader_address:016x}  {commands:>8} {cliques:>9} {duration:>12} {weighted:>16} {weighted_share:>13.6}%",
+            prefix = format_prefix(prefix),
+            commands = group.commands,
+            cliques = group.work_cliques,
+            duration = group.duration_ns,
+            weighted = group.weighted_clique_duration,
         );
     }
 }
@@ -195,6 +243,7 @@ struct Group {
     work_cliques: u64,
     num_uscs: u64,
     duration_ns: u64,
+    weighted_clique_duration: u128,
 }
 
 unsafe fn parse_raw_profile(

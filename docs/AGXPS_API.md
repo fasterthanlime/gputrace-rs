@@ -391,7 +391,7 @@ kicks on other cores.
 a real Objective-C block filter, but it is also lifetime-shaped. It
 does not expose Xcode's ALU/compute-cost metric by itself.
 
-### Useful path: timing analyzer ESL address + instruction stats
+### Useful paths: timing analyzer ESL address + clique duration
 
 The high-value path is `agxps_aps_timing_analyzer_*`, not
 `Counters_f_*.raw`:
@@ -405,15 +405,33 @@ The high-value path is `agxps_aps_timing_analyzer_*`, not
    - `get_work_end`
    - `get_work_shader_address`
    - `get_esl_shader_address`
+   - `get_work_cliques_average_duration`
    - `get_num_work_cliques`
    - `get_kick_software_id`
 4. Use `get_esl_shader_address`, not `get_work_shader_address`, to
    bridge into MIO. The ESL address exactly matches
    `shaderBinaryInfo.raw2` for executable shader-binary references
    (`raw5 == 6 && raw6 == 28`).
-5. Join work cliques to timing-analyzer command spans by system-time
-   overlap, then call
-   `agxps_aps_clique_instruction_trace_get_instruction_stats`.
+5. For a fast command-level cost proxy, aggregate
+   `num_work_cliques * work_cliques_average_duration` per matched ESL
+   shader address.
+
+In the sample trace, this command-level aggregate produces:
+
+```text
+Pipelines by AGXPS timing-analyzer clique duration:
+  99.974% weighted=   112335150 avg_sum=  17555881 rec_cliques=    640 heavy_alu
+   0.026% weighted=       28672 avg_sum=     28672 rec_cliques=      5 light_add
+```
+
+This route is much cheaper than walking every work clique because it
+uses the timing analyzer's per-command aggregates directly. It is not
+yet proven to be Xcode's exact "compute cost" denominator, but it is
+the strongest current candidate for a fast, per-pipeline signal.
+
+The older, heavier route is still useful for RE: join work cliques to
+timing-analyzer command spans by system-time overlap, then call
+`agxps_aps_clique_instruction_trace_get_instruction_stats`.
 
 In the sample trace, `xcode-mio` now filters analyzer records to ESL
 addresses present in MIO's executable shader-binary references and
@@ -421,8 +439,8 @@ aggregates `instruction_stats.words[1]`:
 
 ```text
 Pipelines by AGXPS timing-trace instruction stats:
-   98.91% w1=  1308837836 events=  9539685 cliques= 410372 cmds= 100 heavy_alu
-    1.09% w1=    14479123 events=    43087 cliques=   1359 cmds=   5 light_add
+   98.91% w1=  1308837836 analyzer_weighted=   112335150 events=  9539685 cliques= 410372 cmds= 100 heavy_alu
+    1.09% w1=    14479123 analyzer_weighted=       28672 events=    43087 cliques=   1359 cmds=   5 light_add
 ```
 
 That is the first route that gives a real per-pipeline split from the
@@ -437,6 +455,27 @@ fixture, only `words[0]` and `words[1]` are materially nonzero. We use
 heavy/light split; the exact semantic name of that field still needs
 RE.
 
+### Dead end: ESL clique instruction traces
+
+The Xcode framework also exports `esl_clique_*` profile-data getters:
+
+- `agxps_aps_profile_data_get_esl_cliques_num`
+- `agxps_aps_profile_data_get_esl_clique_start`
+- `agxps_aps_profile_data_get_esl_clique_end`
+- `agxps_aps_profile_data_get_esl_clique_esl_id`
+- `agxps_aps_profile_data_get_esl_clique_kick_id`
+- `agxps_aps_profile_data_get_esl_clique_clique_id`
+- `agxps_aps_profile_data_get_esl_clique_instruction_trace`
+
+Those names looked promising, but on the sample trace their
+instruction traces return zero `words[1]` after the same timestamp join
+that works for work cliques. They are not the missing cost source.
+
+`agxps_aps_profile_data_get_work_clique_esl_id` is also not the MIO
+shader-address bridge. It returns small IDs such as `0xa` and `0xb`,
+and those IDs are shared across heavy/light rows. The robust bridge is
+still the timing analyzer's `get_esl_shader_address`.
+
 ## Open questions / next steps
 
 1. **Name `AgxpsApsInstructionStats.words[0/1]`.** The timing-trace
@@ -444,9 +483,11 @@ RE.
    fields are still unknown.
 
 2. **Reduce integrated runtime.** The current `xcode-mio` integration
-   walks all work cliques and calls the private stats getter for each
-   matched clique. It is accurate enough for RE, but should be cached
-   or made opt-in if it becomes too slow on large captures.
+   still walks all work cliques and calls the private stats getter for
+   each matched clique to populate the `w1` section. The analyzer
+   weighted-duration section does not need that pass, so the obvious
+   next performance step is to make the expensive instruction-stat
+   join opt-in.
 
 3. **`get_counter_*` virtual dispatch.** The counter-value getters
    call into a vtable on the parser. Need to either decode the vtable
@@ -479,7 +520,9 @@ The Xcode-rich path now uses the exported agxps symbols from
 3. Run the timing analyzer.
 4. Match timing-analyzer ESL shader addresses to MIO
    `shaderBinaryInfo.raw2`.
-5. Aggregate work-clique instruction stats per pipeline.
+5. Aggregate timing-analyzer weighted clique duration per pipeline.
+6. Optionally aggregate work-clique instruction stats per pipeline for
+   the slower `w1` RE metric.
 
 The no-Xcode fallback still cannot do this through
 `GPUToolsReplay.framework` without extra symbol-resolution work: the
