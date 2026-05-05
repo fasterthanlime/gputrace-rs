@@ -455,15 +455,39 @@ Xcode ground truth from the same trace's **Counters → GPU Commands →
 Compute Kernel** table is per-dispatch `Execution Cost`:
 
 ```text
-light#0   0.098%   heavy#0  19.421%
-light#1   0.053%   heavy#1  20.245%
-light#2   0.011%   heavy#2  19.582%
-light#3   0.049%   heavy#3  20.513%
-light#4   0.040%   heavy#4  19.987%
+light#0   0.020%   heavy#0  18.379%
+light#1   0.011%   heavy#1  16.476%
+light#2   0.028%   heavy#2  21.367%
+light#3   0.030%   heavy#3  21.376%
+light#4   0.006%   heavy#4  22.306%
 
 pipeline totals:
-heavy_alu  99.75%
-light_add   0.25%
+heavy_alu  99.904%
+light_add   0.095%
+```
+
+The matching **Pipeline Statistics** inspector rows show that Xcode's
+displayed command `Execution Cost` is derived from function execution
+time divided by the profile's total GPU time:
+
+```text
+total GPU time: 417.25 us
+
+light_add dispatches:
+  #8   82 ns
+  #20  46 ns
+  #32 118 ns
+  #44 124 ns
+  #56  27 ns
+  total 397 ns = 0.095% of total GPU time
+
+heavy_alu dispatches:
+  #14 76.69 us
+  #26 68.75 us
+  #38 89.16 us
+  #50 89.20 us
+  #62 93.07 us
+  total 416.85 us = 99.904% of total GPU time
 ```
 
 Sorting MIO executable ESL shader addresses ascending gives the same
@@ -549,6 +573,60 @@ real workload, while analyzer-weighted duration was better on the
 synthetic heavy/light aggregate. Neither metric is the Xcode shader
 cost denominator. The current output treats them as candidate metrics,
 not as ground truth.
+
+### Xcode's private command-time path
+
+Disassembly of
+`GPUToolsAdvancedUI.GTProfilingTimelineDataSource.shaderProfilerCostPercentage`
+shows the exact UI path Xcode uses for shader/command cost:
+
+1. Get `shaderProfilerResults()` from the timeline data-source proxy.
+2. Read `result.timingInfo.time` as the denominator.
+3. For a command, call
+   `gpuCommandForFunctionIndex:subCommandIndex:`.
+4. Read the returned command's `timingInfo.computeTime` for compute
+   shaders.
+5. Display `computeTime / result.timingInfo.time * 100`.
+
+The Swift ABI-visible wrapper passes `forDraw` as `UInt32` and
+`subCommandIndex` as `Int32`.
+
+The standalone `xcode-mio` processor can obtain a
+`GTMioShaderProfilerResult`, and that object responds to
+`gpuCommandForFunctionIndex:subCommandIndex:`. On the sample trace,
+probing likely draw IDs produced:
+
+```text
+processor.shader_result:
+  class=GTMioShaderProfilerResult
+  gpuCommand scan attempts=138
+  non_nil=13
+  first_class=GTMioShaderProfilerGPUCommand
+  timing_info=0
+  nonzero=0
+
+direct.shader_result:
+  class=GTAGX2ShaderProfilerResult
+  gpuCommand scan attempts=138
+  non_nil=0
+```
+
+The reason `timing_info` is zero is visible in
+`-[GTMioShaderProfilerGPUCommand timingInfo]`: it does not return a
+stored timing object. It calls
+`costForLevel:levelIdentifier:scope:scopeIdentifier:cost:` with
+`scope=4`, then scales the returned cost by `globalGPUTime`. Our
+standalone `requestCostTimeline`/`costTimeline` path currently returns
+the right topology (`drawCount`, `pipelineStateCount`,
+`globalGPUTime`) but zero cost records/cost values. In other words,
+the remaining exact-Xcode blocker is not the cost formula; it is
+populating the same private cost timeline data that Xcode's UI-backed
+object has.
+
+This makes the private-framework path useful as an oracle and RE aid,
+but too fragile to be the product path. The stable path should keep
+using native profile decoding plus Xcode-copied fixtures to measure
+error bounds.
 
 `GTMioNonOverlappingCounters` is also not the missing public Compute
 Kernel table. For this raw-directory profile, its per-command rows only

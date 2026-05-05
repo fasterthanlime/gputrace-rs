@@ -2559,6 +2559,7 @@ mod platform {
         fn close(fd: c_int) -> c_int;
         fn objc_lookUpClass(name: *const c_char) -> Class;
         fn object_getClass(obj: Id) -> Class;
+        fn class_getName(cls: Class) -> *const c_char;
         fn class_getInstanceVariable(cls: Class, name: *const c_char) -> Ivar;
         fn ivar_getTypeEncoding(ivar: Ivar) -> *const c_char;
         fn object_getIvar(obj: Id, ivar: Ivar) -> Id;
@@ -2739,9 +2740,11 @@ mod platform {
         unsafe {
             push_parent_processor_numeric_probes(&mut shader_profiler_numeric_arrays, processor);
         }
+        let mut shader_profiler_results = vec![("processor.shader_result", shader_result)];
         match unsafe { runtime.direct_shader_profiler_result(stream) } {
             Ok(direct) => {
                 let direct_shader_result = direct.shader_result;
+                shader_profiler_results.push(("direct.shader_result", direct_shader_result));
                 shader_profiler_numeric_arrays.extend(direct.numeric_arrays);
                 if let Err(error) = unsafe {
                     runtime.merge_shader_profiler_pipeline_state_data(
@@ -2786,6 +2789,19 @@ mod platform {
                 .then_with(|| left.command_index.cmp(&right.command_index))
                 .then_with(|| left.binary_key.cmp(&right.binary_key))
         });
+        for (source, shader_result) in &shader_profiler_results {
+            let class_name = unsafe { object_class_name(*shader_result) }
+                .unwrap_or_else(|| "<unknown class>".to_owned());
+            let has_gpu_command = unsafe {
+                responds_to_selector(
+                    *shader_result,
+                    "gpuCommandForFunctionIndex:subCommandIndex:",
+                )
+            };
+            warnings.push(format!(
+                "{source}: class={class_name} gpuCommandForFunctionIndex={has_gpu_command}"
+            ));
+        }
         timings.shader_profiler_probe_ms = elapsed_ms(shader_probe_start);
         let cost_request_start = Instant::now();
         let (cost_timeline, cost_timeline_object) =
@@ -2861,7 +2877,7 @@ mod platform {
             }
             timings.cost_timeline_decode_ms = elapsed_ms(cost_decode_start);
         }
-        let (gpu_command_function_times, gpu_command_function_time_probes) = unsafe {
+        let (mut gpu_command_function_times, gpu_command_function_time_probes) = unsafe {
             runtime.decode_gpu_command_function_times(
                 mio,
                 cost_timeline_object,
@@ -2871,6 +2887,24 @@ mod platform {
                 &timeline_pipeline_state_ids,
             )
         };
+        for (source, shader_result) in shader_profiler_results {
+            let (rows, warning) = unsafe {
+                runtime.decode_shader_profiler_gpu_command_times(
+                    source,
+                    shader_result,
+                    &decoded_commands,
+                )
+            };
+            gpu_command_function_times.extend(rows);
+            warnings.push(warning);
+        }
+        gpu_command_function_times.sort_by(|left, right| {
+            left.source
+                .cmp(right.source)
+                .then_with(|| left.command_index.cmp(&right.command_index))
+                .then_with(|| left.draw_index.cmp(&right.draw_index))
+                .then_with(|| left.data_master.cmp(&right.data_master))
+        });
         let gpu_command_direct_costs = unsafe {
             runtime.decode_gpu_command_direct_costs(mio, cost_timeline_object, &decoded_commands)
         };
@@ -3814,6 +3848,107 @@ mod platform {
                     .then_with(|| left.target_id.cmp(&right.target_id))
             });
             (rows, probes)
+        }
+
+        unsafe fn decode_shader_profiler_gpu_command_times(
+            &mut self,
+            source: &'static str,
+            shader_result: Id,
+            gpu_commands: &[XcodeMioGpuCommand],
+        ) -> (Vec<XcodeMioGpuCommandFunctionTime>, String) {
+            let mut rows = Vec::new();
+            let mut attempts = 0_usize;
+            let mut non_nil = 0_usize;
+            let mut timing_info = 0_usize;
+            let mut nonzero = 0_usize;
+            let mut first_object_class = None;
+            unsafe {
+                if shader_result.is_null()
+                    || !responds_to_selector(
+                        shader_result,
+                        "gpuCommandForFunctionIndex:subCommandIndex:",
+                    )
+                {
+                    return (
+                        rows,
+                        format!("{source}: gpuCommand scan skipped; selector unavailable"),
+                    );
+                }
+                for command in gpu_commands {
+                    let mut function_indices = vec![
+                        command.function_index,
+                        command.index as u64,
+                        (command.index * 2) as u64,
+                        (command.index * 2 + 1) as u64,
+                    ];
+                    if let Some(display_index) = command.function_index.checked_sub(1) {
+                        function_indices.push(display_index);
+                    }
+                    if let Some(previous_index) = command.function_index.checked_sub(2) {
+                        function_indices.push(previous_index);
+                    }
+                    function_indices.push(command.function_index.saturating_add(1));
+                    function_indices.push(command.index as u64);
+                    function_indices.sort_unstable();
+                    function_indices.dedup();
+
+                    let mut sub_command_indices = vec![command.sub_command_index, -1, 0];
+                    sub_command_indices.sort_unstable();
+                    sub_command_indices.dedup();
+
+                    for function_index in function_indices {
+                        let Ok(draw_index) = u32::try_from(function_index) else {
+                            continue;
+                        };
+                        for sub_command_index in &sub_command_indices {
+                            attempts += 1;
+                            let gpu_command = send_id_u32_i32_allow_nil(
+                                shader_result,
+                                "gpuCommandForFunctionIndex:subCommandIndex:",
+                                draw_index,
+                                *sub_command_index,
+                            )
+                            .unwrap_or(std::ptr::null_mut());
+                            if gpu_command.is_null() {
+                                continue;
+                            }
+                            non_nil += 1;
+                            if first_object_class.is_none() {
+                                first_object_class = object_class_name(gpu_command);
+                            }
+                            let Some(timing) = decode_timing_info(gpu_command) else {
+                                continue;
+                            };
+                            timing_info += 1;
+                            let (duration_ns, data_master) =
+                                shader_profiler_command_duration(timing);
+                            if duration_ns == 0 {
+                                continue;
+                            }
+                            nonzero += 1;
+                            rows.push(XcodeMioGpuCommandFunctionTime {
+                                source,
+                                command_index: command.index,
+                                function_index,
+                                sub_command_index: *sub_command_index,
+                                encoder_index: command.encoder_index,
+                                pipeline_index: command.pipeline_index,
+                                function_name: command.function_name.clone(),
+                                draw_index,
+                                data_master,
+                                duration_ns,
+                            });
+                        }
+                    }
+                }
+            }
+            let class_name = first_object_class.unwrap_or_else(|| "-".to_owned());
+            (
+                rows,
+                format!(
+                    "{source}: gpuCommand scan attempts={attempts} non_nil={non_nil} timing_info={timing_info} nonzero={nonzero} first_class={class_name}"
+                ),
+            )
         }
 
         unsafe fn decode_gpu_command_direct_costs(
@@ -5622,6 +5757,18 @@ mod platform {
                 || decoded.compute_time != 0)
                 .then_some(decoded)
         }
+    }
+
+    fn shader_profiler_command_duration(timing: DecodedTimingInfo) -> (u64, u16) {
+        [
+            (timing.compute_time, 28_u16),
+            (timing.vertex_time, 1_u16),
+            (timing.fragment_time, 2_u16),
+            (timing.time, 0_u16),
+        ]
+        .into_iter()
+        .max_by_key(|(duration_ns, _)| *duration_ns)
+        .unwrap_or((0, 0))
     }
 
     unsafe fn decode_pipeline_profiler_timings(
@@ -7786,6 +7933,24 @@ mod platform {
         (!value.is_null()).then_some(value)
     }
 
+    unsafe fn object_class_name(object: Id) -> Option<String> {
+        if object.is_null() {
+            return None;
+        }
+        let class = unsafe { object_getClass(object) };
+        if class.is_null() {
+            return None;
+        }
+        let name = unsafe { class_getName(class) };
+        if name.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(name) }
+            .to_str()
+            .ok()
+            .map(ToOwned::to_owned)
+    }
+
     unsafe fn object_ivar_assume_object(object: Id, ivar_name: &str) -> Option<Id> {
         if object.is_null() {
             return None;
@@ -8226,6 +8391,23 @@ mod platform {
         }
         let sel = unsafe { selector(sel)? };
         let f: extern "C" fn(Id, Sel, u64, u16) -> Id =
+            unsafe { mem::transmute(objc_msgSend as *const ()) };
+        Ok(f(receiver, sel, left, right))
+    }
+
+    unsafe fn send_id_u32_i32_allow_nil(
+        receiver: Id,
+        sel: &str,
+        left: u32,
+        right: i32,
+    ) -> Result<Id> {
+        if receiver.is_null() {
+            return Err(Error::InvalidInput(format!(
+                "nil Objective-C receiver for {sel}"
+            )));
+        }
+        let sel = unsafe { selector(sel)? };
+        let f: extern "C" fn(Id, Sel, u32, i32) -> Id =
             unsafe { mem::transmute(objc_msgSend as *const ()) };
         Ok(f(receiver, sel, left, right))
     }
